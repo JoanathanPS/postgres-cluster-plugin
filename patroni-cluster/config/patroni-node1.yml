@@ -1,0 +1,52 @@
+scope: patroni-cluster
+namespace: /service
+name: pg-node1
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: pg-node1:8008
+
+etcd3:
+  hosts:
+    - etcd:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: 'on'
+        max_connections: 100
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 128MB
+        unix_socket_directories: '/tmp,/run/postgresql'
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - host all all all scram-sha-256
+    - host replication replicator all scram-sha-256
+  post_init: /home/postgres/post_init.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: pg-node1:5432
+  data_dir: /home/postgres/data/pgdata
+  bin_dir: /usr/lib/postgresql/17.2/bin
+  pgpass: /tmp/.pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: replicator_password
+    superuser:
+      username: postgres
+      password: postgres_password
+  parameters:
+    unix_socket_directories: '/tmp,/run/postgresql'

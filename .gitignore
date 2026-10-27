@@ -1,0 +1,14 @@
+# secrets
+.env
+*.env.local
+postgres/postgres.cfg
+postgres_cluster/postgres_cluster.cfg
+patroni-cluster/.env
+
+# test artefacts
+test-output/
+__pycache__/
+*.pyc
+ScheduledTask/
+postgres_cluster/postgres_cluster.cfg
+.env

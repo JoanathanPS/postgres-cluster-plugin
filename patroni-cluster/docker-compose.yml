@@ -1,0 +1,95 @@
+name: patroni-cluster
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: patroni-etcd
+    command:
+      - etcd
+      - --name=etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd=http://etcd:2380
+      - --initial-cluster-token=etcd-cluster-token
+      - --initial-cluster-state=new
+    ports:
+      - "127.0.0.1:2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  pg-node1:
+    build: ./patroni
+    container_name: patroni-pg-node1
+    hostname: pg-node1
+    command: ["/home/postgres/config/patroni.yml"]
+    volumes:
+      - ./config/patroni-node1.yml:/home/postgres/config/patroni.yml:ro
+      - ./patroni/post_init.sh:/home/postgres/post_init.sh:ro
+      - patroni1-data:/home/postgres/data
+    ports:
+      - "127.0.0.1:5441:5432"
+      - "127.0.0.1:8001:8008"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pg-node2:
+    build: ./patroni
+    container_name: patroni-pg-node2
+    hostname: pg-node2
+    command: ["/home/postgres/config/patroni.yml"]
+    volumes:
+      - ./config/patroni-node2.yml:/home/postgres/config/patroni.yml:ro
+      - ./patroni/post_init.sh:/home/postgres/post_init.sh:ro
+      - patroni2-data:/home/postgres/data
+    ports:
+      - "127.0.0.1:5442:5432"
+      - "127.0.0.1:8002:8008"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pg-node3:
+    build: ./patroni
+    container_name: patroni-pg-node3
+    hostname: pg-node3
+    command: ["/home/postgres/config/patroni.yml"]
+    volumes:
+      - ./config/patroni-node3.yml:/home/postgres/config/patroni.yml:ro
+      - ./patroni/post_init.sh:/home/postgres/post_init.sh:ro
+      - patroni3-data:/home/postgres/data
+    ports:
+      - "127.0.0.1:5443:5432"
+      - "127.0.0.1:8003:8008"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: patroni-haproxy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:7000:7000"
+    depends_on:
+      - pg-node1
+      - pg-node2
+      - pg-node3
+    restart: unless-stopped
+
+volumes:
+  patroni1-data:
+  patroni2-data:
+  patroni3-data:

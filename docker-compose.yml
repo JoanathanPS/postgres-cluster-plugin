@@ -1,0 +1,102 @@
+# PostgreSQL 2-node streaming-replication cluster for testing the official
+# Site24x7 "postgres" plugin (https://github.com/site24x7/plugins/tree/master/postgres).
+#
+#   pg-primary   read/write node            -> 127.0.0.1:${PRIMARY_HOST_PORT:-5432}
+#   pg-replica   hot-standby (read only)    -> 127.0.0.1:${REPLICA_HOST_PORT:-5433}
+#   plugin-test  runs postgres.py against both nodes and validates the output
+#                (only started with:  docker compose run --rm plugin-test)
+#
+# Credentials come from .env (copy .env.example -> .env). Nothing secret is stored here.
+
+name: pg-cluster-site24x7
+
+services:
+  pg-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Used only by initdb/primary/01-init-cluster.sh on first start
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD in .env}
+      REPLICATION_SLOT: ${REPLICATION_SLOT:-replica1_slot}
+      MONITOR_USER: ${MONITOR_USER:-site24x7}
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:?Set MONITOR_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - wal_level=replica            # PG16 default, stated explicitly
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_slot_wal_keep_size=1GB   # a dead replica cannot fill the primary's disk
+      - -c
+      - hot_standby=on
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./initdb/primary:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${PRIMARY_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  pg-replica:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}   # used by the healthcheck only
+      PRIMARY_HOST: pg-primary
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD in .env}
+      REPLICATION_SLOT: ${REPLICATION_SLOT:-replica1_slot}
+    # Clones the primary with pg_basebackup on first start, then runs the
+    # normal postgres entrypoint as a hot standby.
+    entrypoint: ["bash", "/replica/replica-entrypoint.sh"]
+    command: ["postgres"]
+    volumes:
+      - replica-data:/var/lib/postgresql/data
+      - ./replica:/replica:ro
+    ports:
+      - "127.0.0.1:${REPLICA_HOST_PORT:-5433}:5432"
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  plugin-test:
+    build: ./tester
+    profiles: ["test"]
+    environment:
+      MONITOR_USER: ${MONITOR_USER:-site24x7}
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:?Set MONITOR_PASSWORD in .env}
+      # section_name=host:port  (section names mirror postgres.cfg.example)
+      PG_NODES: "pg_primary=pg-primary:5432,pg_replica=pg-replica:5432"
+      PLUGIN_DIR: /plugin/postgres
+      PLUGIN_DB: appdb
+      OUTPUT_DIR: /out
+    volumes:
+      - ./postgres:/plugin/postgres:ro
+      - ./test-output:/out
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-replica:
+        condition: service_healthy
+
+volumes:
+  primary-data:
+  replica-data:

@@ -1,0 +1,9 @@
+[global_configurations]
+use_agent_python=1
+
+[postgres_cluster]
+nodes="127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443"
+username="site24x7"
+password="CHANGE_ME_monitor"
+db="postgres"
+patroni_port="8008"
