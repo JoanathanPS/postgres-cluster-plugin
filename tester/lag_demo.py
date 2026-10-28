@@ -19,7 +19,9 @@ import sys
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PLUGIN_PY = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "postgres_cluster", "postgres_cluster.py"))
+upstream_py = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "upstream_layout", "postgres_cluster", "postgres_cluster.py"))
+fallback_py = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "postgres_cluster", "postgres_cluster.py"))
+PLUGIN_PY = upstream_py if os.path.exists(upstream_py) else fallback_py
 NODES = os.environ.get("PG_NODES", "node1=localhost:5441,node2=localhost:5442,node3=localhost:5443")
 USER = os.environ.get("MONITOR_USER", "site24x7")
 PASS = os.environ.get("MONITOR_PASSWORD", "site24x7")

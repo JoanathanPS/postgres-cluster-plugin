@@ -199,7 +199,9 @@ def main():
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
     args = parser.parse_args()
 
-    plugin_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster", "postgres_cluster.py"))
+    upstream_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster", "postgres_cluster.py"))
+    fallback_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster", "postgres_cluster.py"))
+    plugin_py = upstream_py if os.path.exists(upstream_py) else fallback_py
     nodes = os.environ.get("PG_NODES", "node1=localhost:5441,node2=localhost:5442,node3=localhost:5443")
     user = os.environ.get("MONITOR_USER", "site24x7")
     password = os.environ.get("MONITOR_PASSWORD", "site24x7")
