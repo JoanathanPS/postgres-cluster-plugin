@@ -293,17 +293,65 @@ Start-Service -Name "Site24x7 Plugin Agent"
 
 ## 8. Automated Testing Suite
 
-All tests can be executed locally on Windows:
+### One-Command End-to-End Verification (`tester/e2e.ps1`)
+
+The repository includes a unified, end-to-end verification script:
+
 ```powershell
-# 1. Core Plugin Schema and Error Resilience Suite (4 tests)
+# 1. Quick Mode (~20-30s): Runs preflight, plugin timing constraints (<5s),
+#    unit test suite, check-layout.ps1, agent PluginLog.log validation, and cluster health guarantee:
+.\tester\e2e.ps1
+
+# 2. Full Mode: Runs all quick checks plus dynamic Patroni failover assertions,
+#    pgbench replication lag demonstration, and console validation:
+.\tester\e2e.ps1 -Mode full
+
+# Skip web console checks (useful if not logged into browser yet):
+.\tester\e2e.ps1 -SkipConsole
+```
+
+All test outcomes, timestamps, latencies, and assertion statuses are recorded in `evidence/REPORT.md`.
+
+### Individual Test Suites
+
+```powershell
+# Upstream Layout Compliance (asserts files, AST syntax, py_compile, valid JSON)
+.\check-layout.ps1
+
+# Core Plugin Schema & Error Resilience (healthy cluster, dead host, auth error)
 py tester/test_cluster_plugin.py
 
-# 2. Automated Failover Test (stops leader, asserts timeline advance & new primary, restarts node)
+# Dynamic Patroni Failover Assertion (stops leader, asserts timeline advance & new primary, recovers node)
 .\failover-test.ps1
 
-# 3. Replication Lag Demonstration (simulates stall, generates 1500 tx via pgbench, verifies backlog > 0 then catchup to 0)
+# Replication Lag Demonstration (simulates standby lag, generates pgbench load, verifies catchup)
 py tester/lag_demo.py
 ```
+
+### Site24x7 Web Console Automated Inspection (`tester/console_check.py`)
+
+Browser automation is implemented using Playwright:
+```powershell
+py tester/console_check.py
+```
+
+- **Authentication**: On the first run, Playwright opens a visible browser and prompts you to log into Site24x7 with your credentials and 2FA. The session is cached in `.auth/profile/` and the detected data center base URL is saved in `.auth/config.json`. Subsequent runs execute headless automatically.
+- **Read-Only Assertions**:
+  - Confirms monitor status is UP / green.
+  - Verifies presence of all 6 tabs (`Cluster`, `DB and IO stats`, `BG Writer`, `Transactions and Sessions`, `Write Ahead Log`, `Recovery Conflicts`).
+  - Verifies child tables `Cluster_Nodes` (3 rows) and `Replication_Standbys` (2 rows).
+  - Captures full-page screenshots for every tab into `evidence/screenshots/`.
+
+### The One-Instance Rule & Agent Configuration
+
+The Site24x7 Windows Agent derives plugin monitor instance names based on folder and section matching:
+- **Standard Matching Section**: When the `.cfg` section header equals the folder name (e.g. folder `postgres_cluster_dev` with section `[postgres_cluster_dev]`), the agent schedules a single instance named `postgres_cluster_dev`.
+- **Mismatched Section**: If the `.cfg` section header differs (e.g. `[pg_cluster_dev]`), the agent registers an instance named `<folder>-<section>` (`postgres_cluster_dev-pg_cluster_dev`).
+- **Rule**: Always standardize on matching section headers (`[postgres_cluster_dev]` for dev, `[postgres_cluster]` for production).
+- **Verification**: Check `PluginLog.log` to confirm only one instance executes per cycle:
+  ```powershell
+  Get-Content "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\logs\Details\PluginLog.log" -Tail 50 | Select-String "postgres_cluster_dev"
+  ```
 
 ---
 
