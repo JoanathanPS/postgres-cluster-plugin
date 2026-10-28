@@ -297,14 +297,14 @@ try {
         $pwExit = $LASTEXITCODE
         $pwSw.Stop()
         $pwElapsed = $pwSw.Elapsed.TotalSeconds
-        $pwText = ($pwOut | Out-String).Trim()
+        $pwText = (($pwOut | ForEach-Object { $_.ToString() }) -join "`n").Trim()
 
         if ($pwExit -eq 0) {
             Assert-Result "Console Automation (Playwright)" $true "Dashboard tabs, metrics, and child table assertions verified" $pwElapsed
         } elseif ($pwExit -eq 2 -or $pwText -match "playwright is not installed") {
             Write-Host "  [SKIP] Console Automation: Playwright is not installed (run: py -m pip install playwright)" -ForegroundColor Yellow
             Write-Report "- **[SKIP]** Console Automation: Playwright is not installed (run: py -m pip install playwright)"
-        } elseif ($pwExit -eq 3 -or $pwText -match "Authentication not completed" -or $pwText -match "Session expired" -or $pwText -match "session has expired" -or $pwText -match "login session not active") {
+        } elseif ($pwExit -eq 3 -or $pwText -match "Authentication not completed" -or $pwText -match "Session expired" -or $pwText -match "session has expired" -or $pwText -match "login session not active" -or $pwText -match "MANUAL AUTHENTICATION") {
             $reason = "Site24x7 web console session not active or login timed out. Log in once in the Chrome window."
             Write-Host "  [SKIP] Console Automation: $reason" -ForegroundColor Yellow
             Write-Report "- **[SKIP]** Console Automation: $reason"

@@ -112,10 +112,13 @@ def authenticate_user(p, timeout_secs=300):
             break
         time.sleep(2)
 
-    browser.close()
+    try:
+        browser.close()
+    except Exception:
+        pass
 
     if not detected_base_url:
-        print("\n[SKIP] Authentication not completed within timeout or window was closed.")
+        print("\n[SKIP] Authentication not completed within timeout or window was closed.", flush=True)
         sys.exit(3)
 
     cfg = load_config()
