@@ -13,12 +13,12 @@ import traceback
 from collections import OrderedDict
 
 # Default cluster configuration
-NODES = 'localhost:5441,localhost:5442,localhost:5443'  # host:port or name=host:port or host:port:patroni_port
+NODES = '127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443'  # host:port or name=host:port or host:port:patroni_port
 USERNAME = 'site24x7'                                    # Monitoring username
 PASSWORD = 'site24x7'                                    # Monitoring password
 DB = 'postgres'                                          # Database name to connect to
 PATRONI_PORT = '8008'                                    # Optional Patroni REST API port or mapping
-CONNECT_TIMEOUT = 3                                      # Timeout for connecting to each node
+CONNECT_TIMEOUT = 2                                      # Timeout for connecting to each node
 
 PLUGIN_VERSION = 1
 HEARTBEAT = True
@@ -197,7 +197,7 @@ class pgsql():
         self._conn = None
         self._uname = username
         self._pwd = password
-        self._hostname = host_name
+        self._hostname = "127.0.0.1" if host_name in ("localhost", "127.0.0.1") else host_name
         self._port = port
         self._results = {}
         self._msg = ""
@@ -394,9 +394,11 @@ def parse_nodes(nodes_str, patroni_port_cfg=None):
             if patroni_port == 8008 or patroni_port is None:
                 patroni_port = 8001 + (port - 5441)
 
+        connect_host = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
         nodes.append({
             "name": name,
             "host": host,
+            "connect_host": connect_host,
             "port": port,
             "patroni_port": patroni_port
         })
@@ -409,10 +411,11 @@ def probe_patroni_rest(host, patroni_port):
         return None
 
     import urllib.request
+    connect_host = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
     try:
-        url = f"http://{host}:{patroni_port}/patroni"
+        url = f"http://{connect_host}:{patroni_port}/patroni"
         req = urllib.request.Request(url, headers={"User-Agent": "Site24x7-PG-Cluster"})
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
             if resp.status == 200:
                 return json.loads(resp.read().decode('utf-8'))
     except Exception:
@@ -474,6 +477,152 @@ class PostgresClusterCollector:
         self.db = clean_quotes(db) if db else DB
         self.patroni_port_cfg = clean_quotes(patroni_port) if patroni_port else PATRONI_PORT
 
+    def probe_single_node(self, node_info):
+        """Probes a single node for status, role, timeline, and replication health."""
+        import psycopg2
+
+        name = node_info["name"]
+        host = node_info.get("connect_host") or ("127.0.0.1" if node_info["host"] in ("localhost", "127.0.0.1") else node_info["host"])
+        original_host = node_info["host"]
+        port = node_info["port"]
+        patroni_port = node_info["patroni_port"]
+
+        node_status = "down"
+        node_role = "down"
+        timeline = "N/A"
+        resp_time_ms = 0
+        patroni_state = "N/A"
+        conn = None
+        last_err = ""
+        is_primary = False
+        standby_lags = []
+        replication_standbys = []
+        node_timeline = None
+        auth_failure = None
+        network_failure = None
+
+        t0 = time.time()
+        try:
+            conn = psycopg2.connect(
+                dbname=self.db,
+                user=self.username,
+                password=self.password,
+                host=host,
+                port=port,
+                connect_timeout=CONNECT_TIMEOUT
+            )
+        except Exception as e:
+            last_err = str(e)
+            # Only retry fallback to 'postgres' if the database itself does not exist
+            if ("database" in last_err.lower() and "does not exist" in last_err.lower()) and self.db != "postgres":
+                try:
+                    conn = psycopg2.connect(
+                        dbname="postgres",
+                        user=self.username,
+                        password=self.password,
+                        host=host,
+                        port=port,
+                        connect_timeout=CONNECT_TIMEOUT
+                    )
+                except Exception as inner_e:
+                    conn = None
+                    last_err = str(inner_e)
+
+        resp_time_ms = round((time.time() - t0) * 1000, 2)
+
+        # Probe Patroni REST if configured
+        patroni_info = probe_patroni_rest(host, patroni_port)
+        if patroni_info:
+            patroni_state = patroni_info.get("state", "running")
+
+        if conn is not None:
+            node_status = "up"
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_is_in_recovery();")
+                    in_recovery = cur.fetchone()[0]
+                    node_role = "standby" if in_recovery else "primary"
+                    is_primary = not in_recovery
+
+                    # Retrieve timeline purely via SQL
+                    tl = get_node_timeline(cur, in_recovery)
+                    if tl is None and patroni_info and "timeline" in patroni_info:
+                        try:
+                            tl = int(patroni_info["timeline"])
+                        except Exception:
+                            pass
+                    if tl is None:
+                        tl = 1
+                    timeline = str(tl)
+                    node_timeline = tl
+
+                    if not in_recovery:
+                        # Query connected replicas from primary
+                        try:
+                            cur.execute("""
+                                SELECT
+                                    COALESCE(application_name, client_addr::text, 'standby') AS name,
+                                    COALESCE(client_addr::text, 'local') AS client_addr,
+                                    COALESCE(state, 'unknown') AS state,
+                                    COALESCE(sync_state, 'unknown') AS sync_state,
+                                    COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint AS replay_lag_bytes,
+                                    COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn), 0)::bigint AS write_lag_bytes,
+                                    COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn), 0)::bigint AS flush_lag_bytes
+                                FROM pg_stat_replication;
+                            """)
+                            cols = [d[0] for d in cur.description]
+                            for row in cur.fetchall():
+                                st_entry = {cols[i]: row[i] for i in range(len(cols))}
+                                replication_standbys.append(st_entry)
+                        except Exception:
+                            pass
+                    else:
+                        # Standby node: check replay lag from standby side
+                        try:
+                            cur.execute("SELECT COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0)::bigint;")
+                            s_lag = int(cur.fetchone()[0])
+                            standby_lags.append(s_lag)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            # Connection failed: record failure type
+            err_lower = last_err.lower()
+            if "authentication failed" in err_lower or "password" in err_lower:
+                auth_failure = (name, last_err)
+            else:
+                network_failure = (name, last_err)
+
+        cluster_node = {
+            "name": str(name),
+            "role": str(node_role),
+            "status": str(node_status),
+            "timeline": str(timeline),
+            "response_time_ms": str(resp_time_ms),
+            "patroni_state": str(patroni_state)
+        }
+
+        return {
+            "name": name,
+            "host": host,
+            "original_host": original_host,
+            "port": port,
+            "cluster_node": cluster_node,
+            "is_up": (node_status == "up"),
+            "is_primary": is_primary,
+            "timeline": node_timeline,
+            "standby_lags": standby_lags,
+            "replication_standbys": replication_standbys,
+            "auth_failure": auth_failure,
+            "network_failure": network_failure
+        }
+
     def collect(self):
         results = {
             "plugin_version": PLUGIN_VERSION,
@@ -498,6 +647,68 @@ class PostgresClusterCollector:
             results["units"] = units
             return results
 
+        start_time = time.time()
+        max_deadline = 20.0  # Hard overall deadline in seconds
+
+        import concurrent.futures
+
+        probe_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(parsed_nodes), 8)) as executor:
+            future_to_node = {executor.submit(self.probe_single_node, n): n for n in parsed_nodes}
+            time_left = max(1.0, max_deadline - (time.time() - start_time))
+            done, not_done = concurrent.futures.wait(future_to_node.keys(), timeout=time_left)
+            for f in done:
+                try:
+                    probe_results.append(f.result())
+                except Exception as ex:
+                    node_info = future_to_node[f]
+                    probe_results.append({
+                        "name": node_info["name"],
+                        "host": node_info["host"],
+                        "port": node_info["port"],
+                        "cluster_node": {
+                            "name": str(node_info["name"]),
+                            "role": "down",
+                            "status": "down",
+                            "timeline": "N/A",
+                            "response_time_ms": "0",
+                            "patroni_state": "N/A"
+                        },
+                        "is_up": False,
+                        "is_primary": False,
+                        "timeline": None,
+                        "standby_lags": [],
+                        "replication_standbys": [],
+                        "auth_failure": None,
+                        "network_failure": (node_info["name"], str(ex))
+                    })
+            for f in not_done:
+                node_info = future_to_node[f]
+                probe_results.append({
+                    "name": node_info["name"],
+                    "host": node_info["host"],
+                    "port": node_info["port"],
+                    "cluster_node": {
+                        "name": str(node_info["name"]),
+                        "role": "down",
+                        "status": "down",
+                        "timeline": "N/A",
+                        "response_time_ms": "0",
+                        "patroni_state": "timeout"
+                    },
+                    "is_up": False,
+                    "is_primary": False,
+                    "timeline": None,
+                    "standby_lags": [],
+                    "replication_standbys": [],
+                    "auth_failure": None,
+                    "network_failure": (node_info["name"], "Connection timeout")
+                })
+
+        # Preserve input order for cluster_nodes table
+        node_order = {n["name"]: idx for idx, n in enumerate(parsed_nodes)}
+        probe_results.sort(key=lambda x: node_order.get(x["name"], 0))
+
         cluster_nodes = []
         replication_standbys = []
         primaries = []
@@ -506,130 +717,26 @@ class PostgresClusterCollector:
         auth_failures = []
         network_failures = []
 
-        for node_info in parsed_nodes:
-            name = node_info["name"]
-            host = node_info["host"]
-            port = node_info["port"]
-            patroni_port = node_info["patroni_port"]
-
-            node_status = "down"
-            node_role = "down"
-            timeline = "N/A"
-            resp_time_ms = 0
-            patroni_state = "N/A"
-            conn = None
-            last_err = ""
-
-            t0 = time.time()
-            try:
-                conn = psycopg2.connect(
-                    dbname=self.db,
-                    user=self.username,
-                    password=self.password,
-                    host=host,
-                    port=port,
-                    connect_timeout=CONNECT_TIMEOUT
-                )
-            except Exception as e:
-                last_err = str(e)
-                # If target DB failed (e.g. database does not exist), try fallback to 'postgres'
-                try:
-                    conn = psycopg2.connect(
-                        dbname="postgres",
-                        user=self.username,
-                        password=self.password,
-                        host=host,
-                        port=port,
-                        connect_timeout=CONNECT_TIMEOUT
-                    )
-                except Exception as inner_e:
-                    conn = None
-                    last_err = str(inner_e)
-
-            resp_time_ms = round((time.time() - t0) * 1000, 2)
-
-            # Probe Patroni REST if available
-            patroni_info = probe_patroni_rest(host, patroni_port)
-            if patroni_info:
-                patroni_state = patroni_info.get("state", "running")
-
-            if conn is not None:
-                node_status = "up"
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT pg_is_in_recovery();")
-                        in_recovery = cur.fetchone()[0]
-                        node_role = "standby" if in_recovery else "primary"
-
-                        # Retrieve timeline purely via SQL
-                        tl = get_node_timeline(cur, in_recovery)
-                        if tl is None and patroni_info and "timeline" in patroni_info:
-                            try:
-                                tl = int(patroni_info["timeline"])
-                            except Exception:
-                                pass
-                        if tl is None:
-                            tl = 1
-                        timeline = str(tl)
-                        node_timelines.append(tl)
-
-                        if not in_recovery:
-                            primaries.append({
-                                "name": name,
-                                "host": host,
-                                "port": port,
-                                "timeline": tl
-                            })
-                            # Query connected replicas from primary
-                            try:
-                                cur.execute("""
-                                    SELECT
-                                        COALESCE(application_name, client_addr::text, 'standby') AS name,
-                                        COALESCE(client_addr::text, 'local') AS client_addr,
-                                        COALESCE(state, 'unknown') AS state,
-                                        COALESCE(sync_state, 'unknown') AS sync_state,
-                                        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint AS replay_lag_bytes,
-                                        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn), 0)::bigint AS write_lag_bytes,
-                                        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn), 0)::bigint AS flush_lag_bytes
-                                    FROM pg_stat_replication;
-                                """)
-                                cols = [d[0] for d in cur.description]
-                                for row in cur.fetchall():
-                                    st_entry = {cols[i]: row[i] for i in range(len(cols))}
-                                    replication_standbys.append(st_entry)
-                            except Exception:
-                                pass
-                        else:
-                            # Standby node: check replay lag from standby side
-                            try:
-                                cur.execute("SELECT COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0)::bigint;")
-                                s_lag = int(cur.fetchone()[0])
-                                standby_lags.append(s_lag)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            else:
-                # Connection failed: record failure type
-                err_lower = last_err.lower()
-                if "authentication failed" in err_lower or "password" in err_lower:
-                    auth_failures.append((name, last_err))
+        for res in probe_results:
+            cluster_nodes.append(res["cluster_node"])
+            if res["is_up"]:
+                if res["timeline"] is not None:
+                    node_timelines.append(res["timeline"])
+                if res["is_primary"]:
+                    primaries.append({
+                        "name": res["name"],
+                        "host": res["host"],
+                        "port": res["port"],
+                        "timeline": res["timeline"] or 1
+                    })
+                    replication_standbys.extend(res["replication_standbys"])
                 else:
-                    network_failures.append((name, last_err))
-
-            cluster_nodes.append({
-                "name": str(name),
-                "role": str(node_role),
-                "status": str(node_status),
-                "timeline": str(timeline),
-                "response_time_ms": str(resp_time_ms),
-                "patroni_state": str(patroni_state)
-            })
+                    standby_lags.extend(res["standby_lags"])
+            else:
+                if res["auth_failure"]:
+                    auth_failures.append(res["auth_failure"])
+                if res["network_failure"]:
+                    network_failures.append(res["network_failure"])
 
         # Calculate cluster metrics
         nodes_total = len(cluster_nodes)
