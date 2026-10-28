@@ -1,15 +1,20 @@
-# secrets
-.env
-*.env.local
-postgres/postgres.cfg
-postgres_cluster/postgres_cluster.cfg
-patroni-cluster/.env
-
-# test artefacts
-test-output/
-scratch/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-ScheduledTask/
-postgres_cluster/postgres_cluster.cfg
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & local credentials
 .env
+*.cfg
+!postgres_cluster.cfg
+
+# Test & Evidence artifacts
+.auth/
+evidence/
+ScheduledTask/
+
+# Residual dev folders
+patroni-cluster/
+postgres_cluster/
+tester/
