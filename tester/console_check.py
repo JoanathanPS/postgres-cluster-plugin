@@ -396,7 +396,7 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         # Step 4: Monitor status
         record("Monitor Status", True, f"Monitor dashboard loaded successfully: {page.url}")
 
-        # Step 5: Check 6 tabs
+        # Step 5: Check 6 tabs (strictly all 6 must be found, including checking inside 'More' dropdown)
         expected_tabs = [
             "Cluster",
             "DB and IO stats",
@@ -406,14 +406,43 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             "Recovery Conflicts"
         ]
 
+        # Gather visible tabs on tab bar
+        tab_spans = page.locator("ul.nav-tabs li span, ul.nav-tabs li, [role='tab']")
+        visible_tab_names = [s.strip() for s in tab_spans.all_inner_texts() if s.strip()]
+
+        # Also inspect inside the "More" dropdown
+        more_toggle = page.locator("#show-more-dropdown span.dropdown-toggle, span.dropdown-toggle:has-text('More'), a:has-text('More')").first
+        more_tab_names = []
+        if more_toggle.count() > 0 and more_toggle.is_visible():
+            try:
+                more_toggle.click()
+                time.sleep(1)
+                dropdown_items = page.locator("#show-more-dropdown .dropdown-menu li, .dropdown-menu li, .dropdown-menu a")
+                more_tab_names = [d.strip() for d in dropdown_items.all_inner_texts() if d.strip()]
+                # Click more toggle again to close menu cleanly
+                more_toggle.click()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+        all_available_tabs = set(visible_tab_names + more_tab_names)
         page_content = page.content()
+
         found_tabs = []
         for tab_name in expected_tabs:
-            if tab_name in page_content or page.locator(f"span:text-is('{tab_name}')").count() > 0 or page.locator(f"text='{tab_name}'").count() > 0:
+            if (tab_name in all_available_tabs or
+                page.locator(f"span:text-is('{tab_name}')").count() > 0 or
+                page.locator(f"a:text-is('{tab_name}')").count() > 0 or
+                tab_name in page_content):
                 found_tabs.append(tab_name)
 
-        tabs_ok = len(found_tabs) >= 5
-        record("Dashboard Tabs Present", tabs_ok, f"Found {len(found_tabs)}/6 tabs: {found_tabs}")
+        missing_tabs = [t for t in expected_tabs if t not in found_tabs]
+        tabs_ok = (len(missing_tabs) == 0 and len(found_tabs) == len(expected_tabs))
+
+        if tabs_ok:
+            record("Dashboard Tabs Present", True, f"All 6 tabs verified present: {found_tabs}")
+        else:
+            record("Dashboard Tabs Present", False, f"Missing tab(s): {missing_tabs}. Found {len(found_tabs)}/6: {found_tabs}")
 
         # Step 6: Cluster tab verification & screenshots of all tabs (strictly read-only navigation)
         tab_index = 2
@@ -421,21 +450,27 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             clean_name = tab_name.lower().replace(" ", "_").replace("&", "and")
             shot_path = os.path.join(EVIDENCE_DIR, f"{ts}_{tab_index:02d}_{clean_name}.png")
 
-            tab_loc = page.locator(f"span:text-is('{tab_name}')").first
+            tab_loc = page.locator(f"span#{tab_name}").first
+            if tab_loc.count() == 0:
+                tab_loc = page.locator(f"span:text-is('{tab_name}')").first
             if tab_loc.count() == 0:
                 tab_loc = page.locator(f"a:text-is('{tab_name}')").first
             
             clicked = False
-            if tab_loc.count() > 0 and tab_loc.is_visible():
+            if tab_loc.count() > 0:
                 try:
                     tab_loc.click()
                     clicked = True
                 except Exception:
-                    pass
+                    try:
+                        tab_loc.dispatch_event("click")
+                        clicked = True
+                    except Exception:
+                        pass
 
             if not clicked:
                 # Try via More dropdown if present
-                more_loc = page.locator("a:has-text('More'), span:has-text('More')").first
+                more_loc = page.locator("#show-more-dropdown span.dropdown-toggle, a:has-text('More'), span:has-text('More')").first
                 if more_loc.count() > 0 and more_loc.is_visible():
                     try:
                         more_loc.click()
@@ -448,15 +483,34 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                         pass
 
             if clicked:
-                time.sleep(3)
+                time.sleep(5)
                 page.screenshot(path=shot_path, full_page=True)
 
                 if tab_name == "Cluster":
                     cl_content = page.content()
-                    has_nodes = "Cluster_Nodes" in cl_content or "cluster_nodes" in cl_content.lower()
-                    has_standbys = "Replication_Standbys" in cl_content or "replication_standbys" in cl_content.lower()
-                    record("Cluster Tab Child Tables", has_nodes and has_standbys,
-                           f"Cluster_Nodes: {has_nodes}, Replication_Standbys: {has_standbys}", shot_path)
+                    has_nodes_hdr = "Cluster_Nodes" in cl_content or "cluster_nodes" in cl_content.lower()
+                    has_standbys_hdr = "Replication_Standbys" in cl_content or "replication_standbys" in cl_content.lower()
+                    record("Cluster Tab Child Tables Structure", has_nodes_hdr and has_standbys_hdr,
+                           f"Cluster_Nodes: {has_nodes_hdr}, Replication_Standbys: {has_standbys_hdr}", shot_path)
+
+                    # Assert Cluster_Nodes table shows 3 rows and role column has 'primary' for exactly one row
+                    node_rows = page.locator("tr:has-text('5441'), tr:has-text('5442'), tr:has-text('5443')").all()
+                    if len(node_rows) == 0:
+                        c_widget = page.locator("text='Cluster_Nodes list'").locator("xpath=ancestor::div[contains(@class, 'widget') or contains(@class, 'box') or contains(@class, 'panel')][1]")
+                        if c_widget.count() > 0:
+                            node_rows = c_widget.locator("tbody tr, tr").all()
+
+                    row_count = len(node_rows)
+                    primary_rows = [r for r in node_rows if "primary" in r.inner_text().lower()]
+                    primary_count = len(primary_rows)
+
+                    nodes_table_ok = (row_count == 3 and primary_count == 1)
+                    nodes_details = f"Rows found: {row_count}/3, primary row count: {primary_count}/1"
+                    if not nodes_table_ok:
+                        row_texts = [r.inner_text().strip().replace('\n', ' | ') for r in node_rows]
+                        nodes_details += f" (Observed: {row_texts if row_texts else 'No data rows rendered'})"
+
+                    record("Cluster_Nodes Table Rows and Role", nodes_table_ok, nodes_details, shot_path)
             tab_index += 1
 
         try:

@@ -307,7 +307,7 @@ try {
         } elseif ($pwExit -eq 130 -or $pwText -match "cancelled by user") {
             Write-Host "  [SKIP] Console Automation: Cancelled by user (Ctrl+C)." -ForegroundColor Yellow
             Write-Report "- **[SKIP]** Console Automation: Cancelled by user (Ctrl+C)"
-        } elseif ($pwExit -eq 3 -or $pwText -match "Authentication not completed" -or $pwText -match "Session expired" -or $pwText -match "session has expired" -or $pwText -match "login session not active" -or $pwText -match "MANUAL AUTHENTICATION") {
+        } elseif ($pwExit -eq 3 -or ($pwExit -ne 1 -and ($pwText -match "Authentication not completed" -or $pwText -match "Session expired" -or $pwText -match "login session not active"))) {
             $reason = "Site24x7 web console session not active or login timed out. Log in once in the Chrome window."
             Write-Host "  [SKIP] Console Automation: $reason" -ForegroundColor Yellow
             Write-Report "- **[SKIP]** Console Automation: $reason"
