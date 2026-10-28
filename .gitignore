@@ -16,6 +16,8 @@ pg_out*
 *.log
 scratch/
 test-output/
+evidence/
+.auth/
 __pycache__/
 *.pyc
 

@@ -428,7 +428,7 @@ class pgsql():
         try:
             cur.execute("""
                 SELECT 
-                    (SELECT count(*) FROM pg_stat_activity) as active_conn,
+                    (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend') as active_conn,
                     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn,
                     (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') as reserved_conn;
             """)
@@ -442,9 +442,27 @@ class pgsql():
                 self._results["Available Connections"] = str(avail)
                 self._results["Connection Utilization Percent"] = str(u_pct)
         except Exception:
-            self._conn.rollback()
-            self._results["Available Connections"] = "0"
-            self._results["Connection Utilization Percent"] = "0"
+            try:
+                self._conn.rollback()
+                cur.execute("""
+                    SELECT 
+                        (SELECT count(*) FROM pg_stat_activity WHERE client_addr IS NOT NULL) as active_conn,
+                        (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn,
+                        (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') as reserved_conn;
+                """)
+                cn_row = cur.fetchone()
+                if cn_row:
+                    a_conn = int(cn_row[0] or 0)
+                    m_conn = int(cn_row[1] or 100)
+                    r_conn = int(cn_row[2] or 3)
+                    avail = max(0, m_conn - r_conn - a_conn)
+                    u_pct = round((a_conn / m_conn) * 100, 2) if m_conn > 0 else 0.0
+                    self._results["Available Connections"] = str(avail)
+                    self._results["Connection Utilization Percent"] = str(u_pct)
+            except Exception:
+                self._conn.rollback()
+                self._results["Available Connections"] = "0"
+                self._results["Connection Utilization Percent"] = "0"
 
         cur.close()
 
@@ -469,8 +487,9 @@ class pgsql():
                 tab_result[db_column_names[i]] = str(j)
             db_result.append(tab_result)
 
-        self._results["Tranasctions_and_Session_per_Database"] = conn_result
-        self._results["Stats_per_DB"] = db_result
+        # Enforce Site24x7 25-row tabular limit
+        self._results["Tranasctions_and_Session_per_Database"] = conn_result[:25]
+        self._results["Stats_per_DB"] = db_result[:25]
 
 
 def clean_quotes(value):
@@ -1013,9 +1032,9 @@ class PostgresClusterCollector:
         results["Logical Slots"] = slots_logical
         results["Max Slot Lag Bytes"] = max_slot_lag_bytes
 
-        # Ensure child tables
-        results["Cluster_Nodes"] = cluster_nodes
-        results["Replication_Standbys"] = replication_standbys
+        # Ensure child tables (enforce Site24x7 25-row tabular limit)
+        results["Cluster_Nodes"] = cluster_nodes[:25]
+        results["Replication_Standbys"] = replication_standbys[:25]
 
         # Ensure s247config child discovery
         results["s247config"] = {
