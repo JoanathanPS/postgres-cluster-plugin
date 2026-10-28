@@ -20,7 +20,7 @@ DB = 'postgres'                                          # Database name to conn
 PATRONI_PORT = '8008'                                    # Optional Patroni REST API port or mapping
 CONNECT_TIMEOUT = 2                                      # Timeout for connecting to each node
 
-PLUGIN_VERSION = 1
+PLUGIN_VERSION = 2
 HEARTBEAT = True
 
 VERSION = None

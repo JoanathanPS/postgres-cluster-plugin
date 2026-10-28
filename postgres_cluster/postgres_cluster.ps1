@@ -43,7 +43,7 @@ if (-not $PythonExe) {
 
 if (-not $PythonExe) {
     $errObj = @{
-        plugin_version     = 1
+        plugin_version     = 2
         heartbeat_required = $true
         status             = 0
         msg                = "Python 3 executable not found on host. Please ensure Python is installed with psycopg2-binary."
@@ -63,7 +63,7 @@ if (-not (Test-Path $implScript)) {
 
 if (-not (Test-Path $implScript)) {
     $errObj = @{
-        plugin_version     = 1
+        plugin_version     = 2
         heartbeat_required = $true
         status             = 0
         msg                = "PostgreSQL cluster script not found in: $PSScriptRoot"
@@ -107,7 +107,7 @@ try {
     }
 } catch {
     $errObj = @{
-        plugin_version     = 1
+        plugin_version     = 2
         heartbeat_required = $true
         status             = 0
         msg                = "Exception executing Python script: $($_.Exception.Message)"
