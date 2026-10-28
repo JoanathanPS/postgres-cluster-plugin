@@ -3,10 +3,10 @@
     Site24x7 PostgreSQL Cluster Plugin Windows Installer
 .DESCRIPTION
     Installs and configures the postgres_cluster plugin for the Site24x7 Windows Agent.
-    Validates Python and psycopg2-binary, deploys the PowerShell wrapper and Python collector,
-    ensures exactly one runnable plugin entry is placed in the agent plugin directory,
-    generates the unencrypted configuration (which the agent subsequently encrypts),
-    and validates plugin execution.
+    - Locates the active Python 3 runtime and ensures psycopg2-binary is installed for that exact Python.
+    - Ensures Python is registered in the Machine PATH so the LocalSystem agent service can invoke it.
+    - Deploys postgres_cluster.py and postgres_cluster.cfg with redirect_output=1 under [global_configurations].
+    - Verifies plugin output and JSON schema prior to completing installation.
 .PARAMETER Nodes
     Comma-separated list of cluster nodes (default: "127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443")
 .PARAMETER Username
@@ -19,14 +19,18 @@
     Patroni REST API port or mapping (default: "8008")
 .PARAMETER AgentDir
     Site24x7 Windows Agent directory (default: "C:\Program Files (x86)\Site24x7\WinAgent")
+.PARAMETER PluginFolderName
+    Plugin subfolder and script base name (default: "postgres_cluster")
 .PARAMETER NonInteractive
     Runs without interactive prompts (for automated deployment)
 .PARAMETER SkipAdminCheck
     Skips the Administrator privilege check
+.PARAMETER DryRun
+    Validates environment and runs plugin without modifying the Agent directory
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -NonInteractive
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443" -Username "site24x7" -Password "site24x7" -NonInteractive
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_dev" -NonInteractive
 #>
 
 [CmdletBinding()]
@@ -37,8 +41,10 @@ param(
     [string]$Database = "postgres",
     [string]$PatroniPort = "8008",
     [string]$AgentDir = "C:\Program Files (x86)\Site24x7\WinAgent",
+    [string]$PluginFolderName = "postgres_cluster",
     [switch]$NonInteractive,
-    [switch]$SkipAdminCheck
+    [switch]$SkipAdminCheck,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,12 +79,12 @@ function Check-Admin {
 # 1. Administrator Check
 # ==============================================================================
 Write-Step "1/5 Checking Permissions"
-if ($SkipAdminCheck) {
-    Write-WarningMsg "Skipping Administrator check (-SkipAdminCheck passed)."
+if ($DryRun -or $SkipAdminCheck) {
+    Write-WarningMsg "Skipping Administrator check (DryRun/SkipAdminCheck enabled)."
 } else {
     $isAdmin = Check-Admin
     if (-not $isAdmin) {
-        Write-WarningMsg "Administrator privileges are required to install plugins into the Site24x7 Agent directory."
+        Write-WarningMsg "Administrator privileges are required to deploy files into '$AgentDir'."
         if (-not $NonInteractive) {
             $elevate = Read-Host "Would you like to relaunch this installer as Administrator? (Y/n)"
             if ($elevate -eq "" -or $elevate -match "^[Yy]") {
@@ -89,6 +95,7 @@ if ($SkipAdminCheck) {
                 if ($Database) { $argList += " -Database `"$Database`"" }
                 if ($PatroniPort) { $argList += " -PatroniPort `"$PatroniPort`"" }
                 if ($AgentDir) { $argList += " -AgentDir `"$AgentDir`"" }
+                if ($PluginFolderName) { $argList += " -PluginFolderName `"$PluginFolderName`"" }
                 Start-Process powershell -Verb RunAs -ArgumentList $argList
                 exit 0
             }
@@ -100,7 +107,7 @@ if ($SkipAdminCheck) {
 }
 
 # ==============================================================================
-# 2. Locate Python and psycopg2-binary
+# 2. Locate Python and Verify psycopg2-binary
 # ==============================================================================
 Write-Step "2/5 Locating Python 3 and psycopg2-binary"
 
@@ -112,11 +119,11 @@ $candidatePythons = @(
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "C:\Program Files\Python313\python.exe",
-    "C:\Program Files\Python311\python.exe",
-    "C:\Program Files\Python312\python.exe"
+    "C:\Program Files\Python312\python.exe",
+    "C:\Program Files\Python311\python.exe"
 )
 foreach ($p in $candidatePythons) {
-    if (Test-Path $p) {
+    if ($p -and (Test-Path $p)) {
         $PythonExe = $p
         break
     }
@@ -150,37 +157,37 @@ if (-not $PythonExe) {
 }
 
 if (-not $PythonExe) {
-    Write-ErrorMsg "Python 3 could not be located. Please install Python 3 and rerun."
+    Write-ErrorMsg "Python 3 could not be located. Please install Python 3 and add it to PATH."
     exit 1
 }
 
 $pyVersion = (& $PythonExe --version 2>&1).ToString().Trim()
-Write-Success "Found Python: $PythonExe ($pyVersion)"
+Write-Success "Found Python runtime: $PythonExe ($pyVersion)"
 
-# Ensure psycopg2-binary is installed
+# Ensure psycopg2-binary is installed for this exact Python runtime
 Write-Host "Verifying psycopg2 module..."
 $psycopgCheck = & $PythonExe -c "import psycopg2; print(psycopg2.__version__)" 2>&1
 if ($LASTEXITCODE -ne 0) {
-    Write-WarningMsg "psycopg2 is not installed. Installing psycopg2-binary..."
+    Write-WarningMsg "psycopg2 is not installed in $PythonExe. Installing psycopg2-binary..."
     & $PythonExe -m pip install --quiet psycopg2-binary
     if ($LASTEXITCODE -ne 0) {
-        Write-ErrorMsg "Failed to install psycopg2-binary."
+        Write-ErrorMsg "Failed to install psycopg2-binary into $PythonExe."
         exit 1
     }
-    Write-Success "psycopg2-binary installed."
+    Write-Success "psycopg2-binary installed successfully."
 } else {
-    Write-Success "psycopg2 is available (v$psycopgCheck)."
+    Write-Success "psycopg2 is available (version $psycopgCheck)."
 }
 
-# Ensure Python directory is in Machine PATH for LocalSystem service
+# Ensure Python directory is in Machine PATH for LocalSystem agent service
 $pyFolder = Split-Path -Parent $PythonExe
 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 if ($machinePath -and $machinePath -notmatch [regex]::Escape($pyFolder)) {
     try {
         [Environment]::SetEnvironmentVariable("Path", "$pyFolder;$machinePath", "Machine")
-        Write-Success "Added Python directory to Machine PATH."
+        Write-Success "Added Python folder '$pyFolder' to Machine PATH."
     } catch {
-        Write-WarningMsg "Could not update Machine PATH: $_"
+        Write-WarningMsg "Could not update Machine PATH (non-critical if already in PATH): $_"
     }
 }
 
@@ -212,53 +219,45 @@ if (-not $NonInteractive) {
 }
 
 Write-Host "Config summary:"
-Write-Host "  Nodes:        $Nodes"
-Write-Host "  User:         $Username"
-Write-Host "  Database:     $Database"
-Write-Host "  Patroni Port: $PatroniPort"
+Write-Host "  Nodes:              $Nodes"
+Write-Host "  User:               $Username"
+Write-Host "  Database:           $Database"
+Write-Host "  Patroni Port:       $PatroniPort"
+Write-Host "  Target Plugin Name: $PluginFolderName"
 
 # ==============================================================================
-# 4. Deploy Plugin to Site24x7 Agent
+# 4. Deploy Plugin to Site24x7 Agent Directory
 # ==============================================================================
-Write-Step "4/5 Deploying to Site24x7 Agent Directory"
+Write-Step "4/5 Deploying Plugin Files"
 
-$targetPluginsDir = Join-Path $AgentDir "monitoring\Plugins\postgres_cluster"
+$targetPluginsDir = Join-Path $AgentDir "monitoring\Plugins\$PluginFolderName"
 
-if (-not (Test-Path $AgentDir)) {
-    Write-WarningMsg "Site24x7 Agent directory not found at '$AgentDir'."
-    Write-WarningMsg "Staging plugin files in: $ScriptDir"
-    exit 0
-}
+if ($DryRun) {
+    Write-Success "[DRY RUN] Would deploy to: $targetPluginsDir"
+} else {
+    if (-not (Test-Path $AgentDir)) {
+        Write-WarningMsg "Site24x7 Agent directory not found at '$AgentDir'."
+        Write-WarningMsg "Staging plugin files in: $ScriptDir"
+    } else {
+        try {
+            if (-not (Test-Path $targetPluginsDir)) {
+                New-Item -ItemType Directory -Path $targetPluginsDir -Force | Out-Null
+            }
 
-try {
-    if (-not (Test-Path $targetPluginsDir)) {
-        New-Item -ItemType Directory -Path $targetPluginsDir -Force | Out-Null
-    }
+            $sourcePy = Join-Path $ScriptDir "postgres_cluster.py"
+            $destPy = Join-Path $targetPluginsDir "$PluginFolderName.py"
 
-    $ps1Source = Join-Path $ScriptDir "postgres_cluster.ps1"
-    $pySource = Join-Path $ScriptDir "postgres_cluster.py"
+            # Copy Python collector
+            Copy-Item -Path $sourcePy -Destination $destPy -Force
+            Write-Success "Deployed collector to $destPy"
 
-    # Deploy postgres_cluster.ps1 as the ONE runnable plugin entry
-    Copy-Item -Path $ps1Source -Destination (Join-Path $targetPluginsDir "postgres_cluster.ps1") -Force
-    Write-Success "Deployed postgres_cluster.ps1"
-
-    # Deploy python collector as postgres_cluster_impl.py (non-matching name so agent only registers the .ps1)
-    Copy-Item -Path $pySource -Destination (Join-Path $targetPluginsDir "postgres_cluster_impl.py") -Force
-    Write-Success "Deployed postgres_cluster_impl.py"
-
-    # Remove postgres_cluster.py if present to prevent multiple plugin registrations
-    $oldPy = Join-Path $targetPluginsDir "postgres_cluster.py"
-    if (Test-Path $oldPy) {
-        Remove-Item -Path $oldPy -Force -ErrorAction SilentlyContinue
-    }
-
-    # Write configuration file
-    $cfgContent = @"
+            # Deploy configuration file with redirect_output=1 under [global_configurations]
+            $cfgContent = @"
 [global_configurations]
 use_agent_python=0
-redirect_output="1"
+redirect_output=1
 
-[postgres_cluster]
+[$PluginFolderName]
 nodes="$Nodes"
 username="$Username"
 password="$Password"
@@ -266,13 +265,15 @@ db="$Database"
 patroni_port="$PatroniPort"
 "@
 
-    $targetCfg = Join-Path $targetPluginsDir "postgres_cluster.cfg"
-    Set-Content -Path $targetCfg -Value $cfgContent -Encoding UTF8
-    (Get-Item $targetCfg).LastWriteTime = Get-Date
-    Write-Success "Deployed postgres_cluster.cfg (unencrypted, agent will encrypt)"
-} catch {
-    Write-ErrorMsg "Failed to deploy files to ${targetPluginsDir}: $_"
-    exit 1
+            $targetCfg = Join-Path $targetPluginsDir "$PluginFolderName.cfg"
+            Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii
+            (Get-Item $targetCfg).LastWriteTime = Get-Date
+            Write-Success "Deployed configuration to $targetCfg (unencrypted, agent will encrypt)"
+        } catch {
+            Write-ErrorMsg "Failed to deploy files to ${targetPluginsDir}: $_"
+            exit 1
+        }
+    }
 }
 
 # ==============================================================================
@@ -280,23 +281,27 @@ patroni_port="$PatroniPort"
 # ==============================================================================
 Write-Step "5/5 Validating Plugin Execution"
 
-$testPs1 = Join-Path $targetPluginsDir "postgres_cluster.ps1"
+$scriptToRun = if ($DryRun) { Join-Path $ScriptDir "postgres_cluster.py" } else { Join-Path $targetPluginsDir "$PluginFolderName.py" }
 $testArgs = @(
-    "-File", $testPs1,
-    "-nodes", $Nodes,
-    "-username", $Username,
-    "-password", $Password,
-    "-db", $Database
+    $scriptToRun,
+    "--nodes", $Nodes,
+    "--username", $Username,
+    "--password", $Password,
+    "--db", $Database
 )
 if ($PatroniPort -and $PatroniPort -ne "none") {
-    $testArgs += @("-patroni_port", $PatroniPort)
+    $testArgs += @("--patroni_port", $PatroniPort)
 }
 
-$output = & powershell.exe @testArgs 2>&1
+Write-Host "Running collector verification via $PythonExe..."
+$t0 = [System.Diagnostics.Stopwatch]::StartNew()
+$output = & $PythonExe @testArgs 2>&1
+$t0.Stop()
 $exitCode = $LASTEXITCODE
+$elapsedMs = $t0.ElapsedMilliseconds
 
 if ($exitCode -ne 0) {
-    Write-ErrorMsg "Plugin validation failed with exit code $exitCode."
+    Write-ErrorMsg "Plugin validation failed with exit code $exitCode (elapsed: ${elapsedMs}ms)."
     Write-Host $output -ForegroundColor Yellow
     exit 1
 }
@@ -307,14 +312,16 @@ try {
         Write-ErrorMsg "Plugin returned status 0 (error condition): $($json.msg)"
         exit 1
     }
-    Write-Success "Plugin validation succeeded!"
+    Write-Success "Plugin validation succeeded in ${elapsedMs}ms!"
+    Write-Host "  Plugin Version:      $($json.plugin_version)" -ForegroundColor Gray
     Write-Host "  Nodes Total:         $($json.'Nodes Total')" -ForegroundColor Gray
     Write-Host "  Nodes Up:            $($json.'Nodes Up')" -ForegroundColor Gray
     Write-Host "  Primary Count:       $($json.'Primary Count')" -ForegroundColor Gray
     Write-Host "  Primary Timeline:    $($json.'Primary Timeline')" -ForegroundColor Gray
     Write-Host "  Max Replay Backlog:  $($json.'Max Replay Backlog') bytes" -ForegroundColor Gray
+    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Physical Slots') physical, $($json.'Logical Slots') logical)" -ForegroundColor Gray
     Write-Host "  Cluster Nodes:       $($json.Cluster_Nodes.Count) rows" -ForegroundColor Gray
-    Write-Host "  Standby Rows:        $($json.Replication_Standbys.Count) rows" -ForegroundColor Gray
+    Write-Host "  Standbys Detected:   $($json.Replication_Standbys.Count) rows" -ForegroundColor Gray
 } catch {
     Write-ErrorMsg "Failed to parse plugin output as JSON: $_"
     Write-Host $output
@@ -324,9 +331,10 @@ try {
 Write-Host @"
 
 ==================================================================
- Site24x7 PostgreSQL Cluster Plugin Installed Successfully!
+ Site24x7 PostgreSQL Cluster Plugin Setup Verified Successfully!
 ==================================================================
-Directory: $targetPluginsDir
+Plugin Target: $targetPluginsDir
+Python:        $PythonExe
 
 Agent Lifecycle:
 1. Registration: The agent registers the plugin within ~50 seconds.
@@ -335,7 +343,7 @@ Agent Lifecycle:
    Check: Get-Content -Path "$AgentDir\monitoring\logs\Details\PluginLog.log" -Tail 25
 3. In Site24x7 Web Console:
    - Navigate to: Plugins -> Plugin Integrations
-   - Open monitor: postgres_cluster
-   - Verify: Cluster tab, Cluster_Nodes table, Replication_Standbys table.
+   - Open monitor: $PluginFolderName
+   - Verify: 6 Dashboard tabs, Cluster_Nodes table, Replication_Standbys table.
 ==================================================================
 "@ -ForegroundColor Green

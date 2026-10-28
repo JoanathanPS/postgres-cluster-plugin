@@ -162,8 +162,9 @@ deploy_plugin() {
     cat > "$agent_dir/plugins/$plugin/postgres_cluster.cfg" <<EOF
 [global_configurations]
 use_agent_python=1
+redirect_output=1
 
-[postgres_cluster]
+[pg_cluster]
 nodes="$nodes"
 username="$username"
 password="$password"
