@@ -201,19 +201,50 @@ To implement this fix:
 2. The script deploys `postgres_cluster.py` and `postgres_cluster.cfg` to `/opt/site24x7/monagent/plugins/postgres_cluster/` and installs `psycopg2-binary` into the agent's Python environment.
 3. Monitor logs in `/opt/site24x7/monagent/logs/details/plugins.txt`.
 
-### 7.3 What to Confirm in the Site24x7 Web Console
+### 7.3 Windows Agent Execution, Pipe Deadlock, and the `redirect_output` Fix
+#### Root Cause of the Windows Timeout Issue
+When the Site24x7 Windows Agent executes plugins on Windows (`Site24x7PluginAgent.exe`), it creates a child process with redirected standard output and calls `Process.WaitForExit(timeout)` **before** reading stdout via `StandardOutput.ReadToEnd()`. 
+
+On Windows, anonymous pipes have a fixed 4096-byte (4 KB) kernel buffer. Because the PostgreSQL cluster plugin returns a rich JSON payload (~6.3 KB) including cluster metrics, custom tabs, units, and child table discoveries (`Cluster_Nodes`, `Replication_Standbys`, `Stats_per_DB`, `Tranasctions_and_Session_per_Database`), the process blocks when attempting to flush stdout past 4 KB. Concurrently, the agent waits indefinitely for the process to exit, resulting in a classic deadlock. After 160 s during registration (or 50 s during periodic data collection), the agent times out and terminates the process, causing the error:
+`"No attributes to monitor. Plugin output is empty or not in Json format \n"`.
+
+#### The Solution
+1. **Agent Output Redirection (`redirect_output=1`)**:
+   Site24x7 agent's internal configuration parser checks for `redirect_output=1` inside the `[global_configurations]` section of `postgres_cluster.cfg`. When enabled, the agent configures the process runner to redirect stdout directly to a temporary file (`cmd.exe /c ... > "_output.txt" 2> "_error.txt"`), completely bypassing Windows anonymous pipe buffer limits.
+   ```ini
+   [global_configurations]
+   use_agent_python=0
+   redirect_output="1"
+
+   [postgres_cluster]
+   nodes="127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443"
+   username="site24x7"
+   password="CHANGE_ME"
+   db="postgres"
+   patroni_port="8008"
+   ```
+2. **PowerShell Plugin Wrapper (`postgres_cluster.ps1`)**:
+   Deploys alongside `postgres_cluster_impl.py` to handle Windows argument passing, path resolution for 64-bit Python 3.x, and clean output streaming to stdout, completing execution in under 2 seconds.
+
+### 7.4 What to Confirm in the Site24x7 Web Console
 1. **Navigation**: In the Site24x7 Web Console, go to **Plugins** $\to$ **Plugin Integrations**.
-2. **Monitor Name**: Click on **`postgres_cluster`**.
+2. **Monitor Name**: Click on **`postgres_cluster`** (or your configured instance name).
+   > **Note on Schema Updates**: Site24x7 binds a monitor's attribute schema upon initial registration. If a monitor was previously registered with a partial test payload (e.g. only `Nodes Up`), delete the monitor from the Site24x7 Web Console (Plugins $\to$ click monitor $\to$ Delete) so the agent re-registers it with the full schema, all tabs, and child tables.
 3. **Cluster Tab (Order 1)**: Verify the primary dashboard tab shows:
    - `Nodes Total`: 3, `Nodes Up`: 3
-   - `Primary Count`: 1, `Primary Timeline`: 5
+   - `Primary Count`: 1, `Primary Timeline`: 5 (or current timeline)
    - `No Primary Flag`: 0, `Split Brain Flag`: 0
    - `Max Replay Backlog`: 0 bytes
    - `Replication Slots Total`: 2, `Active`: 2, `Inactive`: 0
+   - `Max Slot Lag Bytes`: 0 bytes
 4. **Child Tables**:
-   - **`Cluster_Nodes`**: Lists every cluster node (`127.0.0.1:5441`, `5442`, `5443`) with its role (`primary`/`standby`), health `status` (`up`/`down`), timeline, and response time.
+   - **`Cluster_Nodes`**: Lists every cluster node (`127.0.0.1:5441`, `5442`, `5443`) with role (`primary`/`standby`), health `status` (`up`/`down`), timeline, and response time.
    - **`Replication_Standbys`**: Lists connected streaming replicas (`pg-node1`, `pg-node3`) with sync state, replay lag, and flush lag.
    - **`Stats_per_DB`** and **`Tranasctions_and_Session_per_Database`**: Metrics collected from the detected active primary.
+5. **Additional Performance Tabs**:
+   - **DB and IO stats**: Per-DB table, row operations (inserted/updated/deleted/fetched/returned), block reads & hits.
+   - **BG Writer**: Checkpoints timed & requested, buffer allocations, sync times.
+   - **Transactions and Sessions**: Transactions per DB, commits, rollbacks, conflicts, active & idle sessions.
 
 ---
 

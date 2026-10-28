@@ -7,6 +7,7 @@ patroni-cluster/.env
 
 # test artefacts
 test-output/
+scratch/
 __pycache__/
 *.pyc
 ScheduledTask/

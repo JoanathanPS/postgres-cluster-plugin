@@ -3,8 +3,8 @@
     Site24x7 PostgreSQL Cluster Plugin PowerShell Runner
 .DESCRIPTION
     Executes the PostgreSQL cluster monitor via Python and returns JSON metrics
-    to the Site24x7 Windows Agent. Uses file-redirected execution to eliminate
-    Windows anonymous pipe buffer deadlocks.
+    to the Site24x7 Windows Agent. Uses Write-Output and works seamlessly with
+    Site24x7 agent's redirect_output=1 configuration to avoid anonymous pipe limits.
 #>
 
 param(
@@ -20,7 +20,6 @@ $ErrorActionPreference = "Continue"
 # 1. Locate Python executable
 $PythonExe = $null
 
-# Priority 1: Check known 64-bit Python install locations
 $candidatePythons = @(
     "C:\Users\Joanathan\AppData\Local\Programs\Python\Python313\python.exe",
     "C:\Users\Joanathan\AppData\Local\Programs\Python\Python311\python.exe",
@@ -35,28 +34,10 @@ foreach ($p in $candidatePythons) {
     }
 }
 
-# Priority 2: Check Machine & User PATH
 if (-not $PythonExe) {
     $pyCmd = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($pyCmd -and $pyCmd.Source -notmatch "WindowsApps") {
         $PythonExe = $pyCmd.Source
-    }
-}
-
-# Priority 3: Check py launcher
-if (-not $PythonExe) {
-    $pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyLauncher) {
-        $lines = & py -0p 2>&1
-        foreach ($line in $lines) {
-            if ($line -match '([A-Z]:\\[^\s]+\\python\.exe)') {
-                $candidate = $matches[1]
-                if (Test-Path $candidate) {
-                    $PythonExe = $candidate
-                    break
-                }
-            }
-        }
     }
 }
 
@@ -108,17 +89,13 @@ try {
     $output = & $PythonExe @pyArgs 2>&1
     $exitCode = $LASTEXITCODE
 
-    # Normalize output string
     $outStr = ($output -join "`n").Trim()
 
     if ($outStr -match '^\s*\{.*"plugin_version".*\}\s*$') {
-        # Valid JSON output from Python script
-        [Console]::Out.Write($outStr)
+        Write-Output $outStr
     } elseif ($outStr -match '^\s*\{.*\}\s*$') {
-        # Other valid JSON
-        [Console]::Out.Write($outStr)
+        Write-Output $outStr
     } else {
-        # Non-JSON or execution error
         $msg = if ($outStr) { $outStr } else { "Process exited with code $exitCode and empty output" }
         $errObj = @{
             plugin_version     = 1

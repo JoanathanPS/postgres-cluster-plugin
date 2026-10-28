@@ -254,6 +254,10 @@ try {
 
     # Write configuration file
     $cfgContent = @"
+[global_configurations]
+use_agent_python=0
+redirect_output="1"
+
 [postgres_cluster]
 nodes="$Nodes"
 username="$Username"
