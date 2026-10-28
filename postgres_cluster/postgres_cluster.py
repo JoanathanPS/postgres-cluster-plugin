@@ -20,7 +20,7 @@ DB = 'postgres'                                          # Database name to conn
 PATRONI_PORT = '8008'                                    # Optional Patroni REST API port or mapping
 CONNECT_TIMEOUT = 2                                      # Timeout for connecting to each node
 
-PLUGIN_VERSION = 2
+PLUGIN_VERSION = 3
 HEARTBEAT = True
 
 VERSION = None
@@ -42,6 +42,8 @@ tabs = {
                 "Replication Slots Total",
                 "Replication Slots Active",
                 "Replication Slots Inactive",
+                "Physical Slots",
+                "Logical Slots",
                 "Max Slot Lag Bytes"
             ]
         },
@@ -87,6 +89,33 @@ tabs = {
                 "Transactions Idle In Transaction",
                 "Transactions Open"
             ]
+        },
+        "Write Ahead Log": {
+            "order": "5",
+            "tablist": [
+                "Current WAL LSN",
+                "WAL Insert LSN",
+                "WAL Flush LSN",
+                "WAL Files Count",
+                "WAL Total Size",
+                "Archive Status Success",
+                "Archive Status Failed",
+                "Archive Ready Files Count"
+            ]
+        },
+        "Recovery Conflicts": {
+            "order": "6",
+            "tablist": [
+                "Recovery Conflicts Total",
+                "Conflicts Tablespace",
+                "Conflicts Lock",
+                "Conflicts Snapshot",
+                "Conflicts Buffer Pin",
+                "Conflicts Deadlock",
+                "Oldest Running Transaction Age",
+                "Available Connections",
+                "Connection Utilization Percent"
+            ]
         }
     }
 }
@@ -102,8 +131,12 @@ units = {
     "Replication Slots Total": "slots",
     "Replication Slots Active": "slots",
     "Replication Slots Inactive": "slots",
+    "Physical Slots": "slots",
+    "Logical Slots": "slots",
     "Max Slot Lag Bytes": "bytes",
     "Active Connections": "connections",
+    "Available Connections": "connections",
+    "Connection Utilization Percent": "%",
     "Max Connections": "connections",
     "Uptime": "s",
     "Total Rows Deleted": "rows",
@@ -120,7 +153,22 @@ units = {
     "Transactions Idle In Transaction": "transactions",
     "Transactions Open": "transactions",
     "Locks Count": "locks",
-    "Database Count": "databases"
+    "Database Count": "databases",
+    "Current WAL LSN": "MB",
+    "WAL Insert LSN": "MB",
+    "WAL Flush LSN": "MB",
+    "WAL Files Count": "files",
+    "WAL Total Size": "MB",
+    "Archive Status Success": "files",
+    "Archive Status Failed": "files",
+    "Archive Ready Files Count": "files",
+    "Recovery Conflicts Total": "conflicts",
+    "Conflicts Tablespace": "conflicts",
+    "Conflicts Lock": "conflicts",
+    "Conflicts Snapshot": "conflicts",
+    "Conflicts Buffer Pin": "conflicts",
+    "Conflicts Deadlock": "conflicts",
+    "Oldest Running Transaction Age": "s"
 }
 
 dict_psqlQueries = OrderedDict({})
@@ -269,6 +317,134 @@ class pgsql():
         except Exception as e:
             self._msg = self._msg + "," + str(e)
             self._conn.rollback()
+
+        # === WAL & Archiving Metrics ===
+        try:
+            cur.execute("""
+                SELECT 
+                    ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024.0 / 1024.0, 2),
+                    ROUND(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0') / 1024.0 / 1024.0, 2),
+                    ROUND(pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') / 1024.0 / 1024.0, 2);
+            """)
+            w_row = cur.fetchone()
+            if w_row:
+                self._results["Current WAL LSN"] = str(w_row[0] if w_row[0] is not None else 0.0)
+                self._results["WAL Insert LSN"] = str(w_row[1] if w_row[1] is not None else 0.0)
+                self._results["WAL Flush LSN"] = str(w_row[2] if w_row[2] is not None else 0.0)
+        except Exception:
+            self._conn.rollback()
+            self._results["Current WAL LSN"] = "0.0"
+            self._results["WAL Insert LSN"] = "0.0"
+            self._results["WAL Flush LSN"] = "0.0"
+
+        try:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as wal_files_count,
+                    COALESCE(ROUND(SUM(size) / 1024.0 / 1024.0, 2), 0) as total_size_mb
+                FROM pg_ls_waldir();
+            """)
+            w_dir = cur.fetchone()
+            if w_dir:
+                self._results["WAL Files Count"] = str(w_dir[0] if w_dir[0] is not None else 0)
+                self._results["WAL Total Size"] = str(w_dir[1] if w_dir[1] is not None else 0.0)
+        except Exception:
+            self._conn.rollback()
+            self._results["WAL Files Count"] = "0"
+            self._results["WAL Total Size"] = "0.0"
+
+        try:
+            cur.execute("""
+                SELECT 
+                    COALESCE(archived_count, 0),
+                    COALESCE(failed_count, 0),
+                    COALESCE(last_archived_wal, 'No WAL archived yet')
+                FROM pg_stat_archiver;
+            """)
+            a_row = cur.fetchone()
+            if a_row:
+                self._results["Archive Status Success"] = str(a_row[0] if a_row[0] is not None else 0)
+                self._results["Archive Status Failed"] = str(a_row[1] if a_row[1] is not None else 0)
+                self._results["Last Archived WAL File"] = str(a_row[2] if a_row[2] else "No WAL archived yet")
+        except Exception:
+            self._conn.rollback()
+            self._results["Archive Status Success"] = "0"
+            self._results["Archive Status Failed"] = "0"
+            self._results["Last Archived WAL File"] = "No WAL archived yet"
+
+        try:
+            cur.execute("SELECT COUNT(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
+            r_row = cur.fetchone()
+            if r_row:
+                self._results["Archive Ready Files Count"] = str(r_row[0] if r_row[0] is not None else 0)
+        except Exception:
+            self._conn.rollback()
+            self._results["Archive Ready Files Count"] = "0"
+
+        # === Recovery Conflicts & Transaction Metrics ===
+        try:
+            cur.execute("""
+                SELECT 
+                    COALESCE(SUM(confl_tablespace), 0),
+                    COALESCE(SUM(confl_lock), 0),
+                    COALESCE(SUM(confl_snapshot), 0),
+                    COALESCE(SUM(confl_bufferpin), 0),
+                    COALESCE(SUM(confl_deadlock), 0),
+                    COALESCE(SUM(confl_tablespace) + SUM(confl_lock) + SUM(confl_snapshot) +
+                             SUM(confl_bufferpin) + SUM(confl_deadlock), 0)
+                FROM pg_stat_database_conflicts;
+            """)
+            c_row = cur.fetchone()
+            if c_row:
+                self._results["Conflicts Tablespace"] = str(c_row[0] if c_row[0] is not None else 0)
+                self._results["Conflicts Lock"] = str(c_row[1] if c_row[1] is not None else 0)
+                self._results["Conflicts Snapshot"] = str(c_row[2] if c_row[2] is not None else 0)
+                self._results["Conflicts Buffer Pin"] = str(c_row[3] if c_row[3] is not None else 0)
+                self._results["Conflicts Deadlock"] = str(c_row[4] if c_row[4] is not None else 0)
+                self._results["Recovery Conflicts Total"] = str(c_row[5] if c_row[5] is not None else 0)
+        except Exception:
+            self._conn.rollback()
+            self._results["Conflicts Tablespace"] = "0"
+            self._results["Conflicts Lock"] = "0"
+            self._results["Conflicts Snapshot"] = "0"
+            self._results["Conflicts Buffer Pin"] = "0"
+            self._results["Conflicts Deadlock"] = "0"
+            self._results["Recovery Conflicts Total"] = "0"
+
+        try:
+            cur.execute("""
+                SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start))::BIGINT, 0)
+                FROM pg_stat_activity
+                WHERE state <> 'idle' AND xact_start IS NOT NULL;
+            """)
+            x_row = cur.fetchone()
+            if x_row:
+                self._results["Oldest Running Transaction Age"] = str(x_row[0] if x_row[0] is not None else 0)
+        except Exception:
+            self._conn.rollback()
+            self._results["Oldest Running Transaction Age"] = "0"
+
+        # === Connection Utilization Metrics ===
+        try:
+            cur.execute("""
+                SELECT 
+                    (SELECT count(*) FROM pg_stat_activity) as active_conn,
+                    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn,
+                    (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') as reserved_conn;
+            """)
+            cn_row = cur.fetchone()
+            if cn_row:
+                a_conn = int(cn_row[0] or 0)
+                m_conn = int(cn_row[1] or 100)
+                r_conn = int(cn_row[2] or 3)
+                avail = max(0, m_conn - r_conn - a_conn)
+                u_pct = round((a_conn / m_conn) * 100, 2) if m_conn > 0 else 0.0
+                self._results["Available Connections"] = str(avail)
+                self._results["Connection Utilization Percent"] = str(u_pct)
+        except Exception:
+            self._conn.rollback()
+            self._results["Available Connections"] = "0"
+            self._results["Connection Utilization Percent"] = "0"
 
         cur.close()
 
@@ -757,6 +933,8 @@ class PostgresClusterCollector:
         slots_total = 0
         slots_active = 0
         slots_inactive = 0
+        slots_physical = 0
+        slots_logical = 0
         max_slot_lag_bytes = 0
 
         # Handle wrong password vs outage when nodes are down
@@ -793,6 +971,8 @@ class PostgresClusterCollector:
                             count(*)::int AS total_slots,
                             COALESCE(count(*) FILTER (WHERE active = true), 0)::int AS active_slots,
                             COALESCE(count(*) FILTER (WHERE active = false), 0)::int AS inactive_slots,
+                            COALESCE(count(*) FILTER (WHERE slot_type = 'physical'), 0)::int AS physical_slots,
+                            COALESCE(count(*) FILTER (WHERE slot_type = 'logical'), 0)::int AS logical_slots,
                             COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)), 0)::bigint AS max_slot_lag_bytes
                         FROM pg_replication_slots;
                     """)
@@ -801,7 +981,9 @@ class PostgresClusterCollector:
                         slots_total = row[0]
                         slots_active = row[1]
                         slots_inactive = row[2]
-                        max_slot_lag_bytes = row[3]
+                        slots_physical = row[3]
+                        slots_logical = row[4]
+                        max_slot_lag_bytes = row[5]
                 prim_conn.close()
             except Exception:
                 pass
@@ -827,6 +1009,8 @@ class PostgresClusterCollector:
         results["Replication Slots Total"] = slots_total
         results["Replication Slots Active"] = slots_active
         results["Replication Slots Inactive"] = slots_inactive
+        results["Physical Slots"] = slots_physical
+        results["Logical Slots"] = slots_logical
         results["Max Slot Lag Bytes"] = max_slot_lag_bytes
 
         # Ensure child tables

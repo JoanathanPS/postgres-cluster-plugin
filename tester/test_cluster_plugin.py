@@ -94,7 +94,8 @@ def validate_schema(data, rep):
         "Nodes Total", "Nodes Up", "Primary Count", "No Primary Flag",
         "Split Brain Flag", "Primary Timeline", "Max Replay Backlog",
         "Replication Slots Total", "Replication Slots Active",
-        "Replication Slots Inactive", "Max Slot Lag Bytes"
+        "Replication Slots Inactive", "Physical Slots", "Logical Slots",
+        "Max Slot Lag Bytes"
     ]
     for m in expected_metrics:
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")

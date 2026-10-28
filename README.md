@@ -205,46 +205,76 @@ To implement this fix:
 #### Root Cause of the Windows Timeout Issue
 When the Site24x7 Windows Agent executes plugins on Windows (`Site24x7PluginAgent.exe`), it creates a child process with redirected standard output and calls `Process.WaitForExit(timeout)` **before** reading stdout via `StandardOutput.ReadToEnd()`. 
 
-On Windows, anonymous pipes have a fixed 4096-byte (4 KB) kernel buffer. Because the PostgreSQL cluster plugin returns a rich JSON payload (~6.3 KB) including cluster metrics, custom tabs, units, and child table discoveries (`Cluster_Nodes`, `Replication_Standbys`, `Stats_per_DB`, `Tranasctions_and_Session_per_Database`), the process blocks when attempting to flush stdout past 4 KB. Concurrently, the agent waits indefinitely for the process to exit, resulting in a classic deadlock. After 160 s during registration (or 50 s during periodic data collection), the agent times out and terminates the process, causing the error:
+On Windows, anonymous pipes have a fixed 4096-byte (4 KB) kernel buffer. Because the PostgreSQL cluster plugin returns a rich JSON payload (~6 KB to ~11 KB) including cluster metrics, custom tabs, units, and child table discoveries (`Cluster_Nodes`, `Replication_Standbys`, `Stats_per_DB`, `Tranasctions_and_Session_per_Database`), the process blocks when attempting to flush stdout past 4 KB. Concurrently, the agent waits indefinitely for the process to exit, resulting in a classic deadlock. After 160 s during registration (or 50 s during periodic data collection), the agent times out and terminates the process, causing the error:
 `"No attributes to monitor. Plugin output is empty or not in Json format \n"`.
 
-#### The Solution
-1. **Agent Output Redirection (`redirect_output=1`)**:
-   Site24x7 agent's internal configuration parser checks for `redirect_output=1` inside the `[global_configurations]` section of `postgres_cluster.cfg`. When enabled, the agent configures the process runner to redirect stdout directly to a temporary file (`cmd.exe /c ... > "_output.txt" 2> "_error.txt"`), completely bypassing Windows anonymous pipe buffer limits.
-   ```ini
-   [global_configurations]
-   use_agent_python=0
-   redirect_output="1"
+#### The Native Agent Solution (`redirect_output=1`)
+Site24x7 agent's internal configuration parser checks for `redirect_output=1` inside the `[global_configurations]` section of `postgres_cluster.cfg`. When enabled, the agent configures the process runner to redirect stdout directly to a temporary file (`cmd.exe /c ... > "_output.txt" 2> "_error.txt"`), completely bypassing Windows anonymous pipe buffer limits.
+```ini
+[global_configurations]
+use_agent_python=0
+redirect_output=1
 
-   [postgres_cluster]
-   nodes="127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443"
-   username="site24x7"
-   password="CHANGE_ME"
-   db="postgres"
-   patroni_port="8008"
-   ```
-2. **PowerShell Plugin Wrapper (`postgres_cluster.ps1`)**:
-   Deploys alongside `postgres_cluster_impl.py` to handle Windows argument passing, path resolution for 64-bit Python 3.x, and clean output streaming to stdout, completing execution in under 2 seconds.
+[pg_cluster]
+nodes="127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443"
+username="site24x7"
+password="CHANGE_ME"
+db="postgres"
+patroni_port="8008"
+```
+Under this configuration, native Python execution takes **under 1 second** (verified in `PluginRegisterLog.log` and `PluginLog.log`), reporting full availability (`availability: 1`) and writing all telemetry without pipe deadlocks.
 
-### 7.4 What to Confirm in the Site24x7 Web Console
+### 7.4 Comparative Gap Analysis against PR #442
+A detailed comparison against upstream [PR #442](https://github.com/site24x7/plugins/pull/442) is documented in [GAP_ANALYSIS.md](file:///D:/College/Year%203/Internship/Zoho/Task%202%20-%20PostgreSQL%20Cluster%20Plugin%20-%20v2/GAP_ANALYSIS.md). Key enhancements incorporated from PR #442 into this plugin include:
+1. **Replication Slots Segregation**: `Physical Slots` and `Logical Slots` tracked alongside total, active, and inactive counts.
+2. **Write-Ahead Log (WAL) Observability**: `Current WAL LSN`, `WAL Insert LSN`, `WAL Flush LSN`, and file retention counts (`WAL Files Count`, `WAL Total Size`).
+3. **Archiving Reliability**: `Archive Status Success`, `Archive Status Failed`, `Last Archived WAL File`, and `Archive Ready Files Count`.
+4. **Recovery Conflicts**: Granular standby conflict breakdown (`Conflicts Tablespace`, `Conflicts Lock`, `Conflicts Snapshot`, `Conflicts Buffer Pin`, `Conflicts Deadlock`, and `Recovery Conflicts Total`).
+5. **Connection Saturation & Transaction Age**: `Available Connections`, `Connection Utilization Percent`, and `Oldest Running Transaction Age`.
+6. **Cross-Version SQL Safety**: While PR #442 hardcoded `pg_stat_checkpointer` (crashing on PostgreSQL < 17), our plugin dynamically inspects `server_version` and adapts between `pg_stat_checkpointer` (PG 17+) and `pg_stat_bgwriter` (PG < 17).
+
+### 7.5 Verifying the Live Agent in Site24x7 Web Console
 1. **Navigation**: In the Site24x7 Web Console, go to **Plugins** $\to$ **Plugin Integrations**.
-2. **Monitor Name**: Click on **`postgres_cluster`** (or your configured instance name).
-   > **Note on Schema Updates**: Site24x7 binds a monitor's attribute schema upon initial registration. If a monitor was previously registered with a partial test payload (e.g. only `Nodes Up`), delete the monitor from the Site24x7 Web Console (Plugins $\to$ click monitor $\to$ Delete) so the agent re-registers it with the full schema, all tabs, and child tables.
-3. **Cluster Tab (Order 1)**: Verify the primary dashboard tab shows:
-   - `Nodes Total`: 3, `Nodes Up`: 3
-   - `Primary Count`: 1, `Primary Timeline`: 5 (or current timeline)
-   - `No Primary Flag`: 0, `Split Brain Flag`: 0
-   - `Max Replay Backlog`: 0 bytes
-   - `Replication Slots Total`: 2, `Active`: 2, `Inactive`: 0
-   - `Max Slot Lag Bytes`: 0 bytes
-4. **Child Tables**:
-   - **`Cluster_Nodes`**: Lists every cluster node (`127.0.0.1:5441`, `5442`, `5443`) with role (`primary`/`standby`), health `status` (`up`/`down`), timeline, and response time.
-   - **`Replication_Standbys`**: Lists connected streaming replicas (`pg-node1`, `pg-node3`) with sync state, replay lag, and flush lag.
-   - **`Stats_per_DB`** and **`Tranasctions_and_Session_per_Database`**: Metrics collected from the detected active primary.
-5. **Additional Performance Tabs**:
-   - **DB and IO stats**: Per-DB table, row operations (inserted/updated/deleted/fetched/returned), block reads & hits.
-   - **BG Writer**: Checkpoints timed & requested, buffer allocations, sync times.
-   - **Transactions and Sessions**: Transactions per DB, commits, rollbacks, conflicts, active & idle sessions.
+2. **Monitors Displayed**:
+   - `postgres_cluster-pg_cluster-<Hostname>`: Active production monitor.
+   - `postgres_cluster_dev-pg_cluster_dev-<Hostname>`: Dev instance (deployed via `deploy-dev.ps1`).
+3. **Check the 6 Dashboard Tabs**:
+   - **Tab 1: Cluster (Order 1)**:
+     - `Nodes Total`: 3, `Nodes Up`: 3
+     - `Primary Count`: 1, `Primary Timeline`: Current timeline (e.g. 8 or 9)
+     - `No Primary Flag`: 0, `Split Brain Flag`: 0
+     - `Max Replay Backlog`: 0 bytes
+     - `Replication Slots Total`: 2, `Active`: 2, `Inactive`: 0, `Physical`: 2, `Logical`: 0
+     - `Max Slot Lag Bytes`: 0 bytes
+   - **Tab 2: DB and IO stats**: Per-DB table, rows inserted/updated/deleted/fetched/returned, block reads and hits.
+   - **Tab 3: BG Writer**: Checkpoints timed & requested, checkpoint write & sync time, buffers checkpoint/clean/alloc.
+   - **Tab 4: Transactions and Sessions**: Commits, rollbacks, conflicts, active sessions, abandoned/fatal/killed counts.
+   - **Tab 5: Write Ahead Log**: Current/Insert/Flush WAL LSNs (MB), WAL file counts, archive success/failure counts.
+   - **Tab 6: Recovery Conflicts**: Tablespace, lock, snapshot, buffer pin, deadlock conflicts, and oldest transaction age.
+4. **Verify Child Tables**:
+   - **`Cluster_Nodes`**: Shows all cluster nodes (`127.0.0.1:5441`, `5442`, `5443`), roles (`primary`/`standby`), health `status` (`up`/`down`), timeline, and response times.
+   - **`Replication_Standbys`**: Lists connected streaming standbys with byte lags and sync states.
+   - **`Stats_per_DB`** and **`Tranasctions_and_Session_per_Database`**: Per-database breakdown on the active primary.
+
+### 7.6 Swapping the Dev Version to Production Agent Folder
+To promote the verified v2 plugin to the production agent folder `postgres_cluster`:
+```powershell
+# Stop services before copying
+Stop-Service -Name "Site24x7 Plugin Agent" -Force -ErrorAction SilentlyContinue
+
+# Target production directory
+$prodDir = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres_cluster"
+
+# Copy python script and configuration
+Copy-Item "D:\College\Year 3\Internship\Zoho\Task 2 - PostgreSQL Cluster Plugin - v2\postgres_cluster\postgres_cluster.py" `
+          -Destination (Join-Path $prodDir "postgres_cluster.py") -Force
+
+Copy-Item "D:\College\Year 3\Internship\Zoho\Task 2 - PostgreSQL Cluster Plugin - v2\postgres_cluster\postgres_cluster.cfg" `
+          -Destination (Join-Path $prodDir "postgres_cluster.cfg") -Force
+
+# Start services
+Start-Service -Name "Site24x7 Plugin Agent"
+```
 
 ---
 
