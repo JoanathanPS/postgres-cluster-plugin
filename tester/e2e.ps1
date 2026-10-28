@@ -64,7 +64,7 @@ function Assert-Result {
 $overallFail = $false
 
 Write-Report "# Site24x7 PostgreSQL Cluster Plugin - E2E Verification Report"
-Write-Report "**Execution Mode:** `$Mode`  "
+Write-Report ("**Execution Mode:** `{0}`  " -f $Mode)
 Write-Report "**Start Time:** $($startTime.ToString('yyyy-MM-dd HH:mm:ss UTC'))  "
 Write-Report "**Single Source of Truth:** `upstream_layout/postgres_cluster/`  `n"
 
@@ -212,11 +212,67 @@ try {
     $pluginLogPath = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\logs\Details\PluginLog.log"
     if (Test-Path $pluginLogPath) {
         $recentLogLines = Get-Content $pluginLogPath -Tail 250
-        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: postgres_cluster_dev"
-        $cycleCount = $devExecMatches.Count
+        
+        # Extract RunPluginandWritetoFile entries
+        $runLines = $recentLogLines | Select-String -Pattern "RunPluginandWritetoFile\s*::"
+        
+        # Group into collection cycles by timestamp
+        $cycles = [System.Collections.Generic.List[System.Collections.Generic.List[string]]]::new()
+        $currCycle = [System.Collections.Generic.List[string]]::new()
+        $lastTime = $null
 
-        $agentPass = ($cycleCount -ge 1)
-        Assert-Result "Site24x7 Agent Execution (Python)" $agentPass "Detected $cycleCount active execution cycle(s) in PluginLog.log"
+        foreach ($m in $runLines) {
+            $line = $m.Line.Trim()
+            if ($line -match '^(\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2})') {
+                $t = [datetime]::ParseExact($matches[1], 'dd-MM-yyyy HH:mm:ss', $null)
+                if ($lastTime -eq $null -or ($t - $lastTime).TotalSeconds -gt 30) {
+                    if ($currCycle.Count -gt 0) {
+                        $cycles.Add($currCycle)
+                        $currCycle = [System.Collections.Generic.List[string]]::new()
+                    }
+                }
+                $currCycle.Add($line)
+                $lastTime = $t
+            }
+        }
+        if ($currCycle.Count -gt 0) {
+            $cycles.Add($currCycle)
+        }
+
+        # Inspect the last two cycles (or last available)
+        $targetCycles = if ($cycles.Count -ge 2) { $cycles | Select-Object -Last 2 } else { $cycles }
+        
+        $singleInstanceOk = $true
+        $violations = @()
+        $inspectedSummaries = @()
+
+        foreach ($c in $targetCycles) {
+            $pgMatches = @($c | Where-Object { $_ -match "postgres" })
+            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" })
+            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" })
+
+            if ($validMatches.Count -ne 1 -or $badMatches.Count -gt 0) {
+                $singleInstanceOk = $false
+                if ($badMatches.Count -gt 0) {
+                    $violations += "Unexpected instance(s) executed: $($badMatches -join '; ')"
+                } elseif ($validMatches.Count -eq 0) {
+                    $violations += "No postgres_cluster_dev instance executed in cycle"
+                }
+            }
+            $inspectedSummaries += "Cycle [$($pgMatches -join '; ')]"
+        }
+
+        $detailMsg = if ($singleInstanceOk) {
+            "Verified $($targetCycles.Count) recent cycle(s): exactly one instance ran ('postgres_cluster_dev - postgres_cluster_dev'). $($inspectedSummaries -join ' | ')"
+        } else {
+            "Instance violation detected: $($violations -join ' | ')"
+        }
+
+        Assert-Result "Single Instance Verification (postgres_cluster_dev)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
+
+        # Check PythonScript execution
+        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: postgres_cluster_dev"
+        Assert-Result "Agent Execution Engine (Python)" ($devExecMatches.Count -ge 1) "Confirmed PythonScript execution without timeout"
 
         # Check PluginData write confirmation in log
         $dataWriteMatches = $recentLogLines | Select-String -Pattern "Successfully written to .*PluginData.*61a227ede3526a541d01dee10eab2c36"
@@ -238,9 +294,26 @@ try {
     } else {
         $pwSw = [System.Diagnostics.Stopwatch]::StartNew()
         $pwOut = py tester/console_check.py 2>&1
+        $pwExit = $LASTEXITCODE
         $pwSw.Stop()
-        $pwPass = ($LASTEXITCODE -eq 0)
-        Assert-Result "Console Automation (Playwright)" $pwPass "Dashboard tabs, metrics, and child table assertions" $pwSw.Elapsed.TotalSeconds
+        $pwElapsed = $pwSw.Elapsed.TotalSeconds
+        $pwText = ($pwOut | Out-String).Trim()
+
+        if ($pwExit -eq 0) {
+            Assert-Result "Console Automation (Playwright)" $true "Dashboard tabs, metrics, and child table assertions verified" $pwElapsed
+        } elseif ($pwExit -eq 2 -or $pwText -match "playwright is not installed") {
+            Write-Host "  [SKIP] Console Automation: Playwright is not installed (run: py -m pip install playwright)" -ForegroundColor Yellow
+            Write-Report "- **[SKIP]** Console Automation: Playwright is not installed (run: py -m pip install playwright)"
+        } elseif ($pwExit -eq 3 -or $pwText -match "Authentication not completed" -or $pwText -match "Session expired" -or $pwText -match "session has expired" -or $pwText -match "login session not active") {
+            $reason = "Site24x7 web console session not active or login timed out. Log in once in the Chrome window."
+            Write-Host "  [SKIP] Console Automation: $reason" -ForegroundColor Yellow
+            Write-Report "- **[SKIP]** Console Automation: $reason"
+        } else {
+            Write-Host "  [FAIL] Console Automation (Playwright) ($([math]::Round($pwElapsed, 2))s)" -ForegroundColor Red
+            Write-Host "         Error details: $pwText" -ForegroundColor DarkRed
+            Write-Report "- **[FAIL]** Console Automation (Playwright) ($([math]::Round($pwElapsed, 2))s) - $pwText"
+            $script:overallFail = $true
+        }
     }
 
 } finally {
