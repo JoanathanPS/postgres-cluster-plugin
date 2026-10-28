@@ -238,6 +238,7 @@ def main():
     dead_nodes = "node_dead=localhost:5999,node_dead2=localhost:5998"
     proc_dead, elapsed_dead = run_plugin(plugin_py, dead_nodes, user, password, db)
     rep.check(proc_dead.returncode == 0, f"Dead node test exit code 0 (elapsed: {elapsed_dead:.2f}s)")
+    rep.check(elapsed_dead < 10.0, f"Dead node run completed under 10s timing constraint ({elapsed_dead:.2f}s < 10.0s)")
     try:
         dead_data = json.loads(proc_dead.stdout)
         rep.check(dead_data.get("No Primary Flag") == 1, "No Primary Flag is 1 on dead cluster")
