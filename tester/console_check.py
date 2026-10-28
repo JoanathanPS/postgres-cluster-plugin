@@ -35,7 +35,7 @@ CONFIG_FILE = os.path.join(AUTH_DIR, "config.json")
 EVIDENCE_DIR = os.path.join(REPO_ROOT, "evidence", "screenshots")
 
 DEFAULT_MONITOR = "postgres_cluster_dev"
-LOGIN_URL = "https://www.site24x7.com/login.html"
+LOGIN_URL = "https://www.site24x7.in/login.html"
 
 manual_override_event = threading.Event()
 
@@ -184,6 +184,15 @@ def authenticate_user(p, timeout_secs=300, debug=False):
     try:
         while time.time() - start_time < timeout_secs:
             now = time.time()
+
+            # Check trigger file in .auth/continue
+            trigger_file = os.path.join(AUTH_DIR, "continue")
+            if os.path.exists(trigger_file):
+                try:
+                    os.remove(trigger_file)
+                except Exception:
+                    pass
+                manual_override_event.set()
 
             # Check non-blocking msvcrt keyhit on Windows
             if HAS_MSVCRT:
