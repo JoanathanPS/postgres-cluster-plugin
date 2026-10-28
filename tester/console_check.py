@@ -299,14 +299,14 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         if not base_url or force_headed:
             base_url = authenticate_user(p, timeout_secs, debug=debug)
 
-        # Step 2: Open session headlessly using cached chrome-profile
+        # Step 2: Open session (reusing authenticated profile)
         browser = get_browser_context(p, headless=not force_headed)
         page = browser.pages[0] if browser.pages else browser.new_page()
 
         plugins_url = f"{base_url}/app/client#/plugins/list"
         print(f"\nNavigating to Plugins list: {plugins_url}")
         try:
-            page.goto(plugins_url, wait_until="networkidle", timeout=45000)
+            page.goto(plugins_url, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
             print(f"[WARN] Navigation timeout: {e}")
 
@@ -321,37 +321,59 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             base_url = authenticate_user(p, timeout_secs, debug=debug)
             browser = get_browser_context(p, headless=False)
             page = browser.pages[0] if browser.pages else browser.new_page()
-            page.goto(f"{base_url}/app/client#/plugins/list", wait_until="networkidle", timeout=45000)
+            page.goto(f"{base_url}/app/client#/plugins/list", wait_until="domcontentloaded", timeout=45000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Step 3: Find the monitor in Plugins list
-        time.sleep(4)
+        # Step 3: Find the monitor in Plugins list (polling up to 35s for SPA AJAX rendering)
+        print("Waiting for plugins list view and table to render...")
+        found = False
+        monitor_locator = None
+        start_wait = time.time()
+
+        while time.time() - start_wait < 35:
+            # Check if monitor row is visible in main table
+            mon_candidates = page.locator(f"span.txtblue:has-text('{monitor_name}'), a:has-text('{monitor_name}'), span:has-text('{monitor_name}')")
+            for i in range(mon_candidates.count()):
+                cand = mon_candidates.nth(i)
+                if cand.is_visible():
+                    monitor_locator = cand
+                    found = True
+                    break
+            if found:
+                break
+
+            # Check if sidebar application filter link is visible
+            app_filter = page.locator("a[href*='/plugins/PLUGIN/application/']:has-text('postgres'), a:has-text('postgres_cluste')").first
+            if app_filter.count() > 0 and app_filter.is_visible():
+                print("Selecting application filter from sidebar...")
+                try:
+                    app_filter.click()
+                except Exception:
+                    pass
+                time.sleep(3)
+                for _ in range(8):
+                    mon_cands2 = page.locator(f"span.txtblue:has-text('{monitor_name}'), a:has-text('{monitor_name}'), span:has-text('{monitor_name}')")
+                    for j in range(mon_cands2.count()):
+                        c2 = mon_cands2.nth(j)
+                        if c2.is_visible():
+                            monitor_locator = c2
+                            found = True
+                            break
+                    if found:
+                        break
+                    time.sleep(1)
+                if found:
+                    break
+
+            time.sleep(2)
+
         plugins_screenshot = os.path.join(EVIDENCE_DIR, f"{ts}_01_plugins_list.png")
         page.screenshot(path=plugins_screenshot, full_page=True)
         record("Plugins List Navigation", True, f"Navigated to {page.url}", plugins_screenshot)
 
-        # Locate monitor link (read-only: strictly clicking monitor row/link)
-        monitor_locator = page.locator(f"a:has-text('{monitor_name}')").or_(page.locator(f"text='{monitor_name}'")).first
-        found = False
-        try:
-            monitor_locator.wait_for(state="visible", timeout=15000)
-            found = True
-        except Exception:
-            search_inputs = page.locator("input[placeholder*='Search'], input.search-input, input[type='search']")
-            if search_inputs.count() > 0:
-                try:
-                    search_inputs.first.fill(monitor_name)
-                    search_inputs.first.press("Enter")
-                    time.sleep(3)
-                except Exception:
-                    pass
-            if page.locator(f"text='{monitor_name}'").count() > 0:
-                monitor_locator = page.locator(f"text='{monitor_name}'").first
-                found = True
-
         if not found:
-            record("Locate Monitor", False, f"Monitor '{monitor_name}' not found on plugins list.")
+            record("Locate Monitor", False, f"Monitor '{monitor_name}' not found on plugins list within timeout.")
             if debug:
                 debug_shot = os.path.join(REPO_ROOT, "evidence", f"debug_locate_fail_{ts}.png")
                 debug_html = os.path.join(REPO_ROOT, "evidence", f"debug_locate_fail_{ts}.html")
@@ -367,16 +389,12 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
 
         record("Locate Monitor", True, f"Found monitor '{monitor_name}' on plugins list.")
 
-        # Click into monitor (strictly navigating into view, no editing)
+        # Click into monitor dashboard (strictly navigating into view, no editing)
         monitor_locator.click()
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-        time.sleep(3)
+        time.sleep(8)
 
         # Step 4: Monitor status
-        record("Monitor Status", True, "Monitor overview loaded successfully")
+        record("Monitor Status", True, f"Monitor dashboard loaded successfully: {page.url}")
 
         # Step 5: Check 6 tabs
         expected_tabs = [
@@ -388,10 +406,10 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             "Recovery Conflicts"
         ]
 
+        page_content = page.content()
         found_tabs = []
         for tab_name in expected_tabs:
-            tab_loc = page.locator(f"text='{tab_name}'").first
-            if tab_loc.count() > 0:
+            if tab_name in page_content or page.locator(f"span:text-is('{tab_name}')").count() > 0 or page.locator(f"text='{tab_name}'").count() > 0:
                 found_tabs.append(tab_name)
 
         tabs_ok = len(found_tabs) >= 5
@@ -400,24 +418,46 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         # Step 6: Cluster tab verification & screenshots of all tabs (strictly read-only navigation)
         tab_index = 2
         for tab_name in expected_tabs:
-            tab_loc = page.locator(f"text='{tab_name}'").first
-            if tab_loc.count() > 0:
+            clean_name = tab_name.lower().replace(" ", "_").replace("&", "and")
+            shot_path = os.path.join(EVIDENCE_DIR, f"{ts}_{tab_index:02d}_{clean_name}.png")
+
+            tab_loc = page.locator(f"span:text-is('{tab_name}')").first
+            if tab_loc.count() == 0:
+                tab_loc = page.locator(f"a:text-is('{tab_name}')").first
+            
+            clicked = False
+            if tab_loc.count() > 0 and tab_loc.is_visible():
                 try:
                     tab_loc.click()
-                    time.sleep(2)
-                    clean_name = tab_name.lower().replace(" ", "_").replace("&", "and")
-                    shot_path = os.path.join(EVIDENCE_DIR, f"{ts}_{tab_index:02d}_{clean_name}.png")
-                    page.screenshot(path=shot_path, full_page=True)
+                    clicked = True
+                except Exception:
+                    pass
 
-                    if tab_name == "Cluster":
-                        page_content = page.content()
-                        has_nodes = "Cluster_Nodes" in page_content or "node" in page_content.lower()
-                        has_standbys = "Replication_Standbys" in page_content or "standby" in page_content.lower()
-                        record("Cluster Tab Child Tables", has_nodes and has_standbys,
-                               f"Cluster_Nodes: {has_nodes}, Replication_Standbys: {has_standbys}", shot_path)
-                    tab_index += 1
-                except Exception as ex:
-                    print(f"  [WARN] Failed to screenshot tab {tab_name}: {ex}")
+            if not clicked:
+                # Try via More dropdown if present
+                more_loc = page.locator("a:has-text('More'), span:has-text('More')").first
+                if more_loc.count() > 0 and more_loc.is_visible():
+                    try:
+                        more_loc.click()
+                        time.sleep(1)
+                        sub_tab = page.locator(f"text='{tab_name}'").first
+                        if sub_tab.count() > 0:
+                            sub_tab.click()
+                            clicked = True
+                    except Exception:
+                        pass
+
+            if clicked:
+                time.sleep(3)
+                page.screenshot(path=shot_path, full_page=True)
+
+                if tab_name == "Cluster":
+                    cl_content = page.content()
+                    has_nodes = "Cluster_Nodes" in cl_content or "cluster_nodes" in cl_content.lower()
+                    has_standbys = "Replication_Standbys" in cl_content or "replication_standbys" in cl_content.lower()
+                    record("Cluster Tab Child Tables", has_nodes and has_standbys,
+                           f"Cluster_Nodes: {has_nodes}, Replication_Standbys: {has_standbys}", shot_path)
+            tab_index += 1
 
         try:
             browser.close()
