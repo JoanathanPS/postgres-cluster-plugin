@@ -115,10 +115,26 @@ get_plugin_data() {
 check_plugin_execution() {
     echo
     echo "Testing plugin execution against cluster..."
-    # Locate postgres_cluster.py
+    # Locate postgres_cluster.py locally first
     PY_SOURCE="$script_dir/postgres_cluster.py"
     if [ ! -f "$PY_SOURCE" ] && [ -f "$script_dir/../postgres_cluster.py" ]; then
         PY_SOURCE="$script_dir/../postgres_cluster.py"
+    fi
+
+    # If not found locally, attempt to download from repo (final location to be decided)
+    if [ ! -f "$PY_SOURCE" ]; then
+        echo "postgres_cluster.py not found locally. Attempting to download from repository..."
+        RAW_URL="https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$RAW_URL" -o "$script_dir/postgres_cluster.py" 2>/dev/null || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$RAW_URL" -O "$script_dir/postgres_cluster.py" 2>/dev/null || true
+        fi
+        if [ -f "$script_dir/postgres_cluster.py" ]; then
+            PY_SOURCE="$script_dir/postgres_cluster.py"
+        else
+            error_handler 1 "postgres_cluster.py not found locally and could not be downloaded. If the repository is private, please clone the repository first: git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git"
+        fi
     fi
 
     test_cmd=("$PYTHON_BIN" "$PY_SOURCE" "--nodes" "$nodes" "--username" "$username" "--password" "$password" "--db" "$db")

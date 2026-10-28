@@ -245,6 +245,24 @@ if ($DryRun) {
             }
 
             $sourcePy = Join-Path $ScriptDir "postgres_cluster.py"
+            if (-not (Test-Path $sourcePy)) {
+                $parentDir = Split-Path -Parent $ScriptDir
+                $candidate = Join-Path $parentDir "postgres_cluster.py"
+                if (Test-Path $candidate) {
+                    $sourcePy = $candidate
+                } else {
+                    Write-Host "postgres_cluster.py not found locally. Attempting to download from repository..." -ForegroundColor Yellow
+                    $rawUrl = "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py"
+                    try {
+                        Invoke-WebRequest -Uri $rawUrl -OutFile $sourcePy -UseBasicParsing -ErrorAction Stop
+                        Write-Success "Downloaded postgres_cluster.py from repository"
+                    } catch {
+                        Write-ErrorMsg "postgres_cluster.py not found locally and download failed: $_"
+                        Write-ErrorMsg "If the repository is private, please clone the repository first: git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git"
+                        exit 1
+                    }
+                }
+            }
             $destPy = Join-Path $targetPluginsDir "$PluginFolderName.py"
 
             # Copy Python collector
@@ -281,7 +299,7 @@ patroni_port="$PatroniPort"
 # ==============================================================================
 Write-Step "5/5 Validating Plugin Execution"
 
-$scriptToRun = if ($DryRun) { Join-Path $ScriptDir "postgres_cluster.py" } else { Join-Path $targetPluginsDir "$PluginFolderName.py" }
+$scriptToRun = if ($DryRun) { $sourcePy } else { Join-Path $targetPluginsDir "$PluginFolderName.py" }
 $testArgs = @(
     $scriptToRun,
     "--nodes", $Nodes,

@@ -115,7 +115,29 @@ get_plugin_data() {
 check_plugin_execution() {
     echo
     echo "Testing plugin execution against cluster..."
-    test_cmd=("$PYTHON_BIN" "$script_dir/postgres_cluster.py" "--nodes" "$nodes" "--username" "$username" "--password" "$password" "--db" "$db")
+    # Locate postgres_cluster.py locally first
+    PY_SOURCE="$script_dir/postgres_cluster.py"
+    if [ ! -f "$PY_SOURCE" ] && [ -f "$script_dir/../postgres_cluster.py" ]; then
+        PY_SOURCE="$script_dir/../postgres_cluster.py"
+    fi
+
+    # If not found locally, attempt to download from repo (final location to be decided)
+    if [ ! -f "$PY_SOURCE" ]; then
+        echo "postgres_cluster.py not found locally. Attempting to download from repository..."
+        RAW_URL="https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$RAW_URL" -o "$script_dir/postgres_cluster.py" 2>/dev/null || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$RAW_URL" -O "$script_dir/postgres_cluster.py" 2>/dev/null || true
+        fi
+        if [ -f "$script_dir/postgres_cluster.py" ]; then
+            PY_SOURCE="$script_dir/postgres_cluster.py"
+        else
+            error_handler 1 "postgres_cluster.py not found locally and could not be downloaded. If the repository is private, please clone the repository first: git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git"
+        fi
+    fi
+
+    test_cmd=("$PYTHON_BIN" "$PY_SOURCE" "--nodes" "$nodes" "--username" "$username" "--password" "$password" "--db" "$db")
     if [ -n "$patroni_port" ] && [ "$patroni_port" != "none" ]; then
         test_cmd+=("--patroni_port" "$patroni_port")
     fi
@@ -156,7 +178,7 @@ deploy_plugin() {
     fi
 
     mkdir -p "$agent_dir/plugins/$plugin"
-    cp "$script_dir/postgres_cluster.py" "$agent_dir/plugins/$plugin/"
+    cp "$PY_SOURCE" "$agent_dir/plugins/$plugin/postgres_cluster.py"
     chmod +x "$agent_dir/plugins/$plugin/postgres_cluster.py"
 
     cat > "$agent_dir/plugins/$plugin/postgres_cluster.cfg" <<EOF
@@ -164,7 +186,7 @@ deploy_plugin() {
 use_agent_python=1
 redirect_output=1
 
-[pg_cluster]
+[$plugin]
 nodes="$nodes"
 username="$username"
 password="$password"

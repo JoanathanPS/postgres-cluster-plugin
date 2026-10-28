@@ -22,17 +22,51 @@ The Site24x7 PostgreSQL Cluster Monitoring plugin provides end-to-end cluster-le
 
 ## Quick Installation
 
-### Linux
-Execute the bash installer to verify prerequisites and install the plugin automatically:
+> **Note on Source Repository**: The plugin and installers are maintained in the repository:  
+> `https://github.com/JoanathanPS/postgres-cluster-plugin` (branch: `upstream-layout`, path: `upstream_layout/postgres_cluster/`)  
+> *(Final location to be decided upon official merge into `site24x7/plugins`).*  
+> If the repository is **private**, raw URL downloads will return 404 or authentication errors; in that case, clone the repository first as described below.
+
+### Method 1: Run Installer from Local Cloned Repository (Recommended)
+
+Both the Linux and Windows installers are designed to work directly from a local clone of the repository without requiring external downloads. They locate `postgres_cluster.py` locally, prompt for cluster credentials, generate a tailored `postgres_cluster.cfg` with `redirect_output=1`, deploy the plugin to the agent directory, and run verification probes.
+
+1. **Clone the repository**:
+   ```bash
+   git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git
+   cd postgres-cluster-plugin/upstream_layout/postgres_cluster
+   ```
+
+2. **Run the installer**:
+
+   - **Linux**:
+     ```bash
+     sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
+     ```
+
+   - **Windows (PowerShell as Administrator)**:
+     ```powershell
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1
+     ```
+
+---
+
+### Method 2: Standalone Download via Raw URLs (Public Access)
+
+If the repository has public raw access enabled, you can download the installer directly:
+
+#### Linux
 ```bash
-wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres_cluster/installer/Site24x7PostgresClusterPluginInstaller.sh && sudo bash Site24x7PostgresClusterPluginInstaller.sh
+wget https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/installer/Site24x7PostgresClusterPluginInstaller.sh && sudo bash Site24x7PostgresClusterPluginInstaller.sh
 ```
 
-### Windows (PowerShell)
-Run the PowerShell installer as Administrator:
+#### Windows (PowerShell)
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/installer/Site24x7PostgresClusterPluginInstaller.ps1" -OutFile "Site24x7PostgresClusterPluginInstaller.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Site24x7PostgresClusterPluginInstaller.ps1
 ```
+
+*Note: When executed standalone, the installer automatically downloads `postgres_cluster.py` from the repository if not found locally. If the repository is private, use Method 1 (git clone) instead.*
 
 ---
 
@@ -77,7 +111,20 @@ Set-Location "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgr
 ```
 
 ### Step 2: Download or Copy Plugin Files
-Place `postgres_cluster.py` and `postgres_cluster.cfg` inside the created folder.
+Place `postgres_cluster.py` and `postgres_cluster.cfg` inside the created folder:
+- **From local clone (Recommended)**: Copy `postgres_cluster.py` and `postgres_cluster.cfg` from `upstream_layout/postgres_cluster/` in your local cloned repository.
+- **Via raw download (if public access enabled)**:
+  - Linux:
+    ```bash
+    wget https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py
+    wget https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.cfg
+    ```
+  - Windows (PowerShell):
+    ```powershell
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py" -OutFile "postgres_cluster.py"
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.cfg" -OutFile "postgres_cluster.cfg"
+    ```
+*(Note: If the repository is private, copy directly from your local clone).*
 
 ### Step 3: Configure `postgres_cluster.cfg`
 Edit `postgres_cluster.cfg` with your cluster connection endpoints:
