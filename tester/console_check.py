@@ -11,7 +11,15 @@ import json
 import os
 import sys
 import time
+import threading
 from datetime import datetime
+from urllib.parse import urlparse, urlsplit
+
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -28,6 +36,22 @@ EVIDENCE_DIR = os.path.join(REPO_ROOT, "evidence", "screenshots")
 
 DEFAULT_MONITOR = "postgres_cluster_dev"
 LOGIN_URL = "https://www.site24x7.com/login.html"
+
+manual_override_event = threading.Event()
+
+
+def start_enter_listener():
+    """Starts a daemon thread listening for Enter key on stdin as a manual override."""
+    def _listen():
+        try:
+            sys.stdin.readline()
+            manual_override_event.set()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_listen, daemon=True)
+    t.start()
+    return t
 
 
 def ensure_dirs():
@@ -52,11 +76,69 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-def is_authenticated_url(url):
+def strip_query(url):
+    """Returns URL with query string removed, retaining scheme, host, path, and hash."""
     if not url:
-        return False
-    u = url.lower()
-    return ("/app/client#" in u or "/client#/" in u or "/app/home" in u) and ("accounts.zoho" not in u and "login.html" not in u)
+        return ""
+    try:
+        parts = urlsplit(url)
+        return parts._replace(query="").geturl()
+    except Exception:
+        return url
+
+
+def check_page_logged_in(page):
+    """
+    Evaluates whether a Playwright Page is authenticated to Site24x7.
+    Returns (is_logged_in: bool, base_url: str or None).
+    """
+    try:
+        url = page.url
+        if not url:
+            return False, None
+
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        full_lower = url.lower()
+
+        # Disqualifying auth/login keywords in URL
+        disqualifiers = ["login", "signin", "signup", "accounts", "auth", "sso"]
+        if any(dq in full_lower for dq in disqualifiers):
+            return False, None
+
+        # Host must belong to site24x7 (site24x7.in, site24x7.com, etc.)
+        if not ("site24x7." in host):
+            return False, None
+
+        # Path or hash looks like the application
+        app_path_or_hash = ("/app/" in parsed.path.lower()) or ("#/" in full_lower) or ("/app/" in full_lower)
+
+        # Inspect DOM for known logged-in elements
+        dom_logged_in = False
+        try:
+            dom_selectors = [
+                "#user-avatar", ".user-avatar", "header .avatar",
+                ".left-nav", "#leftnav", ".navigation-container",
+                ".nav-icon", ".client-header", "div#side-nav",
+                "a[href*='#/home']", "a[href*='#/plugins']",
+                ".profile-icon", "[data-testid='user-profile']",
+                "#topNavbar", ".main-nav", ".sub-nav"
+            ]
+            for sel in dom_selectors:
+                if page.locator(sel).count() > 0:
+                    dom_logged_in = True
+                    break
+        except Exception:
+            pass
+
+        if app_path_or_hash or dom_logged_in:
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            return True, base_url
+
+    except Exception:
+        pass
+
+    return False, None
 
 
 def get_browser_context(p, headless=False):
@@ -79,38 +161,97 @@ def get_browser_context(p, headless=False):
         )
 
 
-def authenticate_user(p, timeout_secs=300):
+def authenticate_user(p, timeout_secs=300, debug=False):
     """Launches headed browser and waits for user to log in manually with 2FA."""
     print("=" * 65)
     print(" SITE24X7 CONSOLE MANUAL AUTHENTICATION")
     print("=" * 65)
     print("PLEASE LOG IN TO SITE24X7 IN THE OPEN CHROME WINDOW (including 2FA).")
-    print("Script will continue automatically once you reach the dashboard...")
-    print(f"Waiting up to {timeout_secs} seconds for manual login to complete...")
+    print("Press [Enter] in this terminal at any time once logged in to continue manually.")
+    print(f"Waiting up to {timeout_secs} seconds for login to complete...")
     print("=" * 65)
+
+    start_enter_listener()
 
     browser = get_browser_context(p, headless=False)
     page = browser.pages[0] if browser.pages else browser.new_page()
     page.goto(LOGIN_URL)
 
     start_time = time.time()
+    last_status_print = start_time
     detected_base_url = None
 
-    while time.time() - start_time < timeout_secs:
-        try:
-            curr_url = page.url
-            if is_authenticated_url(curr_url):
-                from urllib.parse import urlparse
-                parsed = urlparse(curr_url)
+    try:
+        while time.time() - start_time < timeout_secs:
+            now = time.time()
+
+            # Check non-blocking msvcrt keyhit on Windows
+            if HAS_MSVCRT:
+                try:
+                    while msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        if ch in ('\r', '\n'):
+                            manual_override_event.set()
+                            break
+                except Exception:
+                    pass
+
+            if manual_override_event.is_set():
+                print("\n[INFO] Manual override detected (Enter pressed in terminal)!")
+                target_page = browser.pages[-1] if browser.pages else page
+                parsed = urlparse(target_page.url)
                 detected_base_url = f"{parsed.scheme}://{parsed.netloc}"
-                print(f"\n[OK] Logged in successfully! Detected DC base URL: {detected_base_url}")
-                # Allow cookies/session storage to persist
-                time.sleep(3)
+                print(f"[OK] Using base URL from current page: {detected_base_url}")
+                time.sleep(2)
                 break
+
+            # Check all open pages and tabs
+            for p_tab in list(browser.pages):
+                is_logged, b_url = check_page_logged_in(p_tab)
+                if is_logged:
+                    detected_base_url = b_url
+                    print(f"\n[OK] Logged in successfully! Detected DC base URL: {detected_base_url}")
+                    time.sleep(3)
+                    break
+
+            if detected_base_url:
+                break
+
+            # Every 10 seconds print current URL of each page
+            if now - last_status_print >= 10:
+                last_status_print = now
+                remaining = max(0, int(timeout_secs - (now - start_time)))
+                for idx, p_tab in enumerate(browser.pages):
+                    try:
+                        stripped = strip_query(p_tab.url)
+                        print(f"[WAIT] {remaining}s remaining | Tab {idx}: {stripped}")
+                    except Exception:
+                        pass
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n[CANCELLED] Authentication cancelled by user (Ctrl+C).")
+        try:
+            browser.close()
         except Exception:
-            # If user closed browser window
-            break
-        time.sleep(2)
+            pass
+        sys.exit(130)
+
+    # If timeout or failure and debug flag is on, capture screenshot and HTML
+    if not detected_base_url and debug:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for idx, p_tab in enumerate(browser.pages):
+            try:
+                debug_shot = os.path.join(REPO_ROOT, "evidence", f"debug_login_fail_{ts}_tab{idx}.png")
+                debug_html = os.path.join(REPO_ROOT, "evidence", f"debug_login_fail_{ts}_tab{idx}.html")
+                p_tab.screenshot(path=debug_shot, full_page=True)
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(p_tab.content())
+                print(f"  [DEBUG] Saved debug screenshot: {debug_shot}")
+                print(f"  [DEBUG] Saved debug HTML: {debug_html}")
+            except Exception as ex:
+                print(f"  [DEBUG] Failed to save debug artifacts for tab {idx}: {ex}")
 
     try:
         browser.close()
@@ -127,7 +268,7 @@ def authenticate_user(p, timeout_secs=300):
     return detected_base_url
 
 
-def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_secs=300):
+def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_secs=300, debug=False):
     ensure_dirs()
     cfg = load_config()
     base_url = cfg.get("base_url")
@@ -147,7 +288,7 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
     with sync_playwright() as p:
         # Step 1: First run authentication if no cached DC URL or forced headed
         if not base_url or force_headed:
-            base_url = authenticate_user(p, timeout_secs)
+            base_url = authenticate_user(p, timeout_secs, debug=debug)
 
         # Step 2: Open session headlessly using cached chrome-profile
         browser = get_browser_context(p, headless=not force_headed)
@@ -161,10 +302,14 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             print(f"[WARN] Navigation timeout: {e}")
 
         # Check if redirected back to login (session expired)
-        if not is_authenticated_url(page.url):
+        is_logged, _ = check_page_logged_in(page)
+        if not is_logged:
             print("[WARN] Site24x7 session has expired. Reopening Google Chrome headed for login...")
-            browser.close()
-            base_url = authenticate_user(p, timeout_secs)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            base_url = authenticate_user(p, timeout_secs, debug=debug)
             browser = get_browser_context(p, headless=False)
             page = browser.pages[0] if browser.pages else browser.new_page()
             page.goto(f"{base_url}/app/client#/plugins/list", wait_until="networkidle", timeout=45000)
@@ -172,27 +317,43 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Step 3: Find the monitor in Plugins list
-        time.sleep(3)
+        time.sleep(4)
         plugins_screenshot = os.path.join(EVIDENCE_DIR, f"{ts}_01_plugins_list.png")
         page.screenshot(path=plugins_screenshot, full_page=True)
         record("Plugins List Navigation", True, f"Navigated to {page.url}", plugins_screenshot)
 
         # Locate monitor link (read-only: strictly clicking monitor row/link)
-        monitor_locator = page.locator(f"text={monitor_name}").first
+        monitor_locator = page.locator(f"a:has-text('{monitor_name}')").or_(page.locator(f"text='{monitor_name}'")).first
         found = False
         try:
             monitor_locator.wait_for(state="visible", timeout=15000)
             found = True
-        except PlaywrightTimeoutError:
-            page.keyboard.type(monitor_name)
-            time.sleep(2)
-            if page.locator(f"text={monitor_name}").count() > 0:
-                monitor_locator = page.locator(f"text={monitor_name}").first
+        except Exception:
+            search_inputs = page.locator("input[placeholder*='Search'], input.search-input, input[type='search']")
+            if search_inputs.count() > 0:
+                try:
+                    search_inputs.first.fill(monitor_name)
+                    search_inputs.first.press("Enter")
+                    time.sleep(3)
+                except Exception:
+                    pass
+            if page.locator(f"text='{monitor_name}'").count() > 0:
+                monitor_locator = page.locator(f"text='{monitor_name}'").first
                 found = True
 
         if not found:
             record("Locate Monitor", False, f"Monitor '{monitor_name}' not found on plugins list.")
-            browser.close()
+            if debug:
+                debug_shot = os.path.join(REPO_ROOT, "evidence", f"debug_locate_fail_{ts}.png")
+                debug_html = os.path.join(REPO_ROOT, "evidence", f"debug_locate_fail_{ts}.html")
+                page.screenshot(path=debug_shot, full_page=True)
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                print(f"  [DEBUG] Saved locate failure artifacts: {debug_shot}, {debug_html}")
+            try:
+                browser.close()
+            except Exception:
+                pass
             return results
 
         record("Locate Monitor", True, f"Found monitor '{monitor_name}' on plugins list.")
@@ -249,7 +410,10 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                 except Exception as ex:
                     print(f"  [WARN] Failed to screenshot tab {tab_name}: {ex}")
 
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
     return results
 
 
@@ -258,17 +422,23 @@ def main():
     parser.add_argument("--monitor-name", default=DEFAULT_MONITOR, help="Monitor name to inspect")
     parser.add_argument("--headed", action="store_true", help="Run browser headed (visible)")
     parser.add_argument("--timeout", type=int, default=300, help="Login timeout in seconds")
+    parser.add_argument("--debug", action="store_true", help="Capture debug screenshot and HTML on failure")
     args = parser.parse_args()
 
     print("=" * 65)
     print(" Site24x7 Web Console Automated Inspector")
     print("=" * 65)
 
-    results = run_console_check(
-        monitor_name=args.monitor_name,
-        force_headed=args.headed,
-        timeout_secs=args.timeout
-    )
+    try:
+        results = run_console_check(
+            monitor_name=args.monitor_name,
+            force_headed=args.headed,
+            timeout_secs=args.timeout,
+            debug=args.debug
+        )
+    except KeyboardInterrupt:
+        print("\n[CANCELLED] Console verification cancelled by user (Ctrl+C).")
+        sys.exit(130)
 
     failures = [r for r in results if not r["passed"]]
     print("\n" + "=" * 65)
@@ -279,4 +449,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[CANCELLED] Console verification cancelled by user (Ctrl+C).")
+        sys.exit(130)
