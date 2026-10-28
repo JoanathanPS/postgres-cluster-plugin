@@ -224,7 +224,20 @@ patroni_port="8008"
 ```
 Under this configuration, native Python execution takes **under 1 second** (verified in `PluginRegisterLog.log` and `PluginLog.log`), reporting full availability (`availability: 1`) and writing all telemetry without pipe deadlocks.
 
-### 7.4 Comparative Gap Analysis against PR #442
+> **Linux vs Windows Compatibility Note**: On Linux hosts, the kernel anonymous pipe buffer is 64 KB (16x larger than Windows), so payloads under 64 KB do not deadlock. Setting `redirect_output=1` under `[global_configurations]` is supported by newer agents. In environments where `redirect_output` behavior in the Linux `monagent` is unverified, standard output redirection or native pipes remain fully operational for payloads under 64 KB.
+
+### 7.4 The `plugin_version` Rule and Schema Updates
+Site24x7's cloud backend permanently registers and binds a plugin monitor's attribute schema during its **initial registration**:
+1. **Schema Immutability**: If a plugin is registered with `plugin_version: 1`, the Site24x7 web console locks in the metrics reported in that first payload. Any new metrics, tabs, or child tables added later will **not** appear on existing monitors unless the version is incremented.
+2. **Version Bump Rule**: Whenever new metrics, tabs, or child tables are added to `postgres_cluster.py`, always increment `PLUGIN_VERSION` (e.g. from `2` to `3`). When the agent detects an incremented version, it submits a fresh registration payload and the cloud updates the metric schema.
+3. **Removing Stale Monitors in the Console**:
+   If an older test monitor exists (e.g. from early debugging when only `Nodes Up` was monitored), remove it to avoid confusion:
+   - Navigate to **Plugins** $\to$ **Plugin Integrations**.
+   - Hover over or click on the stale monitor (e.g. `postgres_cluster-cluster-<Hostname>`).
+   - Click the hamburger/kebab menu icon $(\vdots)$ and select **Delete**.
+   - The agent will register a clean monitor with full tabs on its next check cycle (~50s).
+
+### 7.5 Comparative Gap Analysis against PR #442
 A detailed comparison against upstream [PR #442](https://github.com/site24x7/plugins/pull/442) is documented in [GAP_ANALYSIS.md](file:///D:/College/Year%203/Internship/Zoho/Task%202%20-%20PostgreSQL%20Cluster%20Plugin%20-%20v2/GAP_ANALYSIS.md). Key enhancements incorporated from PR #442 into this plugin include:
 1. **Replication Slots Segregation**: `Physical Slots` and `Logical Slots` tracked alongside total, active, and inactive counts.
 2. **Write-Ahead Log (WAL) Observability**: `Current WAL LSN`, `WAL Insert LSN`, `WAL Flush LSN`, and file retention counts (`WAL Files Count`, `WAL Total Size`).
@@ -233,7 +246,7 @@ A detailed comparison against upstream [PR #442](https://github.com/site24x7/plu
 5. **Connection Saturation & Transaction Age**: `Available Connections`, `Connection Utilization Percent`, and `Oldest Running Transaction Age`.
 6. **Cross-Version SQL Safety**: While PR #442 hardcoded `pg_stat_checkpointer` (crashing on PostgreSQL < 17), our plugin dynamically inspects `server_version` and adapts between `pg_stat_checkpointer` (PG 17+) and `pg_stat_bgwriter` (PG < 17).
 
-### 7.5 Verifying the Live Agent in Site24x7 Web Console
+### 7.6 Verifying the Live Agent in Site24x7 Web Console
 1. **Navigation**: In the Site24x7 Web Console, go to **Plugins** $\to$ **Plugin Integrations**.
 2. **Monitors Displayed**:
    - `postgres_cluster-pg_cluster-<Hostname>`: Active production monitor.
@@ -256,7 +269,7 @@ A detailed comparison against upstream [PR #442](https://github.com/site24x7/plu
    - **`Replication_Standbys`**: Lists connected streaming standbys with byte lags and sync states.
    - **`Stats_per_DB`** and **`Tranasctions_and_Session_per_Database`**: Per-database breakdown on the active primary.
 
-### 7.6 Swapping the Dev Version to Production Agent Folder
+### 7.7 Swapping the Dev Version to Production Agent Folder
 To promote the verified v2 plugin to the production agent folder `postgres_cluster`:
 ```powershell
 # Stop services before copying

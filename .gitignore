@@ -1,15 +1,23 @@
-# secrets
+# secrets & configs (only *.example files should be tracked)
 .env
+*.env
+!*.env.example
 *.env.local
 postgres/postgres.cfg
 postgres_cluster/postgres_cluster.cfg
 patroni-cluster/.env
 
-# test artefacts
-test-output/
+# debug, helper & scratch files
+inspect_plugin.ps1
+pg_debug*
+pgtest*
+pgbackup*
+pg_out*
+*.log
 scratch/
+test-output/
 __pycache__/
 *.pyc
+
+# legacy task folders
 ScheduledTask/
-postgres_cluster/postgres_cluster.cfg
-.env
