@@ -21,7 +21,7 @@ PATRONI_PORT = '8008'                                                    # Optio
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
 STATEMENT_TIMEOUT_MS = 5000                                              # Per-query statement timeout in PostgreSQL (ms)
 
-PLUGIN_VERSION = 4
+PLUGIN_VERSION = 5
 HEARTBEAT = True
 
 VERSION = None
@@ -94,9 +94,9 @@ tabs = {
         "Write Ahead Log": {
             "order": "5",
             "tablist": [
-                "Current WAL LSN",
-                "WAL Insert LSN",
-                "WAL Flush LSN",
+                "WAL Write Position",
+                "WAL Insert Position",
+                "WAL Flush Position",
                 "WAL Files Count",
                 "WAL Total Size",
                 "Archive Status Success",
@@ -155,9 +155,9 @@ units = {
     "Transactions Open": "transactions",
     "Locks Count": "locks",
     "Database Count": "databases",
-    "Current WAL LSN": "MB",
-    "WAL Insert LSN": "MB",
-    "WAL Flush LSN": "MB",
+    "WAL Write Position": "MB",
+    "WAL Insert Position": "MB",
+    "WAL Flush Position": "MB",
     "WAL Files Count": "files",
     "WAL Total Size": "MB",
     "Archive Status Success": "files",
@@ -332,7 +332,14 @@ class pgsql():
                     self._conn.close()
                 except Exception:
                     pass
-            self._results.update(tabs)
+            import copy
+            final_tabs = copy.deepcopy(tabs)
+            wal_keys_present = [
+                m for m in final_tabs["tabs"]["Write Ahead Log"]["tablist"]
+                if m in self._results
+            ]
+            final_tabs["tabs"]["Write Ahead Log"]["tablist"] = wal_keys_present
+            self._results.update(final_tabs)
             self._results["units"] = units
             if self._msg != "":
                 self._results["msg"] = self._msg
@@ -381,21 +388,23 @@ class pgsql():
             w_row = cur.fetchone()
             if w_row:
                 if w_row[0] is not None:
-                    self._results["Current WAL LSN"] = round(float(w_row[0]), 2)
+                    self._results["WAL Write Position"] = round(float(w_row[0]), 2)
                 if w_row[1] is not None:
-                    self._results["WAL Insert LSN"] = round(float(w_row[1]), 2)
+                    self._results["WAL Insert Position"] = round(float(w_row[1]), 2)
                 if w_row[2] is not None:
-                    self._results["WAL Flush LSN"] = round(float(w_row[2]), 2)
+                    self._results["WAL Flush Position"] = round(float(w_row[2]), 2)
         except Exception as ex:
             self._conn.rollback()
-            self._append_msg(f"wal_lsn: {str(ex).splitlines()[0]}")
+            self._append_msg(f"wal_pos: {str(ex).splitlines()[0]}")
 
+        # Count only WAL segments (24-hex filenames); exclude timeline .history files
         try:
             cur.execute("""
                 SELECT 
                     COUNT(*) as wal_files_count,
-                    COALESCE(ROUND(SUM(size) / 1024.0 / 1024.0, 2), 0) as total_size_mb
-                FROM pg_ls_waldir();
+                    COALESCE(ROUND(SUM(size) / 1024.0 / 1024.0, 2), 0.0) as total_size_mb
+                FROM pg_ls_waldir()
+                WHERE name ~ '^[0-9A-F]{24}$';
             """)
             w_dir = cur.fetchone()
             if w_dir:
@@ -407,33 +416,48 @@ class pgsql():
             self._conn.rollback()
             self._append_msg(f"wal_dir: {str(ex).splitlines()[0]}")
 
+        # Report archive metrics only when archive_mode is 'on' or 'always'
+        archive_mode = "off"
         try:
-            cur.execute("""
-                SELECT 
-                    COALESCE(archived_count, 0),
-                    COALESCE(failed_count, 0),
-                    COALESCE(last_archived_wal, 'No WAL archived yet')
-                FROM pg_stat_archiver;
-            """)
-            a_row = cur.fetchone()
-            if a_row:
-                if a_row[0] is not None:
-                    self._results["Archive Status Success"] = int(a_row[0])
-                if a_row[1] is not None:
-                    self._results["Archive Status Failed"] = int(a_row[1])
-                self._results["Last Archived WAL File"] = str(a_row[2] if a_row[2] else "No WAL archived yet")
-        except Exception as ex:
+            cur.execute("SHOW archive_mode;")
+            a_mode_row = cur.fetchone()
+            if a_mode_row and a_mode_row[0]:
+                archive_mode = str(a_mode_row[0]).strip().lower()
+        except Exception:
             self._conn.rollback()
-            self._append_msg(f"archiver: {str(ex).splitlines()[0]}")
+            archive_mode = "off"
 
-        try:
-            cur.execute("SELECT COUNT(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
-            r_row = cur.fetchone()
-            if r_row and r_row[0] is not None:
-                self._results["Archive Ready Files Count"] = int(r_row[0])
-        except Exception as ex:
-            self._conn.rollback()
-            self._append_msg(f"archive_status: {str(ex).splitlines()[0]}")
+        if archive_mode in ("on", "always"):
+            try:
+                cur.execute("""
+                    SELECT 
+                        COALESCE(archived_count, 0),
+                        COALESCE(failed_count, 0),
+                        COALESCE(last_archived_wal, 'No WAL archived yet')
+                    FROM pg_stat_archiver;
+                """)
+                a_row = cur.fetchone()
+                if a_row:
+                    if a_row[0] is not None:
+                        self._results["Archive Status Success"] = int(a_row[0])
+                    if a_row[1] is not None:
+                        self._results["Archive Status Failed"] = int(a_row[1])
+                    if a_row[2]:
+                        self._results["Last Archived WAL File"] = str(a_row[2])
+            except Exception as ex:
+                self._conn.rollback()
+                self._append_msg(f"archiver: {str(ex).splitlines()[0]}")
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
+                r_row = cur.fetchone()
+                if r_row and r_row[0] is not None:
+                    self._results["Archive Ready Files Count"] = int(r_row[0])
+            except Exception as ex:
+                self._conn.rollback()
+                self._append_msg(f"archive_status: {str(ex).splitlines()[0]}")
+        else:
+            self._append_msg("archiving not enabled")
 
         # === Recovery Conflicts & Transaction Metrics ===
         try:
@@ -1219,8 +1243,15 @@ class PostgresClusterCollector:
             ]
         }
 
-        # Apply tabs and units
-        results.update(tabs)
+        # Apply dynamic tabs and units (exclude absent archive metrics when archive_mode is off)
+        import copy
+        final_tabs = copy.deepcopy(tabs)
+        wal_keys_present = [
+            m for m in final_tabs["tabs"]["Write Ahead Log"]["tablist"]
+            if m in results
+        ]
+        final_tabs["tabs"]["Write Ahead Log"]["tablist"] = wal_keys_present
+        results.update(final_tabs)
         results["units"] = units
 
         # Merge any collector message notes without forcing status to 0
