@@ -396,6 +396,25 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         # Step 4: Monitor status
         record("Monitor Status", True, f"Monitor dashboard loaded successfully: {page.url}")
 
+        # Task 1 evidence capture: full-page screenshot and tab strip outerHTML
+        fullpage_path = os.path.join(EVIDENCE_DIR, "task1_monitor_fullpage.png")
+        try:
+            page.screenshot(path=fullpage_path, full_page=True)
+            print(f"[EVIDENCE] Saved full-page monitor screenshot to: {fullpage_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to capture full-page screenshot: {e}")
+
+        tab_strip_html_path = os.path.join(EVIDENCE_DIR, "task1_tab_strip.html")
+        tab_container_loc = page.locator("ul.nav-tabs, div.tabs-container, ul[role='tablist'], .nav-tabs").first
+        if tab_container_loc.count() > 0:
+            try:
+                strip_html = tab_container_loc.evaluate("el => el.outerHTML")
+                with open(tab_strip_html_path, "w", encoding="utf-8") as f:
+                    f.write(strip_html)
+                print(f"[EVIDENCE] Saved tab strip outerHTML to: {tab_strip_html_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save tab strip HTML: {e}")
+
         # Step 5: Check 6 tabs (strictly all 6 must be found, including checking inside 'More' dropdown)
         expected_tabs = [
             "Cluster",
@@ -406,9 +425,10 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             "Recovery Conflicts"
         ]
 
-        # Gather visible tabs on tab bar
-        tab_spans = page.locator("ul.nav-tabs li span, ul.nav-tabs li, [role='tab']")
+        # Gather visible tabs on tab bar (case and exact label preservation)
+        tab_spans = page.locator("ul.nav-tabs li span, ul.nav-tabs li a, ul.nav-tabs li, [role='tab']")
         visible_tab_names = [s.strip() for s in tab_spans.all_inner_texts() if s.strip()]
+        print(f"[TABS] Exact tab labels rendered on tab bar: {visible_tab_names}")
 
         # Also inspect inside the "More" dropdown
         more_toggle = page.locator("#show-more-dropdown span.dropdown-toggle, span.dropdown-toggle:has-text('More'), a:has-text('More')").first
@@ -419,22 +439,56 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                 time.sleep(1)
                 dropdown_items = page.locator("#show-more-dropdown .dropdown-menu li, .dropdown-menu li, .dropdown-menu a")
                 more_tab_names = [d.strip() for d in dropdown_items.all_inner_texts() if d.strip()]
+                print(f"[TABS] Exact tab labels inside 'More' dropdown: {more_tab_names}")
+                # Save screenshot of opened dropdown
+                more_shot_path = os.path.join(EVIDENCE_DIR, "task1_more_open.png")
+                page.screenshot(path=more_shot_path)
                 # Click more toggle again to close menu cleanly
                 more_toggle.click()
                 time.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] More dropdown inspection error: {e}")
 
-        all_available_tabs = set(visible_tab_names + more_tab_names)
+        all_rendered_labels = visible_tab_names + more_tab_names
+        print(f"[TABS] Combined rendered tab labels (total {len(all_rendered_labels)}): {all_rendered_labels}")
+
+        # Check for plugin version in console DOM/metadata
+        try:
+            ver_text = page.locator("*:has-text('Plugin Version'), *:has-text('plugin_version')").all_inner_texts()
+            if ver_text:
+                print(f"[VERSION] Observed version text in DOM: {ver_text[:3]}")
+        except Exception:
+            pass
+
         page_content = page.content()
 
+        # Strict matching: support case-insensitive check and whitespace trimming
         found_tabs = []
         for tab_name in expected_tabs:
-            if (tab_name in all_available_tabs or
-                page.locator(f"span:text-is('{tab_name}')").count() > 0 or
-                page.locator(f"a:text-is('{tab_name}')").count() > 0 or
-                tab_name in page_content):
+            # 1. Exact match in rendered labels
+            if tab_name in all_rendered_labels:
                 found_tabs.append(tab_name)
+                continue
+
+            # 2. Case-insensitive match in rendered labels
+            matched_ci = [lbl for lbl in all_rendered_labels if lbl.lower() == tab_name.lower()]
+            if matched_ci:
+                print(f"[TABS] Tab '{tab_name}' matched via case-insensitive lookup: '{matched_ci[0]}'")
+                found_tabs.append(tab_name)
+                continue
+
+            # 3. Direct locator in page
+            if (page.locator(f"span:text-is('{tab_name}')").count() > 0 or
+                page.locator(f"a:text-is('{tab_name}')").count() > 0 or
+                page.locator(f"span:text-matches('^{tab_name}$', 'i')").count() > 0 or
+                page.locator(f"a:text-matches('^{tab_name}$', 'i')").count() > 0):
+                found_tabs.append(tab_name)
+                continue
+
+            # 4. Strict check in page HTML (with word boundary / quotes / tags)
+            if f">{tab_name}<" in page_content or f'"{tab_name}"' in page_content:
+                found_tabs.append(tab_name)
+                continue
 
         missing_tabs = [t for t in expected_tabs if t not in found_tabs]
         tabs_ok = (len(missing_tabs) == 0 and len(found_tabs) == len(expected_tabs))
@@ -455,6 +509,10 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                 tab_loc = page.locator(f"span:text-is('{tab_name}')").first
             if tab_loc.count() == 0:
                 tab_loc = page.locator(f"a:text-is('{tab_name}')").first
+            if tab_loc.count() == 0:
+                tab_loc = page.locator(f"span:text-matches('^{tab_name}$', 'i')").first
+            if tab_loc.count() == 0:
+                tab_loc = page.locator(f"a:text-matches('^{tab_name}$', 'i')").first
             
             clicked = False
             if tab_loc.count() > 0:
