@@ -240,7 +240,7 @@ Site24x7's cloud backend permanently registers and binds a plugin monitor's attr
 ### 7.5 Comparative Gap Analysis against PR #442
 A detailed comparison against upstream [PR #442](https://github.com/site24x7/plugins/pull/442) is documented in [GAP_ANALYSIS.md](file:///D:/College/Year%203/Internship/Zoho/Task%202%20-%20PostgreSQL%20Cluster%20Plugin%20-%20v2/GAP_ANALYSIS.md). Key enhancements incorporated from PR #442 into this plugin include:
 1. **Replication Slots Segregation**: `Physical Slots` and `Logical Slots` tracked alongside total, active, and inactive counts.
-2. **Write-Ahead Log (WAL) Observability**: `Current WAL LSN`, `WAL Insert LSN`, `WAL Flush LSN`, and file retention counts (`WAL Files Count`, `WAL Total Size`).
+2. **Write-Ahead Log (WAL) Observability**: `WAL Write Position`, `WAL Insert Position`, `WAL Flush Position`, and file retention counts (`WAL Files Count`, `WAL Total Size`).
 3. **Archiving Reliability**: `Archive Status Success`, `Archive Status Failed`, `Last Archived WAL File`, and `Archive Ready Files Count`.
 4. **Recovery Conflicts**: Granular standby conflict breakdown (`Conflicts Tablespace`, `Conflicts Lock`, `Conflicts Snapshot`, `Conflicts Buffer Pin`, `Conflicts Deadlock`, and `Recovery Conflicts Total`).
 5. **Connection Saturation & Transaction Age**: `Available Connections`, `Connection Utilization Percent`, and `Oldest Running Transaction Age`.

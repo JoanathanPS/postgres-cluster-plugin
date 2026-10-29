@@ -50,9 +50,9 @@ Running a real key diff between the standalone Site24x7 PostgreSQL plugin (`post
 | `Physical Slots` | `int` | Number of physical streaming replication slots. | `SELECT count(*) FILTER (WHERE slot_type = 'physical')::int FROM pg_replication_slots;` |
 | `Logical Slots` | `int` | Number of logical decoding / CDC replication slots. | `SELECT count(*) FILTER (WHERE slot_type = 'logical')::int FROM pg_replication_slots;` |
 | `Max Slot Lag Bytes` | `int` (bytes) | Maximum WAL retained by any single consumer slot. | `SELECT COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)), 0)::bigint FROM pg_replication_slots;` |
-| `Current WAL LSN` | `float` (MB) | Current byte offset write position on the primary WAL. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
-| `WAL Insert LSN` | `float` (MB) | WAL write position buffered in memory. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
-| `WAL Flush LSN` | `float` (MB) | WAL write position durably committed to storage. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Write Position` | `float` (MB) | Current byte offset write position on the primary WAL. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Insert Position` | `float` (MB) | WAL write position buffered in memory. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Flush Position` | `float` (MB) | WAL write position durably committed to storage. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
 | `WAL Files Count` | `int` | Total count of WAL segments present in the `pg_wal` directory. | `SELECT count(*) FROM pg_ls_waldir();` |
 | `WAL Total Size` | `float` (MB) | Total disk consumption of all WAL files on disk. | `SELECT COALESCE(ROUND(SUM(size) / 1024.0 / 1024.0, 2), 0) FROM pg_ls_waldir();` |
 | `Archive Status Success` | `int` | Cumulative number of WAL files successfully archived. | `SELECT archived_count FROM pg_stat_archiver;` |
@@ -210,15 +210,15 @@ python3 postgres_cluster.py --nodes "192.168.1.10:5432,192.168.1.11:5432,192.168
 
 | Metric Name | Description |
 | :--- | :--- |
-| **Current WAL LSN** | Current Log Sequence Number write position on the primary. |
-| **WAL Insert LSN** | LSN position up to which WAL records have been buffered in memory. |
-| **WAL Flush LSN** | LSN position up to which WAL records have been durably flushed to disk. |
-| **WAL Files Count** | Total count of WAL segment files present in `pg_wal`. |
-| **WAL Total Size** | Total disk space consumed by WAL files in `pg_wal` (MB). |
-| **Archive Status Success** | Cumulative count of successfully archived WAL segments. |
-| **Archive Status Failed** | Cumulative count of failed WAL archiving attempts. |
-| **Archive Ready Files Count**| Number of WAL segments pending archiving in `archive_status`. |
-| **Last Archived WAL File** | Filename of the most recently archived WAL segment. |
+| **WAL Write Position** | Current byte offset write position on the primary WAL (in MB). |
+| **WAL Insert Position**| Byte offset position up to which WAL records have been buffered in memory (in MB). |
+| **WAL Flush Position** | Byte offset position up to which WAL records have been durably flushed to disk (in MB). |
+| **WAL Files Count** | Count of active 24-hex WAL segment files in `pg_wal` (excluding `.history` files). |
+| **WAL Total Size** | Total disk space consumed by active WAL segment files in `pg_wal` (MB). |
+| **Archive Status Success** | *(Reported when archive_mode is on/always)* Cumulative count of successfully archived WAL segments. |
+| **Archive Status Failed** | *(Reported when archive_mode is on/always)* Cumulative count of failed WAL archiving attempts. |
+| **Archive Ready Files Count**| *(Reported when archive_mode is on/always)* Number of WAL segments pending archiving in `archive_status`. |
+| **Last Archived WAL File** | *(Reported when archive_mode is on/always)* Filename of the most recently archived WAL segment. |
 
 ### 4. Background Writer & Checkpoints Metrics
 
@@ -297,6 +297,6 @@ The plugin automatically organizes all metrics into 6 dashboard tabs:
 4. **Transactions and Sessions** (`order: 4`):
    Commits, rollbacks, session lifecycles, and the `Tranasctions_and_Session_per_Database` child table.
 5. **Write Ahead Log** (`order: 5`):
-   Current LSN markers, WAL directory file count, total WAL disk usage, and archiver success/failure rates.
+   WAL Write/Insert/Flush positions (MB), on-disk WAL segment file count and total size, and archiving telemetry (when archiving is enabled).
 6. **Recovery Conflicts** (`order: 6`):
    Standby recovery conflicts breakdown, lock/pin/snapshot conflicts, oldest transaction duration, and connection pool utilization.
