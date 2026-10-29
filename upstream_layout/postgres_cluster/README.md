@@ -20,6 +20,60 @@ The Site24x7 PostgreSQL Cluster Monitoring plugin provides end-to-end cluster-le
 
 ---
 
+## What This Adds Over the Standalone PostgreSQL Plugin
+
+Running a real key diff between the standalone Site24x7 PostgreSQL plugin (`postgres/postgres.py` queried against a single primary endpoint) and this cluster plugin (`postgres_cluster.py`) demonstrates **34 new top-level metric keys**, **2 dedicated child tables**, and **3 new dashboard tabs**.
+
+### 1. New Dashboard Tabs
+- **`Cluster`** (`order: 1`): Unified topology view containing `Cluster_Nodes` and `Replication_Standbys` child tables, node reachability, primary flags, WAL timelines, and replication slots.
+- **`Write Ahead Log`** (`order: 5`): High-resolution WAL tracking including exact LSN positions (MB), on-disk WAL directory file counts and size, and archiver success/failure rates.
+- **`Recovery Conflicts`** (`order: 6`): Standby query cancellation breakdown across locks, snapshots, buffer pins, deadlocks, and tablespaces, along with connection pool headroom.
+
+### 2. New Child Tables
+- **`Cluster_Nodes`**: Real-time status for every cluster node (columns: `name`, `role`, `patroni_state`, `up`, `is_primary`, `timeline`, `response_time_ms`, `replay_backlog_bytes`, `replay_delay_s`, `connections`, `status`).
+- **`Replication_Standbys`**: Streaming replication connections queried from the primary (columns: `name`, `client_addr`, `state`, `sync_state`, `is_sync`, `replay_lag_bytes`, `write_lag_bytes`, `flush_lag_bytes`).
+
+### 3. New Metrics Diff Table
+
+| Metric Key | Type | What It Tells an Operator | Source Query / Origin |
+| :--- | :--- | :--- | :--- |
+| `Nodes Total` | `int` | Total count of configured cluster nodes. | Configuration parser (`nodes` list length) |
+| `Nodes Up` | `int` | Number of cluster nodes currently responding to probes. | Concurrent probe (`SELECT 1;`) |
+| `Primary Count` | `int` | Number of reachable nodes operating in read-write primary mode. | `SELECT pg_is_in_recovery();` (count where false) |
+| `No Primary Flag` | `int` (1/0) | Alert flag: 1 if zero primaries are reachable (outage or failover). | Derived (`1 if Primary Count == 0 else 0`) |
+| `Split Brain Flag` | `int` (1/0) | Critical alert flag: 1 if multiple nodes report primary status. | Derived (`1 if Primary Count > 1 else 0`) |
+| `Primary Timeline` | `int` | Active WAL timeline ID; increments on failover. | `SELECT ('x' \|\| substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8))::bit(32)::int;` |
+| `Max Replay Backlog` | `int` (bytes) | Worst-case replication replay backlog across standbys. | `SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint FROM pg_stat_replication;` |
+| `Replication Slots Total` | `int` | Total replication slots defined on primary. | `SELECT count(*)::int FROM pg_replication_slots;` |
+| `Replication Slots Active` | `int` | Count of replication slots actively streaming data. | `SELECT count(*) FILTER (WHERE active = true)::int FROM pg_replication_slots;` |
+| `Replication Slots Inactive` | `int` | Count of inactive slots; alerts on risk of unbounded WAL retention. | `SELECT count(*) FILTER (WHERE active = false)::int FROM pg_replication_slots;` |
+| `Physical Slots` | `int` | Number of physical streaming replication slots. | `SELECT count(*) FILTER (WHERE slot_type = 'physical')::int FROM pg_replication_slots;` |
+| `Logical Slots` | `int` | Number of logical decoding / CDC replication slots. | `SELECT count(*) FILTER (WHERE slot_type = 'logical')::int FROM pg_replication_slots;` |
+| `Max Slot Lag Bytes` | `int` (bytes) | Maximum WAL retained by any single consumer slot. | `SELECT COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)), 0)::bigint FROM pg_replication_slots;` |
+| `Current WAL LSN` | `float` (MB) | Current byte offset write position on the primary WAL. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Insert LSN` | `float` (MB) | WAL write position buffered in memory. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Flush LSN` | `float` (MB) | WAL write position durably committed to storage. | `SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') / 1024.0 / 1024.0, 2);` |
+| `WAL Files Count` | `int` | Total count of WAL segments present in the `pg_wal` directory. | `SELECT count(*) FROM pg_ls_waldir();` |
+| `WAL Total Size` | `float` (MB) | Total disk consumption of all WAL files on disk. | `SELECT COALESCE(ROUND(SUM(size) / 1024.0 / 1024.0, 2), 0) FROM pg_ls_waldir();` |
+| `Archive Status Success` | `int` | Cumulative number of WAL files successfully archived. | `SELECT archived_count FROM pg_stat_archiver;` |
+| `Archive Status Failed` | `int` | Cumulative number of failed WAL archival attempts. | `SELECT failed_count FROM pg_stat_archiver;` |
+| `Last Archived WAL File` | `str` | Name of the last segment successfully pushed to archive. | `SELECT last_archived_wal FROM pg_stat_archiver;` |
+| `Archive Ready Files Count` | `int` | Backlog of WAL files pending archival (`.ready`). | `SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';` |
+| `Conflicts Tablespace` | `int` | Queries cancelled on standbys due to dropped tablespaces. | `SELECT SUM(confl_tablespace) FROM pg_stat_database_conflicts;` |
+| `Conflicts Lock` | `int` | Standby queries cancelled due to table lock timeouts against WAL replay. | `SELECT SUM(confl_lock) FROM pg_stat_database_conflicts;` |
+| `Conflicts Snapshot` | `int` | Standby queries cancelled due to vacuumed cleanup of dead tuples. | `SELECT SUM(confl_snapshot) FROM pg_stat_database_conflicts;` |
+| `Conflicts Buffer Pin` | `int` | Standby queries cancelled due to contention on pinned shared buffers. | `SELECT SUM(confl_bufferpin) FROM pg_stat_database_conflicts;` |
+| `Conflicts Deadlock` | `int` | Standby queries cancelled due to deadlocks during replay. | `SELECT SUM(confl_deadlock) FROM pg_stat_database_conflicts;` |
+| `Recovery Conflicts Total` | `int` | Sum of all query cancellations occurring on standby nodes. | `SELECT SUM(confl_tablespace + confl_lock + confl_snapshot + confl_bufferpin + confl_deadlock) FROM pg_stat_database_conflicts;` |
+| `Oldest Running Transaction Age`| `int` (s) | Duration in seconds of the oldest active transaction. | `SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start))::BIGINT, 0) FROM pg_stat_activity WHERE state <> 'idle';` |
+| `Available Connections` | `int` | Free connection slots reserved for regular client applications. | Derived: `max_connections - superuser_reserved_connections - active_connections` |
+| `Connection Utilization Percent`| `float` (%) | Percentage of configured max client connection slots in active use. | Derived: `ROUND((active_connections / max_connections) * 100.0, 2)` |
+| `Cluster_Nodes` | `list[dict]` | Tabular telemetry across all nodes (reachability, role, timeline, latency). | Multi-node parallel probe |
+| `Replication_Standbys` | `list[dict]` | Tabular streaming replication metrics per connected replica. | `SELECT * FROM pg_stat_replication;` on primary |
+| `status` | `int` (1/0) | Plugin overall operational health status indicator. | Dynamic health check evaluator |
+
+---
+
 ## Installation
 
 > **Repository Access**: The plugin and installers are maintained at:  
