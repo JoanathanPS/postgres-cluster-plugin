@@ -259,9 +259,9 @@ A detailed comparison against upstream [PR #442](https://github.com/site24x7/plu
      - `Max Replay Backlog`: 0 bytes
      - `Replication Slots Total`: 2, `Active`: 2, `Inactive`: 0, `Physical`: 2, `Logical`: 0
      - `Max Slot Lag Bytes`: 0 bytes
-   - **Tab 2: DB and IO stats**: Per-DB table, rows inserted/updated/deleted/fetched/returned, block reads and hits.
+   - **Tab 2: DB and IO stats**: Per-DB table, Cache Hit Ratio (%), Dead Tuples (table bloat risk), rows inserted/updated/deleted/fetched/returned, block reads and hits.
    - **Tab 3: BG Writer**: Checkpoints timed & requested, checkpoint write & sync time, buffers checkpoint/clean/alloc.
-   - **Tab 4: Transactions and Sessions**: Commits, rollbacks, conflicts, active sessions, abandoned/fatal/killed counts.
+   - **Tab 4: Transactions and Sessions**: Oldest Transaction ID Age (TxID wraparound safety), Commits, rollbacks, conflicts, active sessions, abandoned/fatal/killed counts.
    - **Tab 5: Write Ahead Log**: Current/Insert/Flush WAL LSNs (MB), WAL file counts, archive success/failure counts.
    - **Tab 6: Recovery Conflicts**: Tablespace, lock, snapshot, buffer pin, deadlock conflicts, and oldest transaction age.
 4. **Verify Child Tables**:

@@ -21,7 +21,7 @@ PATRONI_PORT = '8008'                                                    # Optio
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
 STATEMENT_TIMEOUT_MS = 5000                                              # Per-query statement timeout in PostgreSQL (ms)
 
-PLUGIN_VERSION = 5
+PLUGIN_VERSION = 6
 HEARTBEAT = True
 
 VERSION = None
@@ -52,6 +52,8 @@ tabs = {
             "order": "2",
             "tablist": [
                 "Stats_per_DB",
+                "Cache Hit Ratio",
+                "Dead Tuples",
                 "Total Rows Deleted",
                 "Total Rows Fetched",
                 "Total Rows Inserted",
@@ -80,6 +82,7 @@ tabs = {
             "order": "4",
             "tablist": [
                 "Tranasctions_and_Session_per_Database",
+                "Oldest Transaction ID Age",
                 "Total Commits",
                 "Total Rollbacks",
                 "Total Conflicts",
@@ -145,6 +148,9 @@ units = {
     "Total Rows Inserted": "rows",
     "Total Rows Returned": "rows",
     "Total Rows Updated": "rows",
+    "Cache Hit Ratio": "%",
+    "Dead Tuples": "tuples",
+    "Oldest Transaction ID Age": "xids",
     "Total Commits": "transactions",
     "Total Rollbacks": "transactions",
     "Total Sessions": "sessions",
@@ -536,6 +542,31 @@ class pgsql():
                 self._conn.rollback()
                 self._append_msg(f"conn_util: {str(inner_ex).splitlines()[0]}")
 
+        # === Table Bloat & TxID Wraparound Safety Metrics ===
+        try:
+            cur.execute("SELECT COALESCE(SUM(n_dead_tup), 0)::bigint FROM pg_stat_user_tables;")
+            dt_row = cur.fetchone()
+            if dt_row and dt_row[0] is not None:
+                self._results["Dead Tuples"] = int(dt_row[0])
+            else:
+                self._results["Dead Tuples"] = 0
+        except Exception as ex:
+            self._conn.rollback()
+            self._results["Dead Tuples"] = 0
+            self._append_msg(f"dead_tup: {str(ex).splitlines()[0]}")
+
+        try:
+            cur.execute("SELECT COALESCE(MAX(age(datfrozenxid)), 0)::bigint FROM pg_database WHERE datallowconn;")
+            tx_row = cur.fetchone()
+            if tx_row and tx_row[0] is not None:
+                self._results["Oldest Transaction ID Age"] = int(tx_row[0])
+            else:
+                self._results["Oldest Transaction ID Age"] = 0
+        except Exception as ex:
+            self._conn.rollback()
+            self._results["Oldest Transaction ID Age"] = 0
+            self._append_msg(f"txid_age: {str(ex).splitlines()[0]}")
+
         cur.close()
 
         # Emit top-level metrics as numbers (int or float) except strings for Server Version
@@ -550,6 +581,18 @@ class pgsql():
                     coerced = coerce_metric_value(key_title, row[i])
                     if coerced is not None:
                         self._results[key_title] = coerced
+
+        # Compute Buffer Cache Hit Ratio (%)
+        try:
+            b_hits = float(self._results.get("Total Block Hits", 0) or 0)
+            b_reads = float(self._results.get("Total Block Reads", 0) or 0)
+            tot_blks = b_hits + b_reads
+            if tot_blks > 0:
+                self._results["Cache Hit Ratio"] = round((b_hits / tot_blks) * 100.0, 2)
+            else:
+                self._results["Cache Hit Ratio"] = 100.0
+        except Exception:
+            self._results["Cache Hit Ratio"] = 100.0
 
         # Populate Tranasctions_and_Session_per_Database with strictly numeric metrics
         for row in conn_table_result:

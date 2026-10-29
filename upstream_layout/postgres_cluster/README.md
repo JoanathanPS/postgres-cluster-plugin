@@ -68,6 +68,9 @@ Running a real key diff between the standalone Site24x7 PostgreSQL plugin (`post
 | `Oldest Running Transaction Age`| `int` (s) | Duration in seconds of the oldest active transaction. | `SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start))::BIGINT, 0) FROM pg_stat_activity WHERE state <> 'idle';` |
 | `Available Connections` | `int` | Free connection slots reserved for regular client applications. | Derived: `max_connections - superuser_reserved_connections - active_connections` |
 | `Connection Utilization Percent`| `float` (%) | Percentage of configured max client connection slots in active use. | Derived: `ROUND((active_connections / max_connections) * 100.0, 2)` |
+| `Cache Hit Ratio` | `float` (%) | Buffer cache efficiency; percentage of page reads served from RAM. | Derived: `ROUND((blks_hit / (blks_hit + blks_read)) * 100.0, 2)` |
+| `Dead Tuples` | `int` (tuples) | Total accumulated dead tuples awaiting autovacuum cleanup; bloat risk. | `SELECT COALESCE(SUM(n_dead_tup), 0)::bigint FROM pg_stat_user_tables;` |
+| `Oldest Transaction ID Age` | `int` (xids) | Oldest transaction age; tracks headroom before 2-billion TxID wraparound shutdown. | `SELECT COALESCE(MAX(age(datfrozenxid)), 0)::bigint FROM pg_database WHERE datallowconn;` |
 | `Cluster_Nodes` | `list[dict]` | Tabular telemetry across all nodes (reachability, role, timeline, latency). | Multi-node parallel probe |
 | `Replication_Standbys` | `list[dict]` | Tabular streaming replication metrics per connected replica. | `SELECT * FROM pg_stat_replication;` on primary |
 | `status` | `int` (1/0) | Plugin overall operational health status indicator. | Dynamic health check evaluator |

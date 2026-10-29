@@ -116,6 +116,14 @@ def validate_schema(data, rep):
     rep.check("WAL Insert LSN" not in data, "Old 'WAL Insert LSN' key successfully retired")
     rep.check("WAL Flush LSN" not in data, "Old 'WAL Flush LSN' key successfully retired")
 
+    # Competitor Advantage Metrics (Cache Hit Ratio, Dead Tuples, TxID Wraparound)
+    rep.check("Cache Hit Ratio" in data and isinstance(data["Cache Hit Ratio"], (int, float)),
+              f"Cache Hit Ratio is present and numeric ({data.get('Cache Hit Ratio')})")
+    rep.check("Dead Tuples" in data and isinstance(data["Dead Tuples"], int),
+              f"Dead Tuples is present and integer ({data.get('Dead Tuples')})")
+    rep.check("Oldest Transaction ID Age" in data and isinstance(data["Oldest Transaction ID Age"], int),
+              f"Oldest Transaction ID Age is present and integer ({data.get('Oldest Transaction ID Age')})")
+
     rep.check("WAL Files Count" in data, f"WAL Files Count is present ({data.get('WAL Files Count')})")
     rep.check("WAL Total Size" in data, f"WAL Total Size is present ({data.get('WAL Total Size')})")
 
