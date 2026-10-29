@@ -49,6 +49,14 @@ BEGIN
 END
 \$\$;
 
+DO \$\$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
+        EXECUTE 'GRANT pg_monitor TO "$MONITOR_USER"';
+    END IF;
+END
+\$\$;
+
 GRANT pg_read_all_stats TO "$MONITOR_USER";
 GRANT pg_read_all_settings TO "$MONITOR_USER";
 ALTER ROLE "$MONITOR_USER" SET default_transaction_read_only = on;
@@ -61,8 +69,20 @@ EXCEPTION WHEN OTHERS THEN
     NULL;
 END
 \$\$;
+
+DO \$\$
+BEGIN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO "$MONITOR_USER"';
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END
+\$\$;
 EOF
 
+echo "Verifying monitoring user privileges for pg_ls_waldir() and pg_ls_archive_statusdir()..."
+PGPASSWORD="$MONITOR_PASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$MONITOR_USER" -d "$DBNAME" -c "SELECT count(*) AS wal_files_accessible FROM pg_ls_waldir();"
+PGPASSWORD="$MONITOR_PASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$MONITOR_USER" -d "$DBNAME" -c "SELECT count(*) AS archive_status_accessible FROM pg_ls_archive_statusdir();"
+
 echo
-echo "✓ Monitoring user '$MONITOR_USER' configured successfully!"
+echo "✓ Monitoring user '$MONITOR_USER' configured and verified successfully!"
 echo "You can now update postgres_cluster.cfg with username='$MONITOR_USER' and password."

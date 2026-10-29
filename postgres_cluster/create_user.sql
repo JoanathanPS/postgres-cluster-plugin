@@ -1,7 +1,6 @@
 -- Site24x7 PostgreSQL Cluster Monitoring User Creation Script
 -- Creates a dedicated least-privilege user for PostgreSQL cluster monitoring.
--- Run this script as a superuser (e.g. 'postgres') on the primary node
--- (or each node if standalone/bootstrap).
+-- Run this script as a superuser (e.g. 'postgres') on the primary node.
 
 \set ON_ERROR_STOP on
 
@@ -14,6 +13,15 @@ BEGIN
         CREATE ROLE site24x7 WITH LOGIN PASSWORD 'site24x7';
     ELSE
         ALTER ROLE site24x7 WITH LOGIN;
+    END IF;
+END
+$$;
+
+-- Grant pg_monitor (PostgreSQL 10+) for full read-only monitoring privileges (activity, WAL, archiving)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
+        EXECUTE 'GRANT pg_monitor TO site24x7';
     END IF;
 END
 $$;
@@ -33,7 +41,18 @@ DO $$
 BEGIN
     EXECUTE 'GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO site24x7';
 EXCEPTION WHEN OTHERS THEN
-    -- Ignore if function does not exist or version does not support it
     NULL;
 END
 $$;
+
+DO $$
+BEGIN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO site24x7';
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END
+$$;
+
+-- Verification queries: assert monitoring user can execute WAL directory functions
+SELECT count(*) AS wal_files_accessible FROM pg_ls_waldir();
+SELECT count(*) AS archive_status_accessible FROM pg_ls_archive_statusdir();
