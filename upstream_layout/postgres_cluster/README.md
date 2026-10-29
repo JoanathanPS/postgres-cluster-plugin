@@ -300,3 +300,15 @@ The plugin automatically organizes all metrics into 6 dashboard tabs:
    WAL Write/Insert/Flush positions (MB), on-disk WAL segment file count and total size, and archiving telemetry (when archiving is enabled).
 6. **Recovery Conflicts** (`order: 6`):
    Standby recovery conflicts breakdown, lock/pin/snapshot conflicts, oldest transaction duration, and connection pool utilization.
+
+---
+
+## v1 vs v2 on the Console
+
+- **Where to find both monitors**: In the Site24x7 web console, navigate to **Plugins** $\rightarrow$ **Plugin Integrations** (or filter by Application).
+  - **v1 monitors**: Named per configured node section (e.g. `postgres_cluster_v1-pg_primary`, `postgres_cluster_v1-pg_replica`).
+  - **v2 monitor**: Displayed as a unified cluster monitor (e.g. `postgres_cluster_dev` or `postgres_cluster`).
+- **Core architectural difference**: **v1** creates one monitor per node, while **v2** creates one monitor for the whole cluster.
+
+*Note: The initial v1 plugin implementation was contributed by the previous intern via site24x7/plugins PR #442; v2 builds upon this work to offer a consolidated, cluster-wide topology under a single monitor pane.*
+

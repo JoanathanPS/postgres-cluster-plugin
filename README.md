@@ -416,3 +416,15 @@ Remove-Item -Recurse test-output             # remove saved plugin JSON
   the replica volume's `postgresql.auto.conf` (normal for this setup).
 - The monitoring role cannot write or replicate. This was tested: `CREATE TABLE` → read-only / `permission denied for schema public`,
   `SELECT` on app tables → `permission denied`, and replication connections are refused.
+
+---
+
+## 11. v1 vs v2 on the console
+
+- **Where to find both monitors**: In the Site24x7 web console, navigate to **Plugins** $\rightarrow$ **Plugin Integrations** (or filter by Application).
+  - **v1 monitors**: Named per configured node section (e.g. `postgres_cluster_v1-pg_primary`, `postgres_cluster_v1-pg_replica`).
+  - **v2 monitor**: Displayed as a unified cluster monitor (e.g. `postgres_cluster_dev` or `postgres_cluster`).
+- **Core architectural difference**: **v1** creates one monitor per node, while **v2** creates one monitor for the whole cluster.
+
+*Note: The initial v1 plugin implementation was contributed by the previous intern via site24x7/plugins PR #442; v2 builds upon this work to offer a consolidated, cluster-wide topology under a single monitor pane.*
+
