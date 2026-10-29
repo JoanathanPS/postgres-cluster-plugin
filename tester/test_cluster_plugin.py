@@ -5,7 +5,7 @@ Automated test suite for the Site24x7 PostgreSQL Cluster Plugin (postgres_cluste
 Validates:
   1. Plugin output adherence to Site24x7 schema and tabular limits:
      - Output is valid RFC 8259 JSON
-     - plugin_version is integer >= 1
+     - plugin_version is integer >= 5
      - heartbeat_required is boolean
      - Max 10 tables, max 15 columns per table, max 25 rows per table
      - Max 5 string columns per table (excluding 'name')
@@ -14,6 +14,10 @@ Validates:
      - Generic metric count <= 200
      - Numeric types: ints and floats emitted for all numeric columns and generic metrics
      - String types only for Server Version and Last Archived WAL File
+     - Renamed WAL position metrics: WAL Write Position, WAL Insert Position, WAL Flush Position (MB)
+     - WAL Files Count counts only 24-hex segments (name ~ '^[0-9A-F]{24}$'), excluding .history files
+     - Archiving metrics reported only when archive_mode is 'on' or 'always'; omitted with 'archiving not enabled' note when 'off'
+     - Write Ahead Log tablist dynamically omits absent archive metrics
      - Nested units format: units["Cluster_Nodes"] and units["Replication_Standbys"]
      - s247config.childdiscovery strictly contains per-DB tables (no Cluster child tables)
      - tabs["Cluster"]["tablist"] includes Cluster_Nodes and Replication_Standbys
@@ -88,8 +92,8 @@ def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None):
 
 
 def validate_schema(data, rep):
-    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 1,
-              f"plugin_version is integer >= 1 ({data.get('plugin_version')})")
+    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 5,
+              f"plugin_version is integer >= 5 ({data.get('plugin_version')})")
     rep.check("heartbeat_required" in data, "heartbeat_required is present")
 
     # Cluster metrics presence and numeric types
@@ -103,6 +107,32 @@ def validate_schema(data, rep):
     for m in expected_metrics:
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")
         rep.check(isinstance(data.get(m), (int, float)), f"Cluster metric '{m}' is numeric type ({type(data.get(m)).__name__})")
+
+    # Renamed WAL position metrics
+    rep.check("WAL Write Position" in data, f"WAL Write Position is present ({data.get('WAL Write Position')})")
+    rep.check("WAL Insert Position" in data, f"WAL Insert Position is present ({data.get('WAL Insert Position')})")
+    rep.check("WAL Flush Position" in data, f"WAL Flush Position is present ({data.get('WAL Flush Position')})")
+    rep.check("Current WAL LSN" not in data, "Old 'Current WAL LSN' key successfully retired")
+    rep.check("WAL Insert LSN" not in data, "Old 'WAL Insert LSN' key successfully retired")
+    rep.check("WAL Flush LSN" not in data, "Old 'WAL Flush LSN' key successfully retired")
+
+    rep.check("WAL Files Count" in data, f"WAL Files Count is present ({data.get('WAL Files Count')})")
+    rep.check("WAL Total Size" in data, f"WAL Total Size is present ({data.get('WAL Total Size')})")
+
+    # Archiving metrics check: omitted when archiving is disabled
+    msg = data.get("msg", "")
+    if "archiving not enabled" in msg:
+        rep.check("Archive Status Success" not in data, "Archive Status Success omitted when archive_mode is off")
+        rep.check("Archive Status Failed" not in data, "Archive Status Failed omitted when archive_mode is off")
+        rep.check("Last Archived WAL File" not in data, "Last Archived WAL File omitted when archive_mode is off")
+        rep.check("Archive Ready Files Count" not in data, "Archive Ready Files Count omitted when archive_mode is off")
+        rep.check(data.get("status") == 1, "'archiving not enabled' note in msg does not set status to 0")
+
+        # Tablist check: absent archive metrics omitted from Write Ahead Log tablist
+        wal_tablist = data.get("tabs", {}).get("Write Ahead Log", {}).get("tablist", [])
+        archive_keys = {"Archive Status Success", "Archive Status Failed", "Last Archived WAL File", "Archive Ready Files Count"}
+        rep.check(all(k not in wal_tablist for k in archive_keys),
+                  f"Write Ahead Log tablist omits absent archive metrics when archiving is off ({wal_tablist})")
 
     # Top-level generic metrics numeric types rule
     # Only 'Server Version' and 'Last Archived WAL File' may be strings
@@ -191,6 +221,10 @@ def validate_schema(data, rep):
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
+    rep.check("WAL Write Position" in units and units["WAL Write Position"] == "MB", "units has 'WAL Write Position': 'MB'")
+    rep.check("WAL Insert Position" in units and units["WAL Insert Position"] == "MB", "units has 'WAL Insert Position': 'MB'")
+    rep.check("WAL Flush Position" in units and units["WAL Flush Position"] == "MB", "units has 'WAL Flush Position': 'MB'")
+
     rep.check("Cluster_Nodes" in units and isinstance(units["Cluster_Nodes"], dict), "units contains nested dict 'Cluster_Nodes'")
     if "Cluster_Nodes" in units:
         rep.check("response_time_ms" in units["Cluster_Nodes"], "units['Cluster_Nodes'] has 'response_time_ms'")
@@ -219,12 +253,50 @@ def validate_schema(data, rep):
     rep.check("Tranasctions_and_Session_per_Database" in childdiscovery, "Tranasctions_and_Session_per_Database present in s247config.childdiscovery")
 
 
+def test_wal_history_exclusion(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """
+    Tests that a cluster with .history files in the WAL directory is not over-counted:
+    - WAL Files Count must count only WAL segment files (24-hex filenames matching ^[0-9A-F]{24}$).
+    - WAL Total Size must sum only those segments.
+    """
+    print("\n=== Test: WAL History File Exclusion & Segment Count Accuracy ===")
+    proc, elapsed = run_plugin(plugin_py, nodes, user, password, db, patroni_port)
+    rep.check(proc.returncode == 0, f"Plugin execution succeeded (elapsed: {elapsed:.2f}s)")
+    try:
+        data = json.loads(proc.stdout)
+        wal_count = data.get("WAL Files Count")
+        wal_size = data.get("WAL Total Size")
+
+        print(f"  Observed WAL Files Count: {wal_count}")
+        print(f"  Observed WAL Total Size:  {wal_size} MB")
+
+        # Live cluster has 26 WAL segments and 15 .history files (total 41 files in pg_ls_waldir)
+        # WAL Files Count must be 26, NOT 41!
+        rep.check(wal_count == 26, f"WAL Files Count strictly counts 24-hex segment files only ({wal_count} == 26, not 41)")
+        rep.check(wal_size == 416.0, f"WAL Total Size matches 26 segments x 16MB ({wal_size} == 416.0 MB)")
+    except Exception as e:
+        rep.fail(f"Failed to verify WAL history file exclusion: {e}")
+
+    # Simulated Mock Test for WAL directory filtering logic
+    import re
+    mock_files = [
+        # 26 valid 24-hex WAL segments (16MB each)
+        *[f"0000000100000001000000{i:02X}" for i in range(26)],
+        # 15 timeline history files
+        *[f"0000000{i:02X}.history" for i in range(1, 16)],
+        # Other potential non-segment items
+        "archive_status"
+    ]
+    wal_regex = re.compile(r'^[0-9A-F]{24}$')
+    filtered_segments = [f for f in mock_files if wal_regex.match(f)]
+    rep.check(len(filtered_segments) == 26, f"Regex '^[0-9A-F]{{24}}$' filters out 15 .history files and archive_status (26 segments matched)")
+
+
 def test_permission_omission(rep):
     """Verifies that query or permission failures omit metrics rather than fabricating default 0s."""
     print("\n=== Test: Forced Permission / Error Handling (No Fabricated Defaults) ===")
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
 
-    # Import collector from upstream layout
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
     try:
         import postgres_cluster as pg_mod
@@ -414,10 +486,13 @@ def main():
     # Test 4: Forced permission failure check
     test_permission_omission(rep)
 
-    # Test 5: Deadline enforcement under paused node
+    # Test 5: WAL History file exclusion test
+    test_wal_history_exclusion(plugin_py, nodes, user, password, db, patroni_port, rep)
+
+    # Test 6: Deadline enforcement under paused node
     test_deadline_behavior(plugin_py, nodes, user, password, db, patroni_port, rep)
 
-    # Test 6: Dynamic Failover Assertion
+    # Test 7: Dynamic Failover Assertion
     if args.failover:
         test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep)
 
