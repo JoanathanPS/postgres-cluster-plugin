@@ -40,6 +40,10 @@ $targetPy = Join-Path $targetDir "postgres_cluster_v1.py"
 Write-Host "Copying v1 python script to: $targetPy" -ForegroundColor Yellow
 Copy-Item -Path "$SourceV1Dir\postgres_cluster.py" -Destination $targetPy -Force
 
+# Minimal showcase fix: Site24x7 agent requires valid JSON output to register
+Write-Host "Applying minimal JSON formatting fix (print(json.dumps(results))) for showcase..." -ForegroundColor Yellow
+(Get-Content $targetPy) -replace '^(\s*)print\(results\)', '$1print(json.dumps(results))' | Set-Content $targetPy -Encoding Utf8
+
 # Create v1 configuration file
 $targetCfg = Join-Path $targetDir "postgres_cluster_v1.cfg"
 $cfgContent = @"
