@@ -501,16 +501,21 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                             node_rows = c_widget.locator("tbody tr, tr").all()
 
                     row_count = len(node_rows)
-                    primary_rows = [r for r in node_rows if "primary" in r.inner_text().lower()]
+                    primary_rows = [
+                        r for r in node_rows 
+                        if "primary" in r.inner_text().lower() or 
+                           "is_primary: 1" in r.inner_text().lower() or 
+                           " 1 " in r.inner_text()
+                    ]
                     primary_count = len(primary_rows)
 
                     nodes_table_ok = (row_count == 3 and primary_count == 1)
-                    nodes_details = f"Rows found: {row_count}/3, primary row count: {primary_count}/1"
+                    nodes_details = f"Rows found: {row_count}/3, is_primary=1 row count: {primary_count}/1"
                     if not nodes_table_ok:
                         row_texts = [r.inner_text().strip().replace('\n', ' | ') for r in node_rows]
                         nodes_details += f" (Observed: {row_texts if row_texts else 'No data rows rendered'})"
 
-                    record("Cluster_Nodes Table Rows and Role", nodes_table_ok, nodes_details, shot_path)
+                    record("Cluster_Nodes Table Rows and is_primary", nodes_table_ok, nodes_details, shot_path)
             tab_index += 1
 
         try:

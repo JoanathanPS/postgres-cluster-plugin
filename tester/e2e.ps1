@@ -112,7 +112,7 @@ try {
     Log-Stage "B. Plugin Timing & Probing Checks (<5s Constraints)"
 
     $pluginPy = Join-Path $repoRoot "upstream_layout\postgres_cluster\postgres_cluster.py"
-    $defaultNodes = "localhost:5441,localhost:5442,localhost:5443"
+    $defaultNodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003"
 
     # Check 1: Healthy Cluster Timing
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -340,7 +340,7 @@ try {
     }
 
     Start-Sleep -Seconds 3
-    $cleanHealth = py upstream_layout/postgres_cluster/postgres_cluster.py --nodes "localhost:5441,localhost:5442,localhost:5443" --username site24x7 --password site24x7 2>$null
+    $cleanHealth = py upstream_layout/postgres_cluster/postgres_cluster.py --nodes "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003" --username site24x7 --password site24x7 2>$null
     $cleanJson = $null
     try { $cleanJson = $cleanHealth | ConvertFrom-Json } catch {}
     $cleanOk = ($cleanJson -and $cleanJson.'Nodes Up' -eq 3 -and $cleanJson.'Primary Count' -eq 1)
