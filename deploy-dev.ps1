@@ -12,7 +12,7 @@
 [CmdletBinding()]
 param(
     [switch]$RestartService,
-    [string]$Nodes = "127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443",
+    [string]$Nodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003",
     [string]$Username = "site24x7",
     [string]$Password = "site24x7",
     [string]$Database = "postgres",
