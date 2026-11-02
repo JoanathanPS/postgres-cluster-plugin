@@ -11,10 +11,11 @@ param(
     [ValidateSet("quick", "full")]
     [string]$Mode = "quick",
     [switch]$SkipConsole,
-    [string]$ReportPath = "evidence\REPORT.md"
+    [string]$ReportPath = "evidence\REPORT.md",
+    [string]$PluginScript = ""
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 Set-Location $repoRoot
@@ -113,32 +114,38 @@ try {
     # --------------------------------------------------------------------------
     Log-Stage "B. Plugin Timing & Probing Checks (<5s Constraints)"
 
-    $pluginPy = Join-Path $repoRoot "upstream_layout\postgres_cluster\postgres_cluster.py"
+    $pluginPy = if ($PluginScript -and (Test-Path $PluginScript)) {
+        (Resolve-Path $PluginScript).Path
+    } else {
+        Join-Path $repoRoot "upstream_layout\postgres_cluster\postgres_cluster.py"
+    }
     $defaultNodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003"
 
     # Check 1: Healthy Cluster Timing
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $healthyOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+    $healthyOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>&1
+    $hExit = $LASTEXITCODE
     $sw.Stop()
     $healthyElapsed = $sw.Elapsed.TotalSeconds
     $healthyJson = $null
     try { $healthyJson = $healthyOut | ConvertFrom-Json } catch {}
 
-    $hPass = ($LASTEXITCODE -eq 0 -and $healthyJson -and $healthyElapsed -lt 5.0)
-    Assert-Result "Healthy Cluster Query (<5s)" $hPass "Elapsed: $([math]::Round($healthyElapsed, 2))s | Nodes Up: $($healthyJson.'Nodes Up')/3 | Timeline: $($healthyJson.'Primary Timeline')" $healthyElapsed
+    $hPass = ($hExit -eq 0 -and $null -ne $healthyJson -and $healthyJson.status -eq 1 -and $healthyElapsed -lt 5.0)
+    Assert-Result "Healthy Cluster Query (<5s)" $hPass "Elapsed: $([math]::Round($healthyElapsed, 2))s | ExitCode: $hExit | Nodes Up: $(if ($healthyJson) { $healthyJson.'Nodes Up' } else { 'N/A' })" $healthyElapsed
 
     # Check 2: 1 Replica Down Timing (<5s)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     docker pause patroni-pg-node3 2>$null | Out-Null
     try {
         $rSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $oneDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+        $oneDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>&1
+        $odExit = $LASTEXITCODE
         $rSw.Stop()
         $oneDownElapsed = $rSw.Elapsed.TotalSeconds
         $oneDownJson = $null
         try { $oneDownJson = $oneDownOut | ConvertFrom-Json } catch {}
-        $odPass = ($oneDownJson -and $oneDownJson.'Nodes Up' -eq 2 -and $oneDownElapsed -lt 5.0)
-        Assert-Result "1 Replica Paused/Down (<5s)" $odPass "Elapsed: $([math]::Round($oneDownElapsed, 2))s | Nodes Up: $($oneDownJson.'Nodes Up') | No Primary: $($oneDownJson.'No Primary Flag')" $oneDownElapsed
+        $odPass = ($odExit -eq 0 -and $null -ne $oneDownJson -and $oneDownJson.'Nodes Up' -eq 2 -and $oneDownElapsed -lt 5.0)
+        Assert-Result "1 Replica Paused/Down (<5s)" $odPass "Elapsed: $([math]::Round($oneDownElapsed, 2))s | Nodes Up: $(if ($oneDownJson) { $oneDownJson.'Nodes Up' } else { 'N/A' })" $oneDownElapsed
     } finally {
         docker unpause patroni-pg-node3 2>$null | Out-Null
     }
@@ -148,35 +155,36 @@ try {
     $currPrimary = "patroni-pg-node1"
     if ($healthyJson -and $healthyJson.Cluster_Nodes) {
         $pNode = $healthyJson.Cluster_Nodes | Where-Object { $_.role -eq "primary" } | Select-Object -First 1
-        if ($pNode.name -match "5442") { $currPrimary = "patroni-pg-node2" }
-        elseif ($pNode.name -match "5443") { $currPrimary = "patroni-pg-node3" }
+        if ($pNode -and $pNode.name -match "5442") { $currPrimary = "patroni-pg-node2" }
+        elseif ($pNode -and $pNode.name -match "5443") { $currPrimary = "patroni-pg-node3" }
     }
 
     docker pause $currPrimary 2>$null | Out-Null
     try {
         $pSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $pDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+        $pDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>&1
+        $pdExit = $LASTEXITCODE
         $pSw.Stop()
         $pDownElapsed = $pSw.Elapsed.TotalSeconds
         $pDownJson = $null
         try { $pDownJson = $pDownOut | ConvertFrom-Json } catch {}
-        $pdPass = ($pDownJson -and $pDownJson.'No Primary Flag' -eq 1 -and $pDownElapsed -lt 5.0)
-        Assert-Result "Primary Paused/Down (<5s)" $pdPass "Elapsed: $([math]::Round($pDownElapsed, 2))s | No Primary Flag: $($pDownJson.'No Primary Flag')" $pDownElapsed
+        $pdPass = ($pdExit -eq 0 -and $null -ne $pDownJson -and $pDownJson.'No Primary Flag' -eq 1 -and $pDownElapsed -lt 5.0)
+        Assert-Result "Primary Paused/Down (<5s)" $pdPass "Elapsed: $([math]::Round($pDownElapsed, 2))s | No Primary Flag: $(if ($pDownJson) { $pDownJson.'No Primary Flag' } else { 'N/A' })" $pDownElapsed
     } finally {
         docker unpause $currPrimary 2>$null | Out-Null
         # Wait for cluster to settle and re-elect/re-attach before proceeding
         $settleSw = [System.Diagnostics.Stopwatch]::StartNew()
         do {
             Start-Sleep -Seconds 2
-            $sOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+            $sOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>&1
             $sJson = $null
             try { $sJson = $sOut | ConvertFrom-Json } catch {}
         } while (($null -eq $sJson -or $sJson.'Nodes Up' -ne 3 -or $sJson.'Primary Count' -ne 1) -and $settleSw.Elapsed.TotalSeconds -lt 25)
     }
 
     # Check 4: Child tables structure
-    $tablesOk = ($healthyJson.Cluster_Nodes.Count -eq 3 -and $healthyJson.Replication_Standbys.Count -ge 1)
-    Assert-Result "Child Tables Structure" $tablesOk "Cluster_Nodes rows: $($healthyJson.Cluster_Nodes.Count) | Replication_Standbys rows: $($healthyJson.Replication_Standbys.Count)"
+    $tablesOk = ($healthyJson -and $healthyJson.Cluster_Nodes -and $healthyJson.Cluster_Nodes.Count -eq 3 -and $healthyJson.Replication_Standbys -and $healthyJson.Replication_Standbys.Count -ge 1)
+    Assert-Result "Child Tables Structure" $tablesOk "Cluster_Nodes rows: $(if ($healthyJson -and $healthyJson.Cluster_Nodes) { $healthyJson.Cluster_Nodes.Count } else { 0 }) | Replication_Standbys rows: $(if ($healthyJson -and $healthyJson.Replication_Standbys) { $healthyJson.Replication_Standbys.Count } else { 0 })"
 
     # --------------------------------------------------------------------------
     # STAGE C: Existing Test Suites
@@ -352,23 +360,37 @@ try {
     }
 
     Start-Sleep -Seconds 3
-    $cleanHealth = & $pyExe upstream_layout/postgres_cluster/postgres_cluster.py --nodes "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003" --username site24x7 --password site24x7 2>$null
+    $cleanHealth = & $pyExe upstream_layout/postgres_cluster/postgres_cluster.py --nodes "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003" --username site24x7 --password site24x7 2>&1
+    $cleanExit = $LASTEXITCODE
     $cleanJson = $null
     try { $cleanJson = $cleanHealth | ConvertFrom-Json } catch {}
-    $cleanOk = ($cleanJson -and $cleanJson.'Nodes Up' -eq 3 -and $cleanJson.'Primary Count' -eq 1)
+    $cleanOk = ($cleanExit -eq 0 -and $null -ne $cleanJson -and $cleanJson.'Nodes Up' -eq 3 -and $cleanJson.'Primary Count' -eq 1)
 
-    Assert-Result "Cluster Returned to Healthy 3-Node State" $cleanOk "Nodes Up: $($cleanJson.'Nodes Up')/3 | Primary Count: $($cleanJson.'Primary Count') | Timeline: $($cleanJson.'Primary Timeline')"
+    Assert-Result "Cluster Returned to Healthy 3-Node State" $cleanOk "Nodes Up: $(if ($cleanJson) { $cleanJson.'Nodes Up' } else { 'N/A' })/3 | Primary Count: $(if ($cleanJson) { $cleanJson.'Primary Count' } else { 'N/A' })"
 }
 
 $endTime = Get-Date
 $totalDuration = ($endTime - $startTime).TotalSeconds
+$resultOutcome = if ($overallFail) { 'FAIL' } else { 'PASS' }
+
+Write-Host "`n=================================================================" -ForegroundColor $(if ($overallFail) { "Red" } else { "Green" })
+Write-Host " RESULT: $resultOutcome" -ForegroundColor $(if ($overallFail) { "Red" } else { "Green" })
+Write-Host "=================================================================" -ForegroundColor $(if ($overallFail) { "Red" } else { "Green" })
+
 Write-Report "`n---`n"
 Write-Report "**Total Duration:** $([math]::Round($totalDuration, 2)) seconds  "
-Write-Report "**Final Outcome:** $(if ($overallFail) { 'FAILED' } else { 'PASSED' })  "
+Write-Report "**Final Outcome:** $($resultOutcome)ED  "
+
+$reportDir = Split-Path -Parent $ReportPath
+if ($reportDir -and (-not (Test-Path $reportDir))) {
+    New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+}
 
 Set-Content -Path $ReportPath -Value $reportLines -Encoding UTF8
 Write-Host "`nE2E Report written to: $ReportPath" -ForegroundColor Cyan
 
 if ($overallFail) {
     exit 1
+} else {
+    exit 0
 }

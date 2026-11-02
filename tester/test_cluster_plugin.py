@@ -92,8 +92,8 @@ def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None, cluster_
 
 
 def validate_schema(data, rep):
-    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 7,
-              f"plugin_version is integer >= 7 ({data.get('plugin_version')})")
+    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 8,
+              f"plugin_version is integer >= 8 ({data.get('plugin_version')})")
     rep.check("heartbeat_required" in data and isinstance(data["heartbeat_required"], bool),
               "heartbeat_required is boolean")
     rep.check(data.get("status") in (0, 1), f"status is 0 or 1 ({data.get('status')})")
@@ -115,13 +115,17 @@ def validate_schema(data, rep):
     # String top-level metrics
     allowed_string_metrics = {
         "Server Version", "Last Archived WAL File", "Cluster Type",
-        "Cluster Type Evidence", "Cluster Name", "Archive Mode", "msg"
+        "Cluster Type Evidence", "Cluster Name", "Archive Mode",
+        "Cluster Summary", "msg"
     }
-    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode"]:
+    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Summary"]:
         if sm in data:
             rep.check(isinstance(data[sm], str), f"Top-level string metric '{sm}' is str ({data.get(sm)})")
             if sm == "Cluster Type Evidence":
                 rep.check(len(data[sm]) < 100, f"Cluster Type Evidence strictly < 100 chars ({len(data[sm])} chars)")
+
+    rep.check("Cluster Summary" in data, f"Cluster Summary present ({data.get('Cluster Summary')})")
+    rep.check("msg" not in data or data.get("msg") is None, f"msg omitted on healthy run ({data.get('msg')})")
 
     # Renamed WAL position metrics
     rep.check("WAL Write Position" in data and isinstance(data["WAL Write Position"], (int, float)),
@@ -684,6 +688,69 @@ def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, 
         rep.check(data_rec.get("Nodes Up") == 3, f"Cluster recovered back to 3 nodes up ({data_rec.get('Nodes Up')})")
 
 
+def test_exception_injection(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """
+    Test: Unexpected Exception Injection Handling
+    Asserts that collect() catches any unexpected internal exception,
+    returns valid JSON with status: 0, sets msg with the exception text,
+    retains data collected so far, and never emits an unhandled traceback to stdout.
+    """
+    print("\n=== Test: Unexpected Exception Injection Handling ===")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    import postgres_cluster as pg_mod
+
+    collector = pg_mod.PostgresClusterCollector(
+        nodes_str=nodes,
+        username=user,
+        password=password,
+        db=db,
+        patroni_port=patroni_port
+    )
+
+    # In-memory injection: inject an unexpected RuntimeError inside _parse_nodes
+    def broken_parse():
+        raise RuntimeError("SIMULATED_INTERNAL_CORRUPTION_FAILURE")
+    collector._parse_nodes = broken_parse
+
+    try:
+        res = collector.collect()
+        rep.check(isinstance(res, dict), "collect() returns valid dictionary despite unexpected exception")
+        rep.check(res.get("status") == 0, f"status is 0 on injected exception ({res.get('status')})")
+        rep.check("msg" in res and "SIMULATED_INTERNAL_CORRUPTION_FAILURE" in str(res.get("msg")),
+                  f"msg contains injected exception text ('{res.get('msg')}')")
+        rep.check(res.get("plugin_version") == pg_mod.PLUGIN_VERSION,
+                  "plugin_version is preserved in results")
+        rep.check(res.get("heartbeat_required") == pg_mod.HEARTBEAT,
+                  "heartbeat_required is preserved in results")
+        rep.check("tabs" in res and "units" in res,
+                  "tabs and units schemas are preserved in results")
+    except Exception as e:
+        rep.fail(f"collect() raised unexpected exception instead of handling safely: {e}")
+
+    # Subprocess execution test: verify CLI execution outputs valid JSON with status 0 and no traceback on stdout
+    test_code = (
+        "import sys, json, os\n"
+        f"sys.path.insert(0, r'{os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'upstream_layout', 'postgres_cluster'))}')\n"
+        "import postgres_cluster as pg\n"
+        "def broken_parse(self):\n"
+        "    raise ValueError('SIMULATED_CLI_EXCEPTION')\n"
+        "pg.PostgresClusterCollector._parse_nodes = broken_parse\n"
+        f"collector = pg.PostgresClusterCollector('{nodes}', '{user}', '{password}', '{db}')\n"
+        "res = collector.collect()\n"
+        "print(json.dumps(res))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", test_code], capture_output=True, text=True)
+    rep.check(proc.returncode == 0, f"CLI runner completed with exit code 0 ({proc.returncode})")
+    rep.check("Traceback" not in proc.stdout, "No traceback present on stdout")
+    try:
+        cli_data = json.loads(proc.stdout)
+        rep.check(cli_data.get("status") == 0, f"CLI output status is 0 ({cli_data.get('status')})")
+        rep.check("SIMULATED_CLI_EXCEPTION" in cli_data.get("msg", ""),
+                  f"CLI output msg contains exception text ('{cli_data.get('msg')}')")
+    except Exception as e:
+        rep.fail(f"CLI output was not valid JSON: {e}\nStdout: {proc.stdout}\nStderr: {proc.stderr}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="PostgreSQL Cluster Plugin Test Suite")
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
@@ -770,7 +837,10 @@ def main():
     # Test 8: Deadline enforcement under paused node
     test_deadline_behavior(plugin_py, nodes, user, password, db, patroni_port, rep)
 
-    # Test 9: Dynamic Failover Assertion
+    # Test 9: Unexpected Exception Injection Handling
+    test_exception_injection(plugin_py, nodes, user, password, db, patroni_port, rep)
+
+    # Test 10: Dynamic Failover Assertion
     if args.failover:
         test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep)
 

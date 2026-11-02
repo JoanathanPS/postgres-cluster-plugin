@@ -56,7 +56,7 @@ The plugin organizes telemetry across **7 dedicated dashboard tabs** and **9 chi
 ### Dashboard Tabs
 
 1. **`Cluster`** (`order: 1`):
-   - **Metrics**: `Nodes Total`, `Nodes Up`, `Primary Count`, `No Primary Flag`, `Split Brain Flag`, `Primary Timeline`, `Cluster Type`, `Cluster Type Evidence`, `Cluster Name`, `Server Version`, `Server PID`, `Uptime`.
+   - **Metrics**: `Nodes Total`, `Nodes Up`, `Primary Count`, `No Primary Flag`, `Split Brain Flag`, `Primary Timeline`, `Cluster Type`, `Cluster Type Evidence`, `Cluster Summary`, `Cluster Name`, `Server Version`, `Server PID`, `Uptime`.
    - **Child Table**: `Cluster_Nodes`.
 2. **`Replication`** (`order: 2`):
    - **Metrics**: `Standbys Expected`, `Standbys Streaming`, `Standby Disconnect Flag`, `Sync Standby Count`, `Cascading Standby Count`, `Max Replay Backlog`, `Max Replay Delay`, `Replication Slots Total`, `Replication Slots Active`, `Replication Slots Inactive`, `Physical Slots`, `Logical Slots`, `Max Slot Lag Bytes`.

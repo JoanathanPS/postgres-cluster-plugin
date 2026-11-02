@@ -26,7 +26,7 @@ CLUSTER_TYPE = 'auto'                                                    # 'auto
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
 STATEMENT_TIMEOUT_MS = 5000                                              # Per-query statement timeout in PostgreSQL (ms)
 
-PLUGIN_VERSION = 7
+PLUGIN_VERSION = 8
 HEARTBEAT = True
 
 # Standard 7-Tab Layout for Site24x7 Console
@@ -38,6 +38,7 @@ tabs = {
                 "Cluster_Nodes",
                 "Cluster Type",
                 "Cluster Type Evidence",
+                "Cluster Summary",
                 "Nodes Total",
                 "Nodes Up",
                 "Primary Count",
@@ -348,7 +349,7 @@ def coerce_metric_value(val_name, raw_val):
 
     if val_name in (
         "Server Version", "Last Archived WAL File", "Cluster Type",
-        "Cluster Type Evidence", "Cluster Name", "Archive Mode"
+        "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Summary"
     ):
         return str_val
 
@@ -831,11 +832,33 @@ class PostgresClusterCollector:
         return parsed
 
     def collect(self):
+        """
+        Public collection entrypoint.
+        Wraps the entire collection pipeline in a safety handler to guarantee that any
+        unexpected exception returns valid JSON with status 0 and a concise error message,
+        never printing an unhandled traceback to stdout and preserving any data collected so far.
+        """
         results = OrderedDict()
         results["plugin_version"] = PLUGIN_VERSION
         results["heartbeat_required"] = HEARTBEAT
         results["status"] = 1
 
+        try:
+            return self._collect_internal(results)
+        except Exception as e:
+            results["status"] = 0
+            err_msg = f"Unexpected collector exception: {type(e).__name__}: {str(e)}"
+            if self.msg_notes:
+                results["msg"] = "; ".join(self.msg_notes) + f"; {err_msg}"
+            else:
+                results["msg"] = err_msg
+            if "tabs" not in results:
+                results.update(copy.deepcopy(tabs))
+            if "units" not in results:
+                results["units"] = units
+            return results
+
+    def _collect_internal(self, results):
         node_defs = self._parse_nodes()
         nodes_total = len(node_defs)
         if nodes_total == 0:
@@ -1419,26 +1442,34 @@ class PostgresClusterCollector:
         results["units"] = units
 
         cluster_name = results.get("Cluster Name", "postgres_cluster")
+        p_desc = f"Primary: {active_primary.endpoint_str} (TL {primary_timeline})" if active_primary else "No Primary"
+        results["Cluster Summary"] = f"Cluster: {cluster_name} ({detected_type}) | {nodes_up}/{nodes_total} nodes up | {p_desc}"
+
         if self.msg_notes:
             results["msg"] = f"[{detected_type}] " + "; ".join(self.msg_notes)
-        else:
-            p_desc = f"Primary: {active_primary.endpoint_str} (TL {primary_timeline})" if active_primary else "No Primary"
-            results["msg"] = f"Cluster: {cluster_name} ({detected_type}) | {nodes_up}/{nodes_total} nodes up | {p_desc}"
 
         return results
 
 
 def run(param):
     """Site24x7 agent Python plugin entrypoint."""
-    nodes = param.get("nodes") if param and param.get("nodes") else NODES
-    username = param.get("username") if param and param.get("username") else USERNAME
-    password = param.get("password") if param and param.get("password") else PASSWORD
-    db = param.get("db") if param and param.get("db") else DB
-    patroni_port = param.get("patroni_port") if param and param.get("patroni_port") else PATRONI_PORT
-    cluster_type = param.get("cluster_type") if param and param.get("cluster_type") else CLUSTER_TYPE
+    try:
+        nodes = param.get("nodes") if param and param.get("nodes") else NODES
+        username = param.get("username") if param and param.get("username") else USERNAME
+        password = param.get("password") if param and param.get("password") else PASSWORD
+        db = param.get("db") if param and param.get("db") else DB
+        patroni_port = param.get("patroni_port") if param and param.get("patroni_port") else PATRONI_PORT
+        cluster_type = param.get("cluster_type") if param and param.get("cluster_type") else CLUSTER_TYPE
 
-    collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type)
-    return collector.collect()
+        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type)
+        return collector.collect()
+    except Exception as e:
+        return {
+            "plugin_version": PLUGIN_VERSION,
+            "heartbeat_required": HEARTBEAT,
+            "status": 0,
+            "msg": f"Unexpected entrypoint exception: {type(e).__name__}: {str(e)}"
+        }
 
 
 if __name__ == '__main__':
@@ -1452,13 +1483,21 @@ if __name__ == '__main__':
     parser.add_argument('--cluster_type', help='Cluster type override or auto', default=CLUSTER_TYPE)
     args = parser.parse_args()
 
-    collector = PostgresClusterCollector(
-        nodes_str=args.nodes,
-        username=args.username,
-        password=args.password,
-        db=args.db,
-        patroni_port=args.patroni_port,
-        cluster_type=args.cluster_type
-    )
-    result = collector.collect()
+    try:
+        collector = PostgresClusterCollector(
+            nodes_str=args.nodes,
+            username=args.username,
+            password=args.password,
+            db=args.db,
+            patroni_port=args.patroni_port,
+            cluster_type=args.cluster_type
+        )
+        result = collector.collect()
+    except Exception as e:
+        result = {
+            "plugin_version": PLUGIN_VERSION,
+            "heartbeat_required": HEARTBEAT,
+            "status": 0,
+            "msg": f"Unexpected execution exception: {type(e).__name__}: {str(e)}"
+        }
     print(json.dumps(result))

@@ -3,7 +3,11 @@
 # Runs the failover assertion suite
 # ==============================================================================
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 Write-Host "Running PostgreSQL Cluster Failover Test Suite..." -ForegroundColor Cyan
 
-py tester/test_cluster_plugin.py --failover
+$pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $pyExe) { $pyExe = "python" }
+
+& $pyExe tester/test_cluster_plugin.py --failover
+exit $LASTEXITCODE
