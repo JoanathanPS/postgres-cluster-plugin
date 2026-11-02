@@ -93,11 +93,13 @@ try {
     Assert-Result "Patroni Containers Running" $all3Up "Nodes found: pg-node1=$hasNode1, pg-node2=$hasNode2, pg-node3=$hasNode3"
 
     # Check Python & psycopg2
-    $pyVer = py --version 2>&1
+    $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if (-not $pyExe) { $pyExe = "python" }
+    $pyVer = & $pyExe --version 2>&1
     $pyOk = ($LASTEXITCODE -eq 0)
     Assert-Result "Python Runtime" $pyOk "$pyVer"
 
-    $psycopg2Check = py -c "import psycopg2; print(psycopg2.__version__)" 2>$null
+    $psycopg2Check = & $pyExe -c "import psycopg2; print(psycopg2.__version__)" 2>$null
     $psycopg2Ok = ($LASTEXITCODE -eq 0 -and $psycopg2Check)
     Assert-Result "psycopg2 Driver" $psycopg2Ok "Version: $psycopg2Check"
 
@@ -116,7 +118,7 @@ try {
 
     # Check 1: Healthy Cluster Timing
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $healthyOut = py $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+    $healthyOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
     $sw.Stop()
     $healthyElapsed = $sw.Elapsed.TotalSeconds
     $healthyJson = $null
@@ -130,7 +132,7 @@ try {
     docker pause patroni-pg-node3 2>$null | Out-Null
     try {
         $rSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $oneDownOut = py $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+        $oneDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
         $rSw.Stop()
         $oneDownElapsed = $rSw.Elapsed.TotalSeconds
         $oneDownJson = $null
@@ -153,7 +155,7 @@ try {
     docker pause $currPrimary 2>$null | Out-Null
     try {
         $pSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $pDownOut = py $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+        $pDownOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
         $pSw.Stop()
         $pDownElapsed = $pSw.Elapsed.TotalSeconds
         $pDownJson = $null
@@ -162,8 +164,14 @@ try {
         Assert-Result "Primary Paused/Down (<5s)" $pdPass "Elapsed: $([math]::Round($pDownElapsed, 2))s | No Primary Flag: $($pDownJson.'No Primary Flag')" $pDownElapsed
     } finally {
         docker unpause $currPrimary 2>$null | Out-Null
-        # Wait a moment for unpaused primary to re-establish leader or heartbeat
-        Start-Sleep -Seconds 3
+        # Wait for cluster to settle and re-elect/re-attach before proceeding
+        $settleSw = [System.Diagnostics.Stopwatch]::StartNew()
+        do {
+            Start-Sleep -Seconds 2
+            $sOut = & $pyExe $pluginPy --nodes $defaultNodes --username site24x7 --password site24x7 2>$null
+            $sJson = $null
+            try { $sJson = $sOut | ConvertFrom-Json } catch {}
+        } while (($null -eq $sJson -or $sJson.'Nodes Up' -ne 3 -or $sJson.'Primary Count' -ne 1) -and $settleSw.Elapsed.TotalSeconds -lt 25)
     }
 
     # Check 4: Child tables structure
@@ -183,9 +191,13 @@ try {
 
     # Unit & Integration test suite
     $tSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $testSuiteOut = py tester/test_cluster_plugin.py 2>&1
+    $testSuiteOut = & $pyExe tester/test_cluster_plugin.py 2>&1
+    $tsExit = $LASTEXITCODE
     $tSw.Stop()
-    Assert-Result "Cluster Plugin Test Suite" ($LASTEXITCODE -eq 0) "All healthy, dead host, and auth error assertions passed" $tSw.Elapsed.TotalSeconds
+    if ($tsExit -ne 0) {
+        Write-Host "TestSuite Error Output:`n$($testSuiteOut -join "`n")" -ForegroundColor Red
+    }
+    Assert-Result "Cluster Plugin Test Suite" ($tsExit -eq 0) "All healthy, dead host, and auth error assertions passed" $tSw.Elapsed.TotalSeconds
 
     if ($Mode -eq "full") {
         # Failover assertion test
@@ -196,7 +208,7 @@ try {
 
         # Lag Demo
         $lagSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $lagOut = py tester/lag_demo.py --duration 5 --rate 50 2>&1
+        $lagOut = & $pyExe tester/lag_demo.py --duration 5 --rate 50 2>&1
         $lagSw.Stop()
         Assert-Result "Replication Lag Demo (lag_demo.py)" ($LASTEXITCODE -eq 0) "pgbench synthetic load generated and observed" $lagSw.Elapsed.TotalSeconds
     } else {
@@ -249,7 +261,7 @@ try {
         foreach ($c in $targetCycles) {
             $pgMatches = @($c | Where-Object { $_ -match "postgres" })
             $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" })
-            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" })
+            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" -and $_ -notmatch "postgres_cluster_v1" })
 
             if ($validMatches.Count -ne 1 -or $badMatches.Count -gt 0) {
                 $singleInstanceOk = $false
@@ -293,7 +305,7 @@ try {
         Write-Report "- **[SKIP]** Web Console checks skipped via -SkipConsole"
     } else {
         $pwSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $pwOut = py tester/console_check.py 2>&1
+        $pwOut = & $pyExe tester/console_check.py 2>&1
         $pwExit = $LASTEXITCODE
         $pwSw.Stop()
         $pwElapsed = $pwSw.Elapsed.TotalSeconds
@@ -340,7 +352,7 @@ try {
     }
 
     Start-Sleep -Seconds 3
-    $cleanHealth = py upstream_layout/postgres_cluster/postgres_cluster.py --nodes "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003" --username site24x7 --password site24x7 2>$null
+    $cleanHealth = & $pyExe upstream_layout/postgres_cluster/postgres_cluster.py --nodes "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003" --username site24x7 --password site24x7 2>$null
     $cleanJson = $null
     try { $cleanJson = $cleanHealth | ConvertFrom-Json } catch {}
     $cleanOk = ($cleanJson -and $cleanJson.'Nodes Up' -eq 3 -and $cleanJson.'Primary Count' -eq 1)

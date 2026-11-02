@@ -55,6 +55,7 @@ username="$Username"
 password="$Password"
 db="$Database"
 patroni_port="$PatroniPort"
+cluster_type="auto"
 "@
 
 Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii

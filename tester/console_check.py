@@ -418,6 +418,7 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         # Step 5: Check 6 tabs (strictly all 6 must be found, including checking inside 'More' dropdown)
         expected_tabs = [
             "Cluster",
+            "Replication",
             "DB and IO stats",
             "BG Writer",
             "Transactions and Sessions",
@@ -494,9 +495,9 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         tabs_ok = (len(missing_tabs) == 0 and len(found_tabs) == len(expected_tabs))
 
         if tabs_ok:
-            record("Dashboard Tabs Present", True, f"All 6 tabs verified present: {found_tabs}")
+            record("Dashboard Tabs Present", True, f"All 7 tabs verified present: {found_tabs}")
         else:
-            record("Dashboard Tabs Present", False, f"Missing tab(s): {missing_tabs}. Found {len(found_tabs)}/6: {found_tabs}")
+            record("Dashboard Tabs Present", False, f"Missing tab(s): {missing_tabs}. Found {len(found_tabs)}/7: {found_tabs}")
 
         # Step 6: Cluster tab verification & screenshots of all tabs (strictly read-only navigation)
         tab_index = 2

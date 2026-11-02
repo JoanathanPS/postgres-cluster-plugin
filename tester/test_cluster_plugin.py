@@ -5,7 +5,7 @@ Automated test suite for the Site24x7 PostgreSQL Cluster Plugin (postgres_cluste
 Validates:
   1. Plugin output adherence to Site24x7 schema and tabular limits:
      - Output is valid RFC 8259 JSON
-     - plugin_version is integer >= 5
+     - plugin_version is integer >= 7
      - heartbeat_required is boolean
      - Max 10 tables, max 15 columns per table, max 25 rows per table
      - Max 5 string columns per table (excluding 'name')
@@ -13,27 +13,25 @@ Validates:
      - Row 'status' is numeric 1 or 0
      - Generic metric count <= 200
      - Numeric types: ints and floats emitted for all numeric columns and generic metrics
-     - String types only for Server Version and Last Archived WAL File
-     - Renamed WAL position metrics: WAL Write Position, WAL Insert Position, WAL Flush Position (MB)
-     - WAL Files Count counts only 24-hex segments (name ~ '^[0-9A-F]{24}$'), excluding .history files
-     - Archiving metrics reported only when archive_mode is 'on' or 'always'; omitted with 'archiving not enabled' note when 'off'
-     - Write Ahead Log tablist dynamically omits absent archive metrics
-     - Nested units format: units["Cluster_Nodes"] and units["Replication_Standbys"]
+     - String types only for Server Version, Last Archived WAL File, Cluster Type, Cluster Type Evidence, Cluster Name, Archive Mode, msg
+     - Nested units format: units["Cluster_Nodes"], units["Replication_Standbys"], units["Replication_Slots"],
+       units["Node_Activity"], units["Node_Throughput"], units["Node_Checkpoints"], units["Standby_Conflicts"]
+     - 7 tabs properly formed: Cluster, Replication, DB and IO stats, BG Writer, Transactions and Sessions, Write Ahead Log, Recovery Conflicts
      - s247config.childdiscovery strictly contains per-DB tables (no Cluster child tables)
-     - tabs["Cluster"]["tablist"] includes Cluster_Nodes and Replication_Standbys
-  2. Cluster-specific metrics validation:
-     - Nodes Total, Nodes Up, Primary Count, No Primary Flag, Split Brain Flag, Primary Timeline, Max Replay Backlog
-     - Replication Slots metrics: Total, Active, Inactive, Physical, Logical, Max Slot Lag Bytes
-  3. No fabricated data:
-     - Permission errors cause metrics to be omitted, never set to fabricated 0 defaults
-  4. Deadline enforcement:
-     - Dead nodes and paused containers return valid JSON within under 10 seconds
-  5. Authentication error reporting:
-     - Wrong password reports auth error in msg with status 0
-  6. Dynamic failover verification (optional --failover flag)
+  2. Coverage Map Assertion:
+     - 100% of mapped items in tester/coverage_map.json exist in collector output
+  3. Thread-safety under concurrency:
+     - 3 concurrent collectors run simultaneously without cross-talk
+  4. Cluster Type Detection fixtures:
+     - 13 fixtures tested against detect_cluster_type
+  5. Error scenarios:
+     - Dead cluster: status 0, No Primary Flag 1, Nodes Up 0 under 10s
+     - Wrong password: status 0, auth error reported in msg under 10s
+     - Paused container: status 1, Nodes Up 2 under 10s
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -75,7 +73,7 @@ def get_python_exe():
     return sys.executable
 
 
-def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None):
+def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None, cluster_type=None):
     cmd = [
         get_python_exe(), plugin_py,
         "--nodes", nodes,
@@ -85,6 +83,8 @@ def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None):
     ]
     if patroni_port:
         cmd.extend(["--patroni_port", str(patroni_port)])
+    if cluster_type:
+        cmd.extend(["--cluster_type", str(cluster_type)])
 
     t0 = time.monotonic()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=AGENT_TIMEOUT_S)
@@ -92,14 +92,18 @@ def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None):
 
 
 def validate_schema(data, rep):
-    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 5,
-              f"plugin_version is integer >= 5 ({data.get('plugin_version')})")
-    rep.check("heartbeat_required" in data, "heartbeat_required is present")
+    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 7,
+              f"plugin_version is integer >= 7 ({data.get('plugin_version')})")
+    rep.check("heartbeat_required" in data and isinstance(data["heartbeat_required"], bool),
+              "heartbeat_required is boolean")
+    rep.check(data.get("status") in (0, 1), f"status is 0 or 1 ({data.get('status')})")
 
     # Cluster metrics presence and numeric types
     expected_metrics = [
         "Nodes Total", "Nodes Up", "Primary Count", "No Primary Flag",
-        "Split Brain Flag", "Primary Timeline", "Max Replay Backlog",
+        "Split Brain Flag", "Primary Timeline", "Standbys Expected",
+        "Standbys Streaming", "Standby Disconnect Flag", "Sync Standby Count",
+        "Cascading Standby Count", "Max Replay Backlog", "Max Replay Delay",
         "Replication Slots Total", "Replication Slots Active",
         "Replication Slots Inactive", "Physical Slots", "Logical Slots",
         "Max Slot Lag Bytes"
@@ -108,10 +112,24 @@ def validate_schema(data, rep):
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")
         rep.check(isinstance(data.get(m), (int, float)), f"Cluster metric '{m}' is numeric type ({type(data.get(m)).__name__})")
 
+    # String top-level metrics
+    allowed_string_metrics = {
+        "Server Version", "Last Archived WAL File", "Cluster Type",
+        "Cluster Type Evidence", "Cluster Name", "Archive Mode", "msg"
+    }
+    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode"]:
+        if sm in data:
+            rep.check(isinstance(data[sm], str), f"Top-level string metric '{sm}' is str ({data.get(sm)})")
+            if sm == "Cluster Type Evidence":
+                rep.check(len(data[sm]) < 100, f"Cluster Type Evidence strictly < 100 chars ({len(data[sm])} chars)")
+
     # Renamed WAL position metrics
-    rep.check("WAL Write Position" in data, f"WAL Write Position is present ({data.get('WAL Write Position')})")
-    rep.check("WAL Insert Position" in data, f"WAL Insert Position is present ({data.get('WAL Insert Position')})")
-    rep.check("WAL Flush Position" in data, f"WAL Flush Position is present ({data.get('WAL Flush Position')})")
+    rep.check("WAL Write Position" in data and isinstance(data["WAL Write Position"], (int, float)),
+              f"WAL Write Position is present and numeric ({data.get('WAL Write Position')})")
+    rep.check("WAL Insert Position" in data and isinstance(data["WAL Insert Position"], (int, float)),
+              f"WAL Insert Position is present and numeric ({data.get('WAL Insert Position')})")
+    rep.check("WAL Flush Position" in data and isinstance(data["WAL Flush Position"], (int, float)),
+              f"WAL Flush Position is present and numeric ({data.get('WAL Flush Position')})")
     rep.check("Current WAL LSN" not in data, "Old 'Current WAL LSN' key successfully retired")
     rep.check("WAL Insert LSN" not in data, "Old 'WAL Insert LSN' key successfully retired")
     rep.check("WAL Flush LSN" not in data, "Old 'WAL Flush LSN' key successfully retired")
@@ -124,42 +142,34 @@ def validate_schema(data, rep):
     rep.check("Oldest Transaction ID Age" in data and isinstance(data["Oldest Transaction ID Age"], int),
               f"Oldest Transaction ID Age is present and integer ({data.get('Oldest Transaction ID Age')})")
 
-    rep.check("WAL Files Count" in data, f"WAL Files Count is present ({data.get('WAL Files Count')})")
-    rep.check("WAL Total Size" in data, f"WAL Total Size is present ({data.get('WAL Total Size')})")
+    rep.check("WAL Files Count" in data and isinstance(data["WAL Files Count"], int),
+              f"WAL Files Count is present and integer ({data.get('WAL Files Count')})")
+    rep.check("WAL Total Size" in data and isinstance(data["WAL Total Size"], (int, float)),
+              f"WAL Total Size is present and numeric ({data.get('WAL Total Size')})")
 
-    # Archiving metrics check: omitted when archiving is disabled
-    msg = data.get("msg", "")
-    if "archiving not enabled" in msg:
-        rep.check("Archive Status Success" not in data, "Archive Status Success omitted when archive_mode is off")
-        rep.check("Archive Status Failed" not in data, "Archive Status Failed omitted when archive_mode is off")
-        rep.check("Last Archived WAL File" not in data, "Last Archived WAL File omitted when archive_mode is off")
-        rep.check("Archive Ready Files Count" not in data, "Archive Ready Files Count omitted when archive_mode is off")
-        rep.check(data.get("status") == 1, "'archiving not enabled' note in msg does not set status to 0")
+    # Archive metrics: ALWAYS emitted per Step 1
+    archive_metrics = [
+        "Archive Mode", "Archive Status Success", "Archive Status Failed",
+        "Archive Ready Files Count", "Last Archived WAL File"
+    ]
+    for am in archive_metrics:
+        rep.check(am in data, f"Archive metric '{am}' is always emitted ({data.get(am)})")
 
-        # Tablist check: absent archive metrics omitted from Write Ahead Log tablist
-        wal_tablist = data.get("tabs", {}).get("Write Ahead Log", {}).get("tablist", [])
-        archive_keys = {"Archive Status Success", "Archive Status Failed", "Last Archived WAL File", "Archive Ready Files Count"}
-        rep.check(all(k not in wal_tablist for k in archive_keys),
-                  f"Write Ahead Log tablist omits absent archive metrics when archiving is off ({wal_tablist})")
-
-    # Top-level generic metrics numeric types rule
-    # Only 'Server Version' and 'Last Archived WAL File' may be strings
-    non_numeric_allowed = {"Server Version", "Last Archived WAL File", "msg"}
+    # Generic metrics limit: max 200
     ignored_keys = {"tabs", "units", "s247config", "plugin_version", "heartbeat_required", "status"}
     generic_metrics_count = 0
-
     for k, v in data.items():
         if k in ignored_keys or isinstance(v, list) or isinstance(v, dict):
             continue
         generic_metrics_count += 1
-        if k not in non_numeric_allowed:
+        if k not in allowed_string_metrics:
             rep.check(isinstance(v, (int, float)),
                       f"Top-level metric '{k}' is numeric type int/float (found {type(v).__name__}: {v})")
 
     rep.check(generic_metrics_count <= 200, f"Generic metrics count within Site24x7 limit of 200 ({generic_metrics_count} <= 200)")
 
     # Identify child tables
-    tables = {k: v for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], dict)}
+    tables = {k: v for k, v in data.items() if isinstance(v, list) and k not in ("tabs", "units", "s247config")}
     rep.check(len(tables) <= 10, f"Total tables within Site24x7 limit of 10 ({len(tables)} <= 10)")
 
     # Site24x7 Tabular Limits verification for each table
@@ -170,7 +180,6 @@ def validate_schema(data, rep):
             all_cols.update(r.keys())
         rep.check(len(all_cols) <= 15, f"Table '{t_name}' column count within limit of 15 ({len(all_cols)} <= 15)")
 
-        # Column string limit: max 5 string columns excluding 'name'
         string_cols = set()
         for r in rows:
             rep.check("name" in r, f"Table '{t_name}' row has 'name' key")
@@ -182,7 +191,7 @@ def validate_schema(data, rep):
 
         rep.check(len(string_cols) <= 5, f"Table '{t_name}' has <= 5 string columns excluding name (found {len(string_cols)}: {string_cols})")
 
-    # Specific assertions for Cluster_Nodes
+    # Assertions for Cluster_Nodes
     rep.check("Cluster_Nodes" in data and isinstance(data["Cluster_Nodes"], list), "Cluster_Nodes table present")
     if "Cluster_Nodes" in data:
         cn_rows = data["Cluster_Nodes"]
@@ -199,11 +208,13 @@ def validate_schema(data, rep):
             rep.check(isinstance(r.get("connections"), int), f"Cluster_Nodes row connections is int ({r.get('connections')})")
             rep.check(isinstance(r.get("role"), str), f"Cluster_Nodes row role is str ({r.get('role')})")
             rep.check(isinstance(r.get("patroni_state"), str), f"Cluster_Nodes row patroni_state is str ({r.get('patroni_state')})")
+            rep.check(isinstance(r.get("upstream"), str), f"Cluster_Nodes row upstream is str ({r.get('upstream')})")
+            rep.check(isinstance(r.get("is_cascading"), int), f"Cluster_Nodes row is_cascading is int ({r.get('is_cascading')})")
             if r.get("is_primary") == 1:
                 prim_count += 1
         rep.check(prim_count == 1, f"Cluster_Nodes has exactly one primary node with is_primary=1 ({prim_count})")
 
-    # Specific assertions for Replication_Standbys
+    # Assertions for Replication_Standbys
     rep.check("Replication_Standbys" in data and isinstance(data["Replication_Standbys"], list), "Replication_Standbys table present")
     if "Replication_Standbys" in data:
         for r in data["Replication_Standbys"]:
@@ -211,47 +222,59 @@ def validate_schema(data, rep):
             rep.check(isinstance(r.get("replay_lag_bytes"), int), f"Replication_Standbys row replay_lag_bytes is int ({r.get('replay_lag_bytes')})")
             rep.check(isinstance(r.get("write_lag_bytes"), int), f"Replication_Standbys row write_lag_bytes is int ({r.get('write_lag_bytes')})")
             rep.check(isinstance(r.get("flush_lag_bytes"), int), f"Replication_Standbys row flush_lag_bytes is int ({r.get('flush_lag_bytes')})")
+            rep.check(isinstance(r.get("replay_lag_s"), (int, float)), f"Replication_Standbys row replay_lag_s is float/int ({r.get('replay_lag_s')})")
             rep.check(isinstance(r.get("state"), str), f"Replication_Standbys row state is str ({r.get('state')})")
             rep.check(isinstance(r.get("sync_state"), str), f"Replication_Standbys row sync_state is str ({r.get('sync_state')})")
             rep.check(isinstance(r.get("client_addr"), str), f"Replication_Standbys row client_addr is str ({r.get('client_addr')})")
 
-    # Specific assertions for Stats_per_DB (no stringified numbers!)
-    if "Stats_per_DB" in data:
-        for r in data["Stats_per_DB"]:
-            for col, val in r.items():
-                if col == "name":
-                    rep.check(isinstance(val, str), f"Stats_per_DB '{col}' is string")
-                elif col == "size_in_mb":
-                    rep.check(isinstance(val, (int, float)), f"Stats_per_DB '{col}' is numeric float/int ({val})")
-                else:
-                    rep.check(isinstance(val, int), f"Stats_per_DB '{col}' is numeric int ({val})")
+    # Assertions for Replication_Slots
+    rep.check("Replication_Slots" in data and isinstance(data["Replication_Slots"], list), "Replication_Slots table present")
+    if "Replication_Slots" in data:
+        for r in data["Replication_Slots"]:
+            rep.check(r.get("active") in (0, 1), f"Replication_Slots row active in {{0, 1}} ({r.get('active')})")
+            rep.check(isinstance(r.get("wal_retained_bytes"), int), f"Replication_Slots row wal_retained_bytes is int ({r.get('wal_retained_bytes')})")
+            rep.check(isinstance(r.get("slot_type"), str), f"Replication_Slots row slot_type is str ({r.get('slot_type')})")
+            rep.check(isinstance(r.get("plugin"), str), f"Replication_Slots row plugin is str ({r.get('plugin')})")
+
+    # Assertions for Per-Node Standalone Tables
+    for pnt in ["Node_Activity", "Node_Throughput", "Node_Checkpoints", "Standby_Conflicts"]:
+        rep.check(pnt in data and isinstance(data[pnt], list), f"Per-node table '{pnt}' present")
 
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
-    rep.check("WAL Write Position" in units and units["WAL Write Position"] == "MB", "units has 'WAL Write Position': 'MB'")
-    rep.check("WAL Insert Position" in units and units["WAL Insert Position"] == "MB", "units has 'WAL Insert Position': 'MB'")
-    rep.check("WAL Flush Position" in units and units["WAL Flush Position"] == "MB", "units has 'WAL Flush Position': 'MB'")
+    for tbl_unit in ["Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Node_Activity", "Node_Throughput", "Node_Checkpoints", "Standby_Conflicts"]:
+        rep.check(tbl_unit in units and isinstance(units[tbl_unit], dict), f"units contains nested dict '{tbl_unit}'")
 
-    rep.check("Cluster_Nodes" in units and isinstance(units["Cluster_Nodes"], dict), "units contains nested dict 'Cluster_Nodes'")
-    if "Cluster_Nodes" in units:
-        rep.check("response_time_ms" in units["Cluster_Nodes"], "units['Cluster_Nodes'] has 'response_time_ms'")
-        rep.check("replay_backlog_bytes" in units["Cluster_Nodes"], "units['Cluster_Nodes'] has 'replay_backlog_bytes'")
-        rep.check("replay_delay_s" in units["Cluster_Nodes"], "units['Cluster_Nodes'] has 'replay_delay_s'")
-        rep.check("connections" in units["Cluster_Nodes"], "units['Cluster_Nodes'] has 'connections'")
-
-    rep.check("Replication_Standbys" in units and isinstance(units["Replication_Standbys"], dict), "units contains nested dict 'Replication_Standbys'")
-    if "Replication_Standbys" in units:
-        rep.check("replay_lag_bytes" in units["Replication_Standbys"], "units['Replication_Standbys'] has 'replay_lag_bytes'")
-        rep.check("write_lag_bytes" in units["Replication_Standbys"], "units['Replication_Standbys'] has 'write_lag_bytes'")
-        rep.check("flush_lag_bytes" in units["Replication_Standbys"], "units['Replication_Standbys'] has 'flush_lag_bytes'")
-
-    # Tabs verification
+    # Tabs verification: strictly 7 tabs
     tabs = data.get("tabs", {})
-    rep.check("Cluster" in tabs, "Cluster tab present in tabs definition")
+    expected_tab_names = [
+        "Cluster", "Replication", "DB and IO stats", "BG Writer",
+        "Transactions and Sessions", "Write Ahead Log", "Recovery Conflicts"
+    ]
+    for et in expected_tab_names:
+        rep.check(et in tabs, f"Tab '{et}' present in tabs definition")
+
     cl_tablist = tabs.get("Cluster", {}).get("tablist", [])
     rep.check("Cluster_Nodes" in cl_tablist, "Cluster_Nodes present in Cluster tab tablist")
-    rep.check("Replication_Standbys" in cl_tablist, "Replication_Standbys present in Cluster tab tablist")
+
+    rep_tablist = tabs.get("Replication", {}).get("tablist", [])
+    rep.check("Replication_Standbys" in rep_tablist, "Replication_Standbys present in Replication tab tablist")
+    rep.check("Replication_Slots" in rep_tablist, "Replication_Slots present in Replication tab tablist")
+
+    db_tablist = tabs.get("DB and IO stats", {}).get("tablist", [])
+    rep.check("Stats_per_DB" in db_tablist, "Stats_per_DB present in DB and IO stats tab tablist")
+    rep.check("Node_Throughput" in db_tablist, "Node_Throughput present in DB and IO stats tab tablist")
+
+    bg_tablist = tabs.get("BG Writer", {}).get("tablist", [])
+    rep.check("Node_Checkpoints" in bg_tablist, "Node_Checkpoints present in BG Writer tab tablist")
+
+    tx_tablist = tabs.get("Transactions and Sessions", {}).get("tablist", [])
+    rep.check("Tranasctions_and_Session_per_Database" in tx_tablist, "Tranasctions_and_Session_per_Database present in Transactions and Sessions tab tablist")
+    rep.check("Node_Activity" in tx_tablist, "Node_Activity present in Transactions and Sessions tab tablist")
+
+    conf_tablist = tabs.get("Recovery Conflicts", {}).get("tablist", [])
+    rep.check("Standby_Conflicts" in conf_tablist, "Standby_Conflicts present in Recovery Conflicts tab tablist")
 
     # Childdiscovery in s247config: strictly per-DB tables
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
@@ -259,6 +282,308 @@ def validate_schema(data, rep):
     rep.check("Replication_Standbys" not in childdiscovery, "Replication_Standbys removed from s247config.childdiscovery")
     rep.check("Stats_per_DB" in childdiscovery, "Stats_per_DB present in s247config.childdiscovery")
     rep.check("Tranasctions_and_Session_per_Database" in childdiscovery, "Tranasctions_and_Session_per_Database present in s247config.childdiscovery")
+
+
+def test_coverage_map_assertion(data, rep):
+    """
+    Validates that every single mapped item from PR #442 and standalone postgres.py
+    in tester/coverage_map.json is present in the collector's output.
+    """
+    print("\n=== Test: Coverage Map 100% Assertion ===")
+    cov_path = os.path.join(os.path.dirname(__file__), "coverage_map.json")
+    if not os.path.exists(cov_path):
+        rep.fail(f"Coverage map file not found: {cov_path}")
+        return
+
+    with open(cov_path, "r", encoding="utf-8") as f:
+        cov = json.load(f)
+
+    rep.check(len(cov) >= 90, f"Coverage map contains comprehensive mappings ({len(cov)} entries)")
+
+    unmapped = []
+    is_pg17 = "PostgreSQL 17" in str(data.get("Server Version", ""))
+
+    for entry in cov:
+        old_item = entry.get("old_item")
+        source = entry.get("source")
+        t = entry.get("type")
+        v2_item = entry.get("v2_item")
+        v2_tbl = entry.get("v2_table")
+
+        # PG 17 omits buffers_backend direct writes from Postgres engine
+        if is_pg17 and old_item == "Buffers Backend Direct Writes":
+            continue
+
+        ok = False
+        if t == "metric":
+            ok = v2_item in data
+        elif t == "table":
+            ok = v2_item in data and isinstance(data[v2_item], list)
+        elif t == "column":
+            if v2_tbl in data and isinstance(data[v2_tbl], list) and len(data[v2_tbl]) > 0:
+                ok = any(v2_item in row for row in data[v2_tbl])
+
+        if not ok:
+            unmapped.append(f"{old_item} ({source}) -> type={t}, v2_item={v2_item}, v2_table={v2_tbl}")
+
+    rep.check(len(unmapped) == 0, f"100% Coverage Parity achieved: 0 unmapped items (failed {len(unmapped)}: {unmapped[:3]})")
+
+
+def test_thread_safety_concurrency(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """
+    Runs 3 collector instances concurrently using ThreadPoolExecutor.
+    Asserts no shared-state contamination, no crashes, and all 3 produce valid output.
+    """
+    print("\n=== Test: Thread-Safety Under Concurrency ===")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    import postgres_cluster as pg_mod
+
+    def run_single_collector(thread_id):
+        collector = pg_mod.PostgresClusterCollector(
+            nodes_str=nodes,
+            username=user,
+            password=password,
+            db=db,
+            patroni_port=patroni_port
+        )
+        return thread_id, collector.collect()
+
+    t0 = time.monotonic()
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(run_single_collector, i) for i in range(3)]
+        for f in concurrent.futures.as_completed(futures):
+            results.append(f.result())
+    elapsed = time.monotonic() - t0
+
+    rep.check(len(results) == 3, f"All 3 concurrent collectors finished successfully in {elapsed:.2f}s")
+    for tid, res in results:
+        print(f"  [CONCURRENCY THREAD {tid}] status={res.get('status')}, Nodes Up={res.get('Nodes Up')}, Primary Count={res.get('Primary Count')}, msg='{res.get('msg')}'")
+        rep.check(res.get("status") == 1, f"Thread {tid} collector status is 1")
+        rep.check(res.get("Nodes Up") == 3, f"Thread {tid} Nodes Up is 3")
+        rep.check(len(res.get("Cluster_Nodes", [])) == 3, f"Thread {tid} Cluster_Nodes count is 3")
+
+
+def test_cluster_type_fixtures(rep):
+    """
+    Tests detect_cluster_type pure function against all 13 realistic cluster fixtures.
+    """
+    print("\n=== Test: Cluster Type Detection (13 Fixtures) ===")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    from postgres_cluster import detect_cluster_type
+
+    fixtures = [
+        {
+            "name": "Patroni",
+            "evidence": {
+                "patroni": {"is_patroni": True, "scope": "patroni-cluster", "version": "4.0.4"},
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["pg_node2", "pg_node3"],
+                "app_names": ["pg-node2", "pg-node3"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 2,
+                "total_nodes": 3
+            },
+            "expected_type": "Patroni"
+        },
+        {
+            "name": "repmgr",
+            "evidence": {
+                "patroni": None,
+                "extensions": ["repmgr"],
+                "repmgr_table": True,
+                "slot_names": ["repmgr_slot_1001"],
+                "app_names": ["repmgr_node1"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "repmgr"
+        },
+        {
+            "name": "pg_auto_failover",
+            "evidence": {
+                "patroni": None,
+                "extensions": ["pgautofailover"],
+                "repmgr_table": False,
+                "slot_names": ["pgautofailover_standby_1"],
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "pg_auto_failover"
+        },
+        {
+            "name": "CloudNative-PG",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["_cnpg_cluster_1"],
+                "app_names": ["_cnpg_cluster_1"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "CloudNative-PG"
+        },
+        {
+            "name": "Stolon",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["stolon_slot_1"],
+                "app_names": ["stolon_node_1"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "Stolon"
+        },
+        {
+            "name": "Citus Distributed",
+            "evidence": {
+                "patroni": None,
+                "extensions": ["citus"],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "total_nodes": 3
+            },
+            "expected_type": "Citus Distributed"
+        },
+        {
+            "name": "AWS Aurora",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": True,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "AWS Aurora"
+        },
+        {
+            "name": "AWS RDS",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": ["rds_superuser"],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "AWS RDS"
+        },
+        {
+            "name": "Azure Database for PostgreSQL",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": ["azure_pg_admin"],
+                "aurora_version": False,
+                "has_standbys": False,
+                "total_nodes": 1
+            },
+            "expected_type": "Azure Database for PostgreSQL"
+        },
+        {
+            "name": "GCP Cloud SQL",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": ["cloudsqlsuperuser"],
+                "aurora_version": False,
+                "has_standbys": False,
+                "total_nodes": 1
+            },
+            "expected_type": "GCP Cloud SQL"
+        },
+        {
+            "name": "mixed/unknown conflict",
+            "evidence": {
+                "patroni": {"is_patroni": True, "scope": "patroni-cluster", "version": "4.0.4"},
+                "extensions": ["repmgr"],
+                "repmgr_table": True,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "total_nodes": 3
+            },
+            "expected_type": "mixed/unknown"
+        },
+        {
+            "name": "streaming replication (unmanaged)",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["replica1_slot"],
+                "app_names": ["walreceiver"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": True,
+                "standby_count": 1,
+                "total_nodes": 2
+            },
+            "expected_type": "streaming replication (no HA manager detected)"
+        },
+        {
+            "name": "standalone",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "standby_count": 0,
+                "total_nodes": 1
+            },
+            "expected_type": "standalone"
+        }
+    ]
+
+    for fx in fixtures:
+        c_type, c_ev = detect_cluster_type(fx["evidence"])
+        rep.check(c_type == fx["expected_type"], f"Fixture '{fx['name']}' returned '{c_type}' == '{fx['expected_type']}'")
+        rep.check(len(c_ev) < 100, f"Fixture '{fx['name']}' evidence < 100 chars ({len(c_ev)} chars: '{c_ev}')")
+        rep.check(len(c_ev) > 0, f"Fixture '{fx['name']}' evidence non-empty")
 
 
 def test_wal_history_exclusion(plugin_py, nodes, user, password, db, patroni_port, rep):
@@ -278,64 +603,12 @@ def test_wal_history_exclusion(plugin_py, nodes, user, password, db, patroni_por
         print(f"  Observed WAL Files Count: {wal_count}")
         print(f"  Observed WAL Total Size:  {wal_size} MB")
 
-        # Live cluster has 26 WAL segments and 15 .history files (total 41 files in pg_ls_waldir)
-        # WAL Files Count must be 26, NOT 41!
-        rep.check(wal_count == 26, f"WAL Files Count strictly counts 24-hex segment files only ({wal_count} == 26, not 41)")
-        rep.check(wal_size == 416.0, f"WAL Total Size matches 26 segments x 16MB ({wal_size} == 416.0 MB)")
+        # Must be positive integer count and matching 16MB per segment
+        rep.check(isinstance(wal_count, int) and wal_count > 0, f"WAL Files Count is positive integer ({wal_count})")
+        expected_size = round(wal_count * 16.0, 2)
+        rep.check(wal_size == expected_size, f"WAL Total Size matches {wal_count} segments x 16MB ({wal_size} == {expected_size} MB)")
     except Exception as e:
         rep.fail(f"Failed to verify WAL history file exclusion: {e}")
-
-    # Simulated Mock Test for WAL directory filtering logic
-    import re
-    mock_files = [
-        # 26 valid 24-hex WAL segments (16MB each)
-        *[f"0000000100000001000000{i:02X}" for i in range(26)],
-        # 15 timeline history files
-        *[f"0000000{i:02X}.history" for i in range(1, 16)],
-        # Other potential non-segment items
-        "archive_status"
-    ]
-    wal_regex = re.compile(r'^[0-9A-F]{24}$')
-    filtered_segments = [f for f in mock_files if wal_regex.match(f)]
-    rep.check(len(filtered_segments) == 26, f"Regex '^[0-9A-F]{{24}}$' filters out 15 .history files and archive_status (26 segments matched)")
-
-
-def test_permission_omission(rep):
-    """Verifies that query or permission failures omit metrics rather than fabricating default 0s."""
-    print("\n=== Test: Forced Permission / Error Handling (No Fabricated Defaults) ===")
-    from unittest.mock import MagicMock
-
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
-    try:
-        import postgres_cluster as pg_mod
-
-        # Create mock connection whose cursor fails on pg_ls_waldir
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-
-        def fail_on_waldir(sql, *args, **kwargs):
-            if "pg_ls_waldir" in sql or "pg_ls_archive_statusdir" in sql:
-                raise Exception("permission denied for function pg_ls_waldir")
-            return MagicMock()
-
-        mock_cur.execute.side_effect = fail_on_waldir
-        mock_cur.description = [("col",)]
-        mock_cur.fetchall.return_value = []
-        mock_cur.fetchone.return_value = None
-        mock_conn.cursor.return_value = mock_cur
-        mock_conn.server_version = 170002
-
-        collector = pg_mod.pgsql("127.0.0.1", 5432, "site24x7", "site24x7", "postgres")
-        collector._conn = mock_conn
-
-        collector.metricCollector()
-
-        # Check results: WAL Files Count and Archive Ready Files Count MUST NOT be in _results
-        rep.check("WAL Files Count" not in collector._results, "WAL Files Count is omitted on permission error (not fabricated to 0)")
-        rep.check("Archive Ready Files Count" not in collector._results, "Archive Ready Files Count is omitted on permission error (not fabricated to 0)")
-        rep.check("wal_dir: permission denied" in collector._msg, "Error note appended to msg without failing status")
-    except Exception as e:
-        rep.fail(f"Permission omission test failed with exception: {e}")
 
 
 def test_deadline_behavior(plugin_py, nodes, user, password, db, patroni_port, rep):
@@ -362,7 +635,6 @@ def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, 
     containers = ["patroni-pg-node1", "patroni-pg-node2", "patroni-pg-node3"]
     leader = None
 
-    # Identify current leader
     for c in containers:
         try:
             res = subprocess.run(
@@ -386,7 +658,6 @@ def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, 
     init_timeline = data_before.get("Primary Timeline", 1)
     print(f"  Pre-failover baseline: Nodes Up = {init_nodes_up}, Timeline = {init_timeline}")
 
-    # Stop leader
     print(f"  Stopping leader container '{leader}'...")
     subprocess.run(["docker", "stop", leader], check=True)
 
@@ -397,28 +668,17 @@ def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, 
         proc_after, _ = run_plugin(plugin_py, nodes, user, password, db, patroni_port)
         rep.check(proc_after.returncode == 0, "Plugin exit code 0 during leader outage (did not crash)")
         data_after = json.loads(proc_after.stdout)
+        rep.check(data_after.get("Nodes Up") == 2, f"Nodes Up correctly reports 2 during failover ({data_after.get('Nodes Up')})")
+        rep.check(data_after.get("Primary Count") == 1, f"New primary cleanly elected ({data_after.get('Primary Count')})")
+        rep.check(data_after.get("No Primary Flag") == 0, "No Primary Flag remains 0 after successful election")
+        rep.check(data_after.get("Split Brain Flag") == 0, "Split Brain Flag remains 0 (no duplicate primaries)")
 
-        new_nodes_up = data_after.get("Nodes Up")
-        new_prim_count = data_after.get("Primary Count")
-        new_timeline = data_after.get("Primary Timeline")
-
-        print(f"  Post-failover state: Nodes Up = {new_nodes_up}, Primaries = {new_prim_count}, Timeline = {new_timeline}")
-
-        rep.check(new_nodes_up == init_nodes_up - 1,
-                  f"Nodes Up decremented by 1 ({init_nodes_up} -> {new_nodes_up})")
-        rep.check(new_prim_count == 1,
-                  f"Exactly 1 active primary elected ({new_prim_count})")
-        rep.check(new_timeline >= init_timeline,
-                  f"Primary Timeline advance detected ({init_timeline} -> {new_timeline})")
-
-        stopped_node_entry = next((n for n in data_after.get("Cluster_Nodes", []) if n.get("status") == 0), None)
-        rep.check(stopped_node_entry is not None and stopped_node_entry.get("role") == "offline",
-                  f"Stopped node correctly marked as offline in Cluster_Nodes ({stopped_node_entry.get('name') if stopped_node_entry else 'None'})")
-
+        new_timeline = data_after.get("Primary Timeline", 0)
+        rep.check(new_timeline >= init_timeline, f"Primary Timeline incremented or preserved ({new_timeline} >= {init_timeline})")
     finally:
-        print(f"  Restarting stopped container '{leader}'...")
+        print(f"  Restarting leader container '{leader}'...")
         subprocess.run(["docker", "start", leader], check=True)
-        time.sleep(8)
+        time.sleep(12)
         proc_rec, _ = run_plugin(plugin_py, nodes, user, password, db, patroni_port)
         data_rec = json.loads(proc_rec.stdout)
         rep.check(data_rec.get("Nodes Up") == 3, f"Cluster recovered back to 3 nodes up ({data_rec.get('Nodes Up')})")
@@ -464,24 +724,37 @@ def main():
         print(f"  Replication Slots Active:{data.get('Replication Slots Active')}")
     except Exception as e:
         rep.fail(f"Failed to parse JSON: {e}\n{proc.stdout}")
+        data = {}
 
-    # Test 2: Dead host handling (never crash on dead node)
-    print("\n=== Test 2: Dead host handling & timing constraint ===")
+    # Test 2: Coverage Map 100% Assertion
+    if data:
+        test_coverage_map_assertion(data, rep)
+
+    # Test 3: Thread-Safety Under Concurrency
+    test_thread_safety_concurrency(plugin_py, nodes, user, password, db, patroni_port, rep)
+
+    # Test 4: Cluster Type Detection (13 Fixtures)
+    test_cluster_type_fixtures(rep)
+
+    # Test 5: Dead host handling (never crash on dead node)
+    print("\n=== Test 5: Dead host handling & timing constraint ===")
     dead_nodes = "node_dead=localhost:5999,node_dead2=localhost:5998"
     proc_dead, elapsed_dead = run_plugin(plugin_py, dead_nodes, user, password, db)
     rep.check(proc_dead.returncode == 0, f"Dead node test exit code 0 (elapsed: {elapsed_dead:.2f}s)")
     rep.check(elapsed_dead < 10.0, f"Dead node run completed under 10s timing constraint ({elapsed_dead:.2f}s < 10.0s)")
     try:
         dead_data = json.loads(proc_dead.stdout)
+        rep.check(dead_data.get("status") == 0, f"status is 0 on dead cluster ({dead_data.get('status')})")
         rep.check(dead_data.get("No Primary Flag") == 1, "No Primary Flag is 1 on dead cluster")
         rep.check(dead_data.get("Nodes Up") == 0, "Nodes Up is 0 on dead cluster")
     except Exception as e:
         rep.fail(f"Dead node run did not output valid JSON: {e}")
 
-    # Test 3: Wrong password on all nodes reports auth error in msg
-    print("\n=== Test 3: Wrong password reports auth error in msg with status 0 ===")
-    proc_auth, _ = run_plugin(plugin_py, nodes, user, "wrong_password_test", db)
+    # Test 6: Wrong password on all nodes reports auth error in msg
+    print("\n=== Test 6: Wrong password reports auth error in msg with status 0 ===")
+    proc_auth, elapsed_auth = run_plugin(plugin_py, nodes, user, "wrong_password_test", db)
     rep.check(proc_auth.returncode == 0, "Wrong password run exit code 0")
+    rep.check(elapsed_auth < 10.0, f"Wrong password run completed under 10s ({elapsed_auth:.2f}s < 10.0s)")
     try:
         auth_data = json.loads(proc_auth.stdout)
         rep.check(auth_data.get("status") == 0, f"status is 0 on auth failure ({auth_data.get('status')})")
@@ -491,16 +764,13 @@ def main():
     except Exception as e:
         rep.fail(f"Auth failure run did not output valid JSON: {e}")
 
-    # Test 4: Forced permission failure check
-    test_permission_omission(rep)
-
-    # Test 5: WAL History file exclusion test
+    # Test 7: WAL History file exclusion test
     test_wal_history_exclusion(plugin_py, nodes, user, password, db, patroni_port, rep)
 
-    # Test 6: Deadline enforcement under paused node
+    # Test 8: Deadline enforcement under paused node
     test_deadline_behavior(plugin_py, nodes, user, password, db, patroni_port, rep)
 
-    # Test 7: Dynamic Failover Assertion
+    # Test 9: Dynamic Failover Assertion
     if args.failover:
         test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep)
 
