@@ -1418,8 +1418,12 @@ class PostgresClusterCollector:
         results.update(copy.deepcopy(tabs))
         results["units"] = units
 
+        cluster_name = results.get("Cluster Name", "postgres_cluster")
         if self.msg_notes:
-            results["msg"] = "; ".join(self.msg_notes)
+            results["msg"] = f"[{detected_type}] " + "; ".join(self.msg_notes)
+        else:
+            p_desc = f"Primary: {active_primary.endpoint_str} (TL {primary_timeline})" if active_primary else "No Primary"
+            results["msg"] = f"Cluster: {cluster_name} ({detected_type}) | {nodes_up}/{nodes_total} nodes up | {p_desc}"
 
         return results
 
