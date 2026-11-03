@@ -4,7 +4,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Connections",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -12,7 +12,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Queries",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -20,7 +20,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Waiting Queries",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -28,7 +28,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Buffers Alloc",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -36,7 +36,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Buffers Checkpoint",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -44,7 +44,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Buffers Clean",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -52,7 +52,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Cache Hit Ratio",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -60,7 +60,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Checkpoint Sync Time",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -68,7 +68,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Checkpoint Write Time",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -76,7 +76,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Checkpoints Req",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -84,7 +84,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Checkpoints Timed",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -92,7 +92,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Database Count",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -100,7 +100,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Heap Blocks Hit",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -108,7 +108,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Heap Blocks Read",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -116,7 +116,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Rows Fetched",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -124,7 +124,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Rows Read",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -132,7 +132,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Scans",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -140,7 +140,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Locks Count",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -148,7 +148,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Max Connections",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -156,7 +156,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Maxwritten Clean",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -172,7 +172,7 @@
     "source": "standalone_postgres",
     "type": "table",
     "v2_item": "Stats_per_DB",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -180,7 +180,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Table Count",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -188,7 +188,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Block Hits",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -196,7 +196,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Block Reads",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -228,7 +228,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Rows Deleted",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -236,7 +236,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Rows Fetched",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -244,7 +244,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Rows Inserted",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -252,7 +252,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Rows Returned",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -260,7 +260,7 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Total Rows Updated",
-    "tab": "DB and IO stats",
+    "tab": "Node Performance",
     "notes": "Direct 1:1 mapping from official postgres.py"
   },
   {
@@ -332,7 +332,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Active Connections",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Same metric name"
   },
   {
@@ -348,7 +348,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Ready Files Count",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Retained and always emitted"
   },
   {
@@ -356,7 +356,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Status Failed",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Retained and always emitted"
   },
   {
@@ -364,7 +364,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Status Success",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Retained and always emitted"
   },
   {
@@ -372,15 +372,15 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Available Connections",
-    "tab": "Recovery Conflicts",
-    "notes": "Retained metric"
+    "tab": "Transactions and Sessions",
+    "notes": "v8 extra removed to adhere to standalone postgres.py parameter parity"
   },
   {
     "old_item": "Buffers Allocated",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Buffers Alloc",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Renamed to official standard"
   },
   {
@@ -388,7 +388,7 @@
     "source": "pr442",
     "type": "column",
     "v2_item": "buffers_backend",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Renamed to official standard (reported on PG <= 16; omitted on PG 17+ per postgres docs)",
     "v2_table": "Node_Checkpoints"
   },
@@ -397,7 +397,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Buffers Checkpoint",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Same metric name"
   },
   {
@@ -405,7 +405,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Buffers Clean",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Same metric name"
   },
   {
@@ -413,7 +413,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Checkpoint Sync Time",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Renamed with unit Time"
   },
   {
@@ -421,7 +421,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Checkpoint Write Time",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Renamed with unit Time"
   },
   {
@@ -429,7 +429,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Checkpoints Req",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Renamed to official standard"
   },
   {
@@ -437,7 +437,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Checkpoints Timed",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Same metric name"
   },
   {
@@ -469,7 +469,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Buffer Pin",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -477,7 +477,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Deadlock",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -485,7 +485,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Lock",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -493,7 +493,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Snapshot",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -501,7 +501,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Tablespace",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -509,7 +509,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Connection Utilization Percent",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Same metric name"
   },
   {
@@ -517,7 +517,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Write Position",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Converted to MB numeric position"
   },
   {
@@ -551,7 +551,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Last Archived WAL File",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Emitted when archiving enabled"
   },
   {
@@ -573,17 +573,18 @@
   {
     "old_item": "Logical Slots",
     "source": "pr442",
-    "type": "metric",
-    "v2_item": "Logical Slots",
+    "type": "column",
+    "v2_item": "slot_type",
     "tab": "Replication",
-    "notes": "Same metric name"
+    "notes": "Represented as slot_type column in Replication_Slots table",
+    "v2_table": "Replication_Slots"
   },
   {
     "old_item": "Max Connections",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Max Connections",
-    "tab": "Recovery Conflicts",
+    "tab": "Transactions and Sessions",
     "notes": "Same metric name"
   },
   {
@@ -591,7 +592,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Maxwritten Clean",
-    "tab": "BG Writer",
+    "tab": "Node Performance",
     "notes": "Same metric name"
   },
   {
@@ -608,16 +609,17 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Oldest Running Transaction Age",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
     "old_item": "Physical Slots",
     "source": "pr442",
-    "type": "metric",
-    "v2_item": "Physical Slots",
+    "type": "column",
+    "v2_item": "slot_type",
     "tab": "Replication",
-    "notes": "Same metric name"
+    "notes": "Represented as slot_type column in Replication_Slots table",
+    "v2_table": "Replication_Slots"
   },
   {
     "old_item": "PostgreSQL Version",
@@ -640,7 +642,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Recovery Conflicts Total",
-    "tab": "Recovery Conflicts",
+    "tab": "Replication",
     "notes": "Same metric name"
   },
   {
@@ -698,7 +700,7 @@
     "type": "metric",
     "v2_item": "Server PID",
     "tab": "Cluster",
-    "notes": "Primary server backend PID"
+    "notes": "needs TL approval (preserved on Transactions and Sessions tab)"
   },
   {
     "old_item": "Server Uptime",
@@ -721,8 +723,8 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Superuser Reserved Connections",
-    "tab": "Recovery Conflicts",
-    "notes": "Reserved connection headroom"
+    "tab": "Transactions and Sessions",
+    "notes": "v8 extra removed to adhere to standalone postgres.py parameter parity"
   },
   {
     "old_item": "Sync State",
@@ -746,7 +748,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Files Count",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Count of 16MB WAL segment files in pg_wal"
   },
   {
@@ -754,7 +756,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Flush Position",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Durably committed WAL position in MB"
   },
   {
@@ -762,7 +764,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Insert Position",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Buffered WAL insert position in MB"
   },
   {
@@ -778,7 +780,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Total Size",
-    "tab": "Write Ahead Log",
+    "tab": "Replication",
     "notes": "Disk size of WAL directory in MB"
   },
   {
