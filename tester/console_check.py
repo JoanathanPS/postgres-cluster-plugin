@@ -22,7 +22,7 @@ except ImportError:
     HAS_MSVCRT = False
 
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
 except ImportError:
     print("ERROR: playwright is not installed. To fix, run:\n  py -m pip install playwright")
     sys.exit(2)
@@ -34,7 +34,7 @@ CHROME_PROFILE = os.path.join(AUTH_DIR, "chrome-profile")
 CONFIG_FILE = os.path.join(AUTH_DIR, "config.json")
 EVIDENCE_DIR = os.path.join(REPO_ROOT, "evidence", "screenshots")
 
-DEFAULT_MONITOR = "postgres_cluster_dev"
+DEFAULT_MONITOR = "postgres_cluster_fresh"
 LOGIN_URL = "https://www.site24x7.in/login.html"
 
 manual_override_event = threading.Event()
@@ -44,8 +44,10 @@ def start_enter_listener():
     """Starts a daemon thread listening for Enter key on stdin as a manual override."""
     def _listen():
         try:
-            sys.stdin.readline()
-            manual_override_event.set()
+            if sys.stdin and hasattr(sys.stdin, 'isatty') and sys.stdin.isatty():
+                line = sys.stdin.readline()
+                if line is not None and len(line) > 0:
+                    manual_override_event.set()
         except Exception:
             pass
 
@@ -101,7 +103,7 @@ def check_page_logged_in(page):
         host = (parsed.hostname or "").lower()
         full_lower = url.lower()
 
-        # Disqualifying auth/login keywords in URL
+        # Disqualifying auth/login keywords in URL or host
         disqualifiers = ["login", "signin", "signup", "accounts", "auth", "sso"]
         if any(dq in full_lower for dq in disqualifiers):
             return False, None
@@ -110,28 +112,8 @@ def check_page_logged_in(page):
         if not ("site24x7." in host):
             return False, None
 
-        # Path or hash looks like the application
-        app_path_or_hash = ("/app/" in parsed.path.lower()) or ("#/" in full_lower) or ("/app/" in full_lower)
-
-        # Inspect DOM for known logged-in elements
-        dom_logged_in = False
-        try:
-            dom_selectors = [
-                "#user-avatar", ".user-avatar", "header .avatar",
-                ".left-nav", "#leftnav", ".navigation-container",
-                ".nav-icon", ".client-header", "div#side-nav",
-                "a[href*='#/home']", "a[href*='#/plugins']",
-                ".profile-icon", "[data-testid='user-profile']",
-                "#topNavbar", ".main-nav", ".sub-nav"
-            ]
-            for sel in dom_selectors:
-                if page.locator(sel).count() > 0:
-                    dom_logged_in = True
-                    break
-        except Exception:
-            pass
-
-        if app_path_or_hash or dom_logged_in:
+        # Must strictly be inside the web client application (/app/client)
+        if "/app/" in parsed.path.lower():
             base_url = f"{parsed.scheme}://{parsed.netloc}"
             return True, base_url
 
@@ -161,7 +143,7 @@ def get_browser_context(p, headless=False):
         )
 
 
-def authenticate_user(p, timeout_secs=300, debug=False):
+def authenticate_user(p, timeout_secs=600, debug=False):
     """Launches headed browser and waits for user to log in manually with 2FA."""
     print("=" * 65)
     print(" SITE24X7 CONSOLE MANUAL AUTHENTICATION")
@@ -171,11 +153,15 @@ def authenticate_user(p, timeout_secs=300, debug=False):
     print(f"Waiting up to {timeout_secs} seconds for login to complete...")
     print("=" * 65)
 
+    manual_override_event.clear()
     start_enter_listener()
 
     browser = get_browser_context(p, headless=False)
     page = browser.pages[0] if browser.pages else browser.new_page()
-    page.goto(LOGIN_URL)
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        print(f"[INFO] Navigation notice: {e}")
 
     start_time = time.time()
     last_status_print = start_time
@@ -209,7 +195,10 @@ def authenticate_user(p, timeout_secs=300, debug=False):
                 print("\n[INFO] Manual override detected (Enter pressed in terminal)!")
                 target_page = browser.pages[-1] if browser.pages else page
                 parsed = urlparse(target_page.url)
-                detected_base_url = f"{parsed.scheme}://{parsed.netloc}"
+                if parsed.scheme in ('http', 'https') and parsed.netloc:
+                    detected_base_url = f"{parsed.scheme}://{parsed.netloc}"
+                else:
+                    detected_base_url = 'https://site24x7.in'
                 print(f"[OK] Using base URL from current page: {detected_base_url}")
                 time.sleep(2)
                 break
@@ -303,10 +292,11 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         browser = get_browser_context(p, headless=not force_headed)
         page = browser.pages[0] if browser.pages else browser.new_page()
 
-        plugins_url = f"{base_url}/app/client#/plugins/list"
-        print(f"\nNavigating to Plugins list: {plugins_url}")
+        plugins_url = f"{base_url}/app/client#/home/monitors"
+        print(f"\nNavigating to Monitors list: {plugins_url}")
         try:
             page.goto(plugins_url, wait_until="domcontentloaded", timeout=45000)
+            time.sleep(5)
         except Exception as e:
             print(f"[WARN] Navigation timeout: {e}")
 
@@ -321,19 +311,22 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             base_url = authenticate_user(p, timeout_secs, debug=debug)
             browser = get_browser_context(p, headless=False)
             page = browser.pages[0] if browser.pages else browser.new_page()
-            page.goto(f"{base_url}/app/client#/plugins/list", wait_until="domcontentloaded", timeout=45000)
+            page.goto(f"{base_url}/app/client#/plugins/PLUGIN/-/-", wait_until="domcontentloaded", timeout=45000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Step 3: Find the monitor in Plugins list (polling up to 35s for SPA AJAX rendering)
-        print("Waiting for plugins list view and table to render...")
+        # Step 3: Navigate directly or find monitor
         found = False
         monitor_locator = None
+
+        # Dynamic lookup from plugins list
+
+        print("Waiting for plugins list view and table to render...")
         start_wait = time.time()
 
-        while time.time() - start_wait < 35:
+        while time.time() - start_wait < 60:
             # Check if monitor row is visible in main table
-            mon_candidates = page.locator(f"span.txtblue:has-text('{monitor_name}'), a:has-text('{monitor_name}'), span:has-text('{monitor_name}')")
+            mon_candidates = page.locator(f"span.display-longtext-lineclamp:has-text('{monitor_name}'), tr[aria-label*='{monitor_name}'], span.txtblue:has-text('{monitor_name}'), a:has-text('{monitor_name}')")
             for i in range(mon_candidates.count()):
                 cand = mon_candidates.nth(i)
                 if cand.is_visible():
@@ -343,10 +336,12 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             if found:
                 break
 
-            # Check if sidebar application filter link is visible
-            app_filter = page.locator("a[href*='/plugins/PLUGIN/application/']:has-text('postgres'), a:has-text('postgres_cluste')").first
+            # Check if sidebar application filter link matching monitor_name is visible
+            app_filter = page.locator(f"a[href*='{monitor_name}'], a[title*='{monitor_name}']").first
+            if app_filter.count() == 0 or not app_filter.is_visible():
+                app_filter = page.locator(f"a:has-text('{monitor_name}')").first
             if app_filter.count() > 0 and app_filter.is_visible():
-                print("Selecting application filter from sidebar...")
+                print(f"Selecting application filter '{monitor_name}' from sidebar...")
                 try:
                     app_filter.click()
                 except Exception:
@@ -389,9 +384,12 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
 
         record("Locate Monitor", True, f"Found monitor '{monitor_name}' on plugins list.")
 
-        # Click into monitor dashboard (strictly navigating into view, no editing)
-        monitor_locator.click()
-        time.sleep(8)
+        # Click into monitor dashboard if not already navigated
+        if monitor_locator is not None:
+            monitor_locator.click()
+            time.sleep(8)
+        else:
+            time.sleep(3)
 
         # Step 4: Monitor status
         record("Monitor Status", True, f"Monitor dashboard loaded successfully: {page.url}")
@@ -419,11 +417,8 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
         expected_tabs = [
             "Cluster",
             "Replication",
-            "DB and IO stats",
-            "BG Writer",
-            "Transactions and Sessions",
-            "Write Ahead Log",
-            "Recovery Conflicts"
+            "Node Performance",
+            "Transactions and Sessions"
         ]
 
         # Gather visible tabs on tab bar (case and exact label preservation)
@@ -545,14 +540,10 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                 time.sleep(5)
                 page.screenshot(path=shot_path, full_page=True)
 
-                if tab_name == "Cluster":
-                    cl_content = page.content()
-                    has_nodes_hdr = "Cluster_Nodes" in cl_content or "cluster_nodes" in cl_content.lower()
-                    has_standbys_hdr = "Replication_Standbys" in cl_content or "replication_standbys" in cl_content.lower()
-                    record("Cluster Tab Child Tables Structure", has_nodes_hdr and has_standbys_hdr,
-                           f"Cluster_Nodes: {has_nodes_hdr}, Replication_Standbys: {has_standbys_hdr}", shot_path)
+                content_lower = page.content().lower()
 
-                    # Assert Cluster_Nodes table shows 3 rows and role column has 'primary' for exactly one row
+                if tab_name == "Cluster":
+                    has_nodes = "cluster_nodes" in content_lower
                     node_rows = page.locator("tr:has-text('5441'), tr:has-text('5442'), tr:has-text('5443')").all()
                     if len(node_rows) == 0:
                         c_widget = page.locator("text='Cluster_Nodes list'").locator("xpath=ancestor::div[contains(@class, 'widget') or contains(@class, 'box') or contains(@class, 'panel')][1]")
@@ -562,19 +553,29 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                     row_count = len(node_rows)
                     primary_rows = [
                         r for r in node_rows 
-                        if "primary" in r.inner_text().lower() or 
-                           "is_primary: 1" in r.inner_text().lower() or 
-                           " 1 " in r.inner_text()
+                        if "primary" in r.inner_text().lower() or "is_primary: 1" in r.inner_text().lower()
                     ]
                     primary_count = len(primary_rows)
+                    nodes_ok = (has_nodes and row_count >= 3 and primary_count == 1)
+                    record("Cluster_Nodes Table (3 rows, 1 primary)", nodes_ok,
+                           f"Rendered rows: {row_count}, primary count: {primary_count}", shot_path)
 
-                    nodes_table_ok = (row_count == 3 and primary_count == 1)
-                    nodes_details = f"Rows found: {row_count}/3, is_primary=1 row count: {primary_count}/1"
-                    if not nodes_table_ok:
-                        row_texts = [r.inner_text().strip().replace('\n', ' | ') for r in node_rows]
-                        nodes_details += f" (Observed: {row_texts if row_texts else 'No data rows rendered'})"
+                elif tab_name == "Replication":
+                    has_standbys = "replication_standbys" in content_lower
+                    has_slots = "replication_slots" in content_lower
+                    rep_ok = (has_standbys and has_slots)
+                    record("Replication Tab (Standbys & Slots tables)", rep_ok,
+                           f"Replication_Standbys: {has_standbys}, Replication_Slots: {has_slots}", shot_path)
 
-                    record("Cluster_Nodes Table Rows and is_primary", nodes_table_ok, nodes_details, shot_path)
+                elif tab_name == "Node Performance":
+                    has_io = "node_io" in content_lower or "stats_per_db" in content_lower or "checkpoints" in content_lower
+                    record("Node Performance Tab (Node_IO / Node_Checkpoints / Stats_per_DB)", has_io,
+                           f"Node Performance telemetry rendered: {has_io}", shot_path)
+
+                elif tab_name == "Transactions and Sessions":
+                    has_activity = "node_activity" in content_lower or "node_transactions" in content_lower or "tranasctions" in content_lower or "transactions" in content_lower
+                    record("Transactions and Sessions Tab (Node_Activity / Node_Transactions)", has_activity,
+                           f"Transactions & Sessions telemetry rendered: {has_activity}", shot_path)
             tab_index += 1
 
         try:

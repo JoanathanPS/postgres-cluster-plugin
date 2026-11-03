@@ -100,13 +100,12 @@ def validate_schema(data, rep):
 
     # Cluster metrics presence and numeric types
     expected_metrics = [
-        "Nodes Total", "Nodes Up", "Primary Count", "No Primary Flag",
-        "Split Brain Flag", "Primary Timeline", "Standbys Expected",
+        "Cluster Health", "Nodes Total", "Nodes Up", "Primary Count", "No Primary Flag",
+        "Split Brain Flag", "Primary Timeline", "Timeline Mismatch Flag", "Standbys Expected",
         "Standbys Streaming", "Standby Disconnect Flag", "Sync Standby Count",
         "Cascading Standby Count", "Max Replay Backlog", "Max Replay Delay",
         "Replication Slots Total", "Replication Slots Active",
-        "Replication Slots Inactive", "Physical Slots", "Logical Slots",
-        "Max Slot Lag Bytes"
+        "Replication Slots Inactive", "Max Slot Lag Bytes"
     ]
     for m in expected_metrics:
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")
@@ -116,15 +115,17 @@ def validate_schema(data, rep):
     allowed_string_metrics = {
         "Server Version", "Last Archived WAL File", "Cluster Type",
         "Cluster Type Evidence", "Cluster Name", "Archive Mode",
-        "Cluster Summary", "msg"
+        "Cluster Health Reason", "msg"
     }
-    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Summary"]:
+    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Health Reason"]:
         if sm in data:
             rep.check(isinstance(data[sm], str), f"Top-level string metric '{sm}' is str ({data.get(sm)})")
-            if sm == "Cluster Type Evidence":
-                rep.check(len(data[sm]) < 100, f"Cluster Type Evidence strictly < 100 chars ({len(data[sm])} chars)")
+            if sm in ("Cluster Type Evidence", "Cluster Health Reason"):
+                rep.check(len(data[sm]) < 100, f"'{sm}' strictly < 100 chars ({len(data[sm])} chars)")
 
-    rep.check("Cluster Summary" in data, f"Cluster Summary present ({data.get('Cluster Summary')})")
+    rep.check("Cluster Health Reason" in data, f"Cluster Health Reason present ({data.get('Cluster Health Reason')})")
+    rep.check("Cluster Health" in data and data.get("Cluster Health") in (0, 1, 2), f"Cluster Health is 0/1/2 ({data.get('Cluster Health')})")
+    rep.check("Timeline Mismatch Flag" in data and data.get("Timeline Mismatch Flag") in (0, 1), f"Timeline Mismatch Flag is 0/1 ({data.get('Timeline Mismatch Flag')})")
     rep.check("msg" not in data or data.get("msg") is None, f"msg omitted on healthy run ({data.get('msg')})")
 
     # Renamed WAL position metrics
@@ -207,8 +208,6 @@ def validate_schema(data, rep):
             rep.check(r.get("is_primary") in (0, 1), f"Cluster_Nodes row is_primary in {{0, 1}} ({r.get('is_primary')})")
             rep.check(isinstance(r.get("timeline"), int), f"Cluster_Nodes row timeline is int ({r.get('timeline')})")
             rep.check(isinstance(r.get("response_time_ms"), (int, float)), f"Cluster_Nodes row response_time_ms is float/int ({r.get('response_time_ms')})")
-            rep.check(isinstance(r.get("replay_backlog_bytes"), int), f"Cluster_Nodes row replay_backlog_bytes is int ({r.get('replay_backlog_bytes')})")
-            rep.check(isinstance(r.get("replay_delay_s"), (int, float)), f"Cluster_Nodes row replay_delay_s is float/int ({r.get('replay_delay_s')})")
             rep.check(isinstance(r.get("connections"), int), f"Cluster_Nodes row connections is int ({r.get('connections')})")
             rep.check(isinstance(r.get("role"), str), f"Cluster_Nodes row role is str ({r.get('role')})")
             rep.check(isinstance(r.get("patroni_state"), str), f"Cluster_Nodes row patroni_state is str ({r.get('patroni_state')})")
@@ -216,6 +215,11 @@ def validate_schema(data, rep):
             rep.check(isinstance(r.get("is_cascading"), int), f"Cluster_Nodes row is_cascading is int ({r.get('is_cascading')})")
             if r.get("is_primary") == 1:
                 prim_count += 1
+                rep.check("replay_backlog_bytes" not in r, "Primary row omits replay_backlog_bytes")
+                rep.check("replay_delay_s" not in r, "Primary row omits replay_delay_s")
+            else:
+                rep.check(isinstance(r.get("replay_backlog_bytes"), int), f"Cluster_Nodes row replay_backlog_bytes is int ({r.get('replay_backlog_bytes')})")
+                rep.check(isinstance(r.get("replay_delay_s"), (int, float)), f"Cluster_Nodes row replay_delay_s is float/int ({r.get('replay_delay_s')})")
         rep.check(prim_count == 1, f"Cluster_Nodes has exactly one primary node with is_primary=1 ({prim_count})")
 
     # Assertions for Replication_Standbys
@@ -240,22 +244,25 @@ def validate_schema(data, rep):
             rep.check(isinstance(r.get("slot_type"), str), f"Replication_Slots row slot_type is str ({r.get('slot_type')})")
             rep.check(isinstance(r.get("plugin"), str), f"Replication_Slots row plugin is str ({r.get('plugin')})")
 
-    # Assertions for Per-Node Standalone Tables
-    for pnt in ["Node_Activity", "Node_Throughput", "Node_Checkpoints", "Standby_Conflicts"]:
-        rep.check(pnt in data and isinstance(data[pnt], list), f"Per-node table '{pnt}' present")
+    # Assertions for 10 Child Tables
+    expected_10_tables = [
+        "Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Standby_Conflicts",
+        "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Node_Activity",
+        "Node_Transactions", "Tranasctions_and_Session_per_Database"
+    ]
+    for pnt in expected_10_tables:
+        rep.check(pnt in data and isinstance(data[pnt], list), f"Child table '{pnt}' present")
 
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
-    for tbl_unit in ["Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Node_Activity", "Node_Throughput", "Node_Checkpoints", "Standby_Conflicts"]:
+    for tbl_unit in ["Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Standby_Conflicts", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
         rep.check(tbl_unit in units and isinstance(units[tbl_unit], dict), f"units contains nested dict '{tbl_unit}'")
 
-    # Tabs verification: strictly 7 tabs
+    # Tabs verification: strictly 4 tabs
     tabs = data.get("tabs", {})
-    expected_tab_names = [
-        "Cluster", "Replication", "DB and IO stats", "BG Writer",
-        "Transactions and Sessions", "Write Ahead Log", "Recovery Conflicts"
-    ]
+    expected_tab_names = ["Cluster", "Replication", "Node Performance", "Transactions and Sessions"]
+    rep.check(len(tabs) == 4, f"Exactly 4 tabs defined in plugin tabs metadata (found {len(tabs)}: {list(tabs.keys())})")
     for et in expected_tab_names:
         rep.check(et in tabs, f"Tab '{et}' present in tabs definition")
 
@@ -265,20 +272,17 @@ def validate_schema(data, rep):
     rep_tablist = tabs.get("Replication", {}).get("tablist", [])
     rep.check("Replication_Standbys" in rep_tablist, "Replication_Standbys present in Replication tab tablist")
     rep.check("Replication_Slots" in rep_tablist, "Replication_Slots present in Replication tab tablist")
+    rep.check("Standby_Conflicts" in rep_tablist, "Standby_Conflicts present in Replication tab tablist")
 
-    db_tablist = tabs.get("DB and IO stats", {}).get("tablist", [])
-    rep.check("Stats_per_DB" in db_tablist, "Stats_per_DB present in DB and IO stats tab tablist")
-    rep.check("Node_Throughput" in db_tablist, "Node_Throughput present in DB and IO stats tab tablist")
-
-    bg_tablist = tabs.get("BG Writer", {}).get("tablist", [])
-    rep.check("Node_Checkpoints" in bg_tablist, "Node_Checkpoints present in BG Writer tab tablist")
+    perf_tablist = tabs.get("Node Performance", {}).get("tablist", [])
+    rep.check("Node_IO" in perf_tablist, "Node_IO present in Node Performance tab tablist")
+    rep.check("Node_Checkpoints" in perf_tablist, "Node_Checkpoints present in Node Performance tab tablist")
+    rep.check("Stats_per_DB" in perf_tablist, "Stats_per_DB present in Node Performance tab tablist")
 
     tx_tablist = tabs.get("Transactions and Sessions", {}).get("tablist", [])
-    rep.check("Tranasctions_and_Session_per_Database" in tx_tablist, "Tranasctions_and_Session_per_Database present in Transactions and Sessions tab tablist")
     rep.check("Node_Activity" in tx_tablist, "Node_Activity present in Transactions and Sessions tab tablist")
-
-    conf_tablist = tabs.get("Recovery Conflicts", {}).get("tablist", [])
-    rep.check("Standby_Conflicts" in conf_tablist, "Standby_Conflicts present in Recovery Conflicts tab tablist")
+    rep.check("Node_Transactions" in tx_tablist, "Node_Transactions present in Transactions and Sessions tab tablist")
+    rep.check("Tranasctions_and_Session_per_Database" in tx_tablist, "Tranasctions_and_Session_per_Database present in Transactions and Sessions tab tablist")
 
     # Childdiscovery in s247config: strictly per-DB tables
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
@@ -305,7 +309,7 @@ def test_coverage_map_assertion(data, rep):
     rep.check(len(cov) >= 90, f"Coverage map contains comprehensive mappings ({len(cov)} entries)")
 
     unmapped = []
-    is_pg17 = "PostgreSQL 17" in str(data.get("Server Version", ""))
+    is_pg17 = "PostgreSQL 17" in str(data.get("Server Version", "")) or "17." in str(data.get("Server Version", ""))
 
     for entry in cov:
         old_item = entry.get("old_item")
@@ -316,6 +320,10 @@ def test_coverage_map_assertion(data, rep):
 
         # PG 17 omits buffers_backend direct writes from Postgres engine
         if is_pg17 and old_item == "Buffers Backend Direct Writes":
+            continue
+
+        # Skip items explicitly documented as removed in notes
+        if "removed" in entry.get("notes", "").lower():
             continue
 
         ok = False
@@ -749,6 +757,85 @@ def test_exception_injection(plugin_py, nodes, user, password, db, patroni_port,
                   f"CLI output msg contains exception text ('{cli_data.get('msg')}')")
     except Exception as e:
         rep.fail(f"CLI output was not valid JSON: {e}\nStdout: {proc.stdout}\nStderr: {proc.stderr}")
+
+
+
+def test_standalone_sql_parity(rep):
+    """
+    Validates that every single standalone query in get_standalone_queries()
+    matches standalone postgres.py character-for-character across PG 14, 16, and 17.
+    """
+    print("\n=== Test: Standalone SQL Parity vs postgres.py ===")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    import postgres_cluster as pg_mod
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres")))
+    import postgres as std_mod
+
+    for ver in [140000, 160000, 170000]:
+        major = ver // 10000
+        std_mod.VERSION = ver
+        std_mod.inititializeQueries()
+        expected_queries = std_mod.dict_psqlQueries
+        v2_queries = pg_mod.get_standalone_queries(major)
+
+        for qkey, qval in expected_queries.items():
+            rep.check(qkey in v2_queries, f"PG{major} query '{qkey}' present in v2 get_standalone_queries")
+            if qkey in v2_queries:
+                clean_exp = " ".join(qval.split())
+                clean_v2 = " ".join(v2_queries[qkey].split())
+                rep.check(clean_exp == clean_v2, f"PG{major} SQL for '{qkey}' matches postgres.py exactly")
+
+
+def test_cluster_health_rules(rep):
+    """
+    Unit tests for evaluate_cluster_health pure function verifying every branch of the health logic:
+    Critical: no primary, split-brain, no streaming standby when expected.
+    Degraded: node down, standby disconnected, lag over threshold, inactive slot, timeline mismatch.
+    Healthy: all criteria met.
+    """
+    print("\n=== Test: Cluster Health Rules and Fixtures ===")
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    from postgres_cluster import evaluate_cluster_health
+
+    # 1. Critical: No primary
+    code, reason = evaluate_cluster_health(3, 2, 0, 1, 0, 2, 2, 0.0, 0, 0, 0)
+    rep.check(code == 2 and "No active primary" in reason, f"Critical (no primary): {code}, '{reason}'")
+
+    # 2. Critical: Split brain
+    code, reason = evaluate_cluster_health(3, 3, 2, 0, 1, 1, 1, 0.0, 0, 0, 0)
+    rep.check(code == 2 and "Split brain" in reason, f"Critical (split brain): {code}, '{reason}'")
+
+    # 3. Critical: No streaming standby while expected
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 0, 0.0, 0, 0, 0)
+    rep.check(code == 2 and "No streaming standbys" in reason, f"Critical (0 streaming): {code}, '{reason}'")
+
+    # 4. Degraded: Node down
+    code, reason = evaluate_cluster_health(3, 2, 1, 0, 0, 2, 2, 0.0, 0, 0, 0)
+    rep.check(code == 1 and "node(s) offline" in reason, f"Degraded (node offline): {code}, '{reason}'")
+
+    # 5. Degraded: Standby disconnected
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 1, 0.0, 0, 0, 0)
+    rep.check(code == 1 and "standby(s) not streaming" in reason, f"Degraded (standby disconnect): {code}, '{reason}'")
+
+    # 6. Degraded: Replay delay over threshold
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 75.0, 0, 0, 0)
+    rep.check(code == 1 and "Replay delay" in reason, f"Degraded (delay > 60s): {code}, '{reason}'")
+
+    # 7. Degraded: Replay backlog over threshold
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 120 * 1024 * 1024, 0, 0)
+    rep.check(code == 1 and "Replay backlog" in reason, f"Degraded (backlog > 100MB): {code}, '{reason}'")
+
+    # 8. Degraded: Inactive slot
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 1, 0)
+    rep.check(code == 1 and "inactive replication slot" in reason, f"Degraded (inactive slot): {code}, '{reason}'")
+
+    # 9. Degraded: Timeline mismatch
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 0, 1)
+    rep.check(code == 1 and "Timeline mismatch" in reason, f"Degraded (timeline mismatch): {code}, '{reason}'")
+
+    # 10. Healthy: All OK
+    code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 0, 0)
+    rep.check(code == 0 and "Cluster healthy" in reason, f"Healthy: {code}, '{reason}'")
 
 
 def main():

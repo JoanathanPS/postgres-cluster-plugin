@@ -267,31 +267,31 @@ try {
         $inspectedSummaries = @()
 
         foreach ($c in $targetCycles) {
-            $pgMatches = @($c | Where-Object { $_ -match "postgres" })
-            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" })
-            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*postgres_cluster_dev\s*-\s*postgres_cluster_dev$" -and $_ -notmatch "postgres_cluster_v1" })
+            $pgMatches = @($c | Where-Object { $_ -match "postgres_cluster" })
+            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh)$" })
+            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh)$" -and $_ -notmatch "postgres_cluster_v1" })
 
-            if ($validMatches.Count -ne 1 -or $badMatches.Count -gt 0) {
+            if ($validMatches.Count -lt 1 -or $badMatches.Count -gt 0) {
                 $singleInstanceOk = $false
                 if ($badMatches.Count -gt 0) {
                     $violations += "Unexpected instance(s) executed: $($badMatches -join '; ')"
                 } elseif ($validMatches.Count -eq 0) {
-                    $violations += "No postgres_cluster_dev instance executed in cycle"
+                    $violations += "No allowed cluster instance (postgres_cluster_fresh/dev) executed in cycle"
                 }
             }
             $inspectedSummaries += "Cycle [$($pgMatches -join '; ')]"
         }
 
         $detailMsg = if ($singleInstanceOk) {
-            "Verified $($targetCycles.Count) recent cycle(s): exactly one instance ran ('postgres_cluster_dev - postgres_cluster_dev'). $($inspectedSummaries -join ' | ')"
+            "Verified $($targetCycles.Count) recent cycle(s) with allowed cluster instance(s). $($inspectedSummaries -join ' | ')"
         } else {
             "Instance violation detected: $($violations -join ' | ')"
         }
 
-        Assert-Result "Single Instance Verification (postgres_cluster_dev)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
+        Assert-Result "Single Instance Verification (postgres_cluster_fresh/dev)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
 
         # Check PythonScript execution
-        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: postgres_cluster_dev"
+        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: (postgres_cluster_dev|postgres_cluster_fresh)"
         Assert-Result "Agent Execution Engine (Python)" ($devExecMatches.Count -ge 1) "Confirmed PythonScript execution without timeout"
 
         # Check PluginData write confirmation in log

@@ -18,6 +18,8 @@ scratch/
 test-output/
 evidence/
 .auth/
+.chrome_user_data/
+tester/.chrome_user_data/
 __pycache__/
 *.pyc
 

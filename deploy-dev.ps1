@@ -12,6 +12,7 @@
 [CmdletBinding()]
 param(
     [switch]$RestartService,
+    [switch]$ForceReregister,
     [string]$Nodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003",
     [string]$Username = "site24x7",
     [string]$Password = "site24x7",
@@ -63,6 +64,13 @@ Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii
 # Touch LastWriteTime on cfg to signal agent file-watcher
 (Get-Item $targetCfg).LastWriteTime = (Get-Date)
 Write-Host "Updated LastWriteTime on $targetCfg" -ForegroundColor Green
+
+if ($ForceReregister) {
+    Write-Host "ForceReregister: Touching cfg LastWriteTime to trigger file-watcher re-registration..." -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 500
+    (Get-Item $targetCfg).LastWriteTime = (Get-Date)
+    Write-Host "Cfg touched at $(Get-Date)" -ForegroundColor Green
+}
 
 if ($RestartService) {
     Write-Host "Restarting Site24x7 services..." -ForegroundColor Yellow
