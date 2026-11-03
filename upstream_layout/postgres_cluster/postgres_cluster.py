@@ -557,8 +557,9 @@ class PostgresNodeClient:
     Encapsulates all node-specific connection state, version detection, query preparation,
     evidence, and per-node table collection without any module-level global variables.
     """
-    def __init__(self, name, host, port, username, password, db, patroni_port=None):
+    def __init__(self, name, host, port, username, password, db, patroni_port=None, has_explicit_alias=False):
         self.name = name                               # Display name / alias in tables
+        self.has_explicit_alias = has_explicit_alias
         self.raw_host = host
         self.hostname = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
         self.port = int(port)
@@ -617,6 +618,15 @@ class PostgresNodeClient:
             cur.execute("SHOW server_version;")
             self.server_version_str = cur.fetchone()[0]
 
+            if not self.has_explicit_alias and self.name.startswith(("127.0.0.1", "localhost", "D127")):
+                try:
+                    cur.execute("SELECT current_setting('cluster_name', true);")
+                    row = cur.fetchone()
+                    if row and row[0] and row[0].strip():
+                        self.name = row[0].strip()
+                except Exception:
+                    pass
+
     def close(self):
         if self.conn:
             try:
@@ -644,6 +654,9 @@ class PostgresNodeClient:
                         "timeline": data.get("timeline")
                     }
                     self.patroni_state = data.get("state", "N/A")
+                    patroni_member_name = data.get("patroni", {}).get("name")
+                    if patroni_member_name and not self.has_explicit_alias:
+                        self.name = str(patroni_member_name).strip()
         except Exception:
             self.patroni_state = "N/A"
 
@@ -715,16 +728,27 @@ class PostgresNodeClient:
                         if recv_lsn and rep_lsn:
                             cur.execute("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
                             diff = cur.fetchone()[0]
-                            self.replay_backlog_bytes = int(diff) if diff is not None else 0
-                            if recv_lsn == rep_lsn:
+                            self.replay_backlog_bytes = max(0, int(diff)) if diff is not None else 0
+                            if recv_lsn == rep_lsn or self.replay_backlog_bytes == 0:
                                 self.replay_delay_s = 0.0
                             else:
                                 cur.execute("SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));")
                                 delay = cur.fetchone()[0]
-                                self.replay_delay_s = round(float(delay), 2) if delay is not None and delay >= 0 else 0.0
+                                self.replay_delay_s = max(0.0, round(float(delay), 2)) if delay is not None else 0.0
                         else:
                             self.replay_backlog_bytes = 0
                             self.replay_delay_s = 0.0
+
+                        if not self.has_explicit_alias and self.name.startswith(("127.0.0.1", "localhost", "D127")):
+                            try:
+                                cur.execute("SELECT slot_name FROM pg_stat_wal_receiver WHERE slot_name IS NOT NULL LIMIT 1;")
+                                r_slot = cur.fetchone()
+                                if r_slot and r_slot[0]:
+                                    clean_slot = r_slot[0].replace('_', '-')
+                                    if clean_slot:
+                                        self.name = clean_slot
+                            except Exception:
+                                pass
                     except Exception as e:
                         self.notes.append(f"Standby lag query error on {self.name}: {e}")
 
@@ -1042,10 +1066,13 @@ class PostgresClusterCollector:
             if not entry:
                 continue
             alias = None
+            has_explicit_alias = False
             if "=" in entry:
                 alias, entry = entry.split("=", 1)
                 alias = alias.strip()
                 entry = entry.strip()
+                if alias:
+                    has_explicit_alias = True
 
             parts = entry.split(':')
             if len(parts) >= 3:
@@ -1056,7 +1083,7 @@ class PostgresClusterCollector:
                 h, p, pat = parts[0], 5432, self.patroni_port
 
             display_name = alias if alias else f"{h}:{p}"
-            parsed.append((display_name, h, p, pat))
+            parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
 
     def collect(self):
@@ -1091,8 +1118,8 @@ class PostgresClusterCollector:
             return results
 
         clients = []
-        for dname, h, p, pat in node_defs:
-            clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat))
+        for dname, h, p, pat, has_alias in node_defs:
+            clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat, has_explicit_alias=has_alias))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, nodes_total)) as executor:
             future_to_client = {executor.submit(cli.collect_full): cli for cli in clients}
@@ -1107,6 +1134,17 @@ class PostgresClusterCollector:
             if cli.notes:
                 for n in cli.notes:
                     self._add_note(n)
+            # Sync discovered readable name to per-node child table rows
+            if cli.activity_row:
+                cli.activity_row["name"] = cli.name
+            if cli.io_row:
+                cli.io_row["name"] = cli.name
+            if cli.transactions_row:
+                cli.transactions_row["name"] = cli.name
+            if cli.checkpoints_row:
+                cli.checkpoints_row["name"] = cli.name
+            if cli.conflicts_row:
+                cli.conflicts_row["name"] = cli.name
 
         nodes_up = sum(1 for c in clients if c.is_up)
         primary_candidates = [c for c in clients if c.is_up and c.is_primary]
@@ -1211,9 +1249,9 @@ class PostgresClusterCollector:
                 node_row["connections"] = int(c.connections)
             if c.is_up and not c.is_primary:
                 if c.replay_backlog_bytes is not None:
-                    node_row["replay_backlog_bytes"] = int(c.replay_backlog_bytes)
+                    node_row["replay_backlog_bytes"] = max(0, int(c.replay_backlog_bytes))
                 if c.replay_delay_s is not None:
-                    node_row["replay_delay_s"] = float(c.replay_delay_s)
+                    node_row["replay_delay_s"] = max(0.0, float(c.replay_delay_s))
 
             cluster_nodes.append(node_row)
 
@@ -1255,22 +1293,35 @@ class PostgresClusterCollector:
                         is_sync = 1 if r[3] in ('sync', 'quorum') else 0
                         if is_sync:
                             sync_standbys_count += 1
-                        rep_lag_bytes = int(r[5] or 0)
-                        rep_lag_s = float(r[8] or 0.0)
+                        rep_lag_bytes = max(0, int(r[5] or 0))
+                        w_lag_bytes = max(0, int(r[6] or 0))
+                        f_lag_bytes = max(0, int(r[7] or 0))
+                        rep_lag_s = max(0.0, float(r[8] or 0.0))
                         if rep_lag_bytes > max_replay_backlog:
                             max_replay_backlog = rep_lag_bytes
                         if rep_lag_s > max_replay_delay_s:
                             max_replay_delay_s = rep_lag_s
 
+                        app_name = str(r[0] or "").strip()
+                        client_ip = str(r[1] or "").strip()
+                        standby_name = app_name
+                        if not standby_name or standby_name in ('unknown', 'none', 'walreceiver', ''):
+                            for c in clients:
+                                if client_ip and (c.hostname in client_ip or c.raw_host in client_ip or client_ip.startswith(c.raw_host)):
+                                    standby_name = c.name
+                                    break
+                        if not standby_name or standby_name == 'unknown':
+                            standby_name = client_ip or "standby"
+
                         replication_standbys.append({
-                            "name": str(r[0]),
-                            "client_addr": str(r[1]),
+                            "name": standby_name,
+                            "client_addr": client_ip,
                             "state": str(r[2]),
                             "sync_state": str(r[3]),
                             "role": "standby",
                             "replay_lag_bytes": rep_lag_bytes,
-                            "write_lag_bytes": int(r[6] or 0),
-                            "flush_lag_bytes": int(r[7] or 0),
+                            "write_lag_bytes": w_lag_bytes,
+                            "flush_lag_bytes": f_lag_bytes,
                             "replay_lag_s": rep_lag_s,
                             "is_sync": is_sync,
                             "status": 1
@@ -1651,6 +1702,18 @@ class PostgresClusterCollector:
         standbys_expected = max(0, nodes_total - primary_count)
         standbys_streaming = len(replication_standbys) + cascading_standbys_count
         standby_disconnect_flag = 1 if standbys_expected > standbys_streaming else 0
+
+        # Check all standbys' local backlog as well
+        for c in clients:
+            if c.is_up and not c.is_primary and c.replay_backlog_bytes is not None:
+                if c.replay_backlog_bytes > max_replay_backlog:
+                    max_replay_backlog = c.replay_backlog_bytes
+                if c.replay_delay_s is not None and c.replay_delay_s > max_replay_delay_s:
+                    max_replay_delay_s = c.replay_delay_s
+
+        max_replay_backlog = max(0, max_replay_backlog)
+        max_replay_delay_s = max(0.0, max_replay_delay_s)
+        max_slot_lag_bytes = max(0, max_slot_lag_bytes)
 
         if nodes_up == 0:
             results["status"] = 0
