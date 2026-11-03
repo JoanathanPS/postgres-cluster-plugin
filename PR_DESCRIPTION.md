@@ -1,79 +1,93 @@
-# PR: Comprehensive PostgreSQL Cluster Monitoring Plugin for Site24x7
+# PR: Comprehensive PostgreSQL Cluster Monitoring Plugin for Site24x7 (v2 Redesign)
 
 ## Summary of Changes
 
-This Pull Request introduces a production-ready, enterprise-grade PostgreSQL Cluster monitoring plugin for Site24x7. It supersedes the partial implementation in PR #442 by adopting a unified cluster-first topology model, delivering sub-second failover visibility, incorporating all review feedback from PR #442, and eliminating the Windows Agent 160 s registration deadlock.
+This Pull Request introduces a production-ready, enterprise-grade PostgreSQL Cluster monitoring plugin for Site24x7. It supersedes the partial implementation in PR #442 by adopting a unified cluster-first topology model, delivering sub-second failover visibility, incorporating all review feedback from PR #442, redesigning into a clean 4-tab layout, and eliminating the Windows Agent 160 s registration deadlock.
 
 The single source of truth for upstream repository submission is maintained under:
 `upstream_layout/postgres_cluster/`
 
 ---
 
-## 1. Architectural Architecture: Single-Monitor vs Per-Node
+## 1. 4-Tab Dashboard Architecture
 
-| Dimension | PR #442 Implementation | This Plugin Implementation (`v2`) |
+The dashboard is structured into exactly 4 specialized tabs, each answering a critical operational question:
+
+1. **`Cluster`**: *What is the cluster topology, manager type, active primary, timeline, and overall cluster health?*
+   - Surfaces `Cluster Type` (prominently at the top of the tab and as the primary landing page).
+   - Features `Cluster Health` (0: Healthy, 1: Degraded, 2: Critical) and `Cluster Health Reason` (<100 characters).
+   - Child Table: `Cluster_Nodes` (Per-node reachability, timeline, latency, connections, lag, upstream, and cluster type).
+2. **`Replication`**: *Are standbys replicating properly, are WAL positions progressing, and are replication slots healthy?*
+   - Standbys Expected/Streaming, Sync Standby Count, Max Replay Backlog/Delay, Slots Active/Inactive, Max Slot Lag Bytes, Logical Replication In Use.
+   - Always-emitted WAL positions and Archiving status (`Archive Mode`, Success, Failed, Ready).
+   - Child Tables: `Replication_Standbys`, `Replication_Slots`, `Standby_Conflicts`.
+3. **`Node Performance`**: *How are cluster nodes performing in terms of I/O throughput, buffer allocation, cache hits, and checkpoints?*
+   - Exact SQL and parameter parity with standalone `postgres.py`: insert/update/delete/fetch/return tuples, block reads/hits, heap reads/hits, cache hit ratio (0.0 to 1.0 ratio), index scans/reads/fetches, and background writer buffers.
+   - Child Tables: `Node_IO`, `Node_Checkpoints`, `Stats_per_DB`.
+4. **`Transactions and Sessions`**: *What is the concurrency, connection saturation, lock contention, and transaction throughput across nodes and databases?*
+   - Active connections, max connections, connection utilization %, active queries, waiting queries, locks, commits, rollbacks, conflicts, open transactions, session lifecycles, and uptime.
+   - Child Tables: `Node_Activity`, `Node_Transactions`, `Tranasctions_and_Session_per_Database`.
+
+---
+
+## 2. Hierarchical Cluster Health Evaluation Rules
+
+Evaluated top-down to return the first matching condition:
+- **`Critical` (Code 2)**:
+  - `No Primary Flag == 1` (0 primary nodes found)
+  - `Split Brain Flag == 1` (>1 primary nodes detected)
+  - `Standbys Expected > 0` but `Standbys Streaming == 0` (all standbys disconnected)
+- **`Degraded` (Code 1)**:
+  - Any node down (`Nodes Up < Nodes Total`)
+  - Standby disconnected (`Standbys Streaming < Standbys Expected`)
+  - Replay delay over threshold (`Max Replay Delay > 30.0s`)
+  - Replay backlog over threshold (`Max Replay Backlog > 104,857,600 bytes`)
+  - Inactive replication slot (`Replication Slots Inactive > 0`)
+  - Timeline mismatch (`Timeline Mismatch Flag == 1`)
+- **`Healthy` (Code 0)**:
+  - All nodes up, exactly 1 primary, all expected standbys streaming, matching timelines, and acceptable lag.
+
+---
+
+## 3. Strict Parity with Standalone `postgres.py` & PR #442
+
+- **Identical SQL & Aliases**: Every query for IO, BG writer, Heap & Cache, and DB stats uses the exact query structure and aliases from official `postgres.py`.
+- **Cache Hit Ratio**: Computed strictly as a 0.0 to 1.0 ratio (`heap_blks_hit / (heap_blks_hit + heap_blks_read)`).
+- **Exact Typos Preserved**: The table name `Tranasctions_and_Session_per_Database` is retained exactly as in `postgres.py` for backward compatibility.
+- **Site24x7 Schema Limits Observed**:
+  - Max 10 child tables (exactly 9 defined).
+  - Max 15 columns per child table.
+  - Max 25 rows per child table (strict `[:25]` truncation).
+  - Max 5 string columns per table.
+  - Nested units dictionary for all tabular numeric columns.
+
+---
+
+## 4. Tested Clusters Matrix
+
+| Cluster Manager / Architecture | Verification Status | Verification Methodology & Evidence |
 | :--- | :--- | :--- |
-| **Topology Representation** | Monitors individual nodes independently via separate configuration blocks (`[pg_primary]`, `[pg_replica]`). | Monitors the **entire cluster as a cohesive unit** under a single monitor definition (`nodes = host1:port1,host2:port2,...`). |
-| **Primary Discovery & Failover** | Static configuration. If a failover occurs, the replica monitor reports errors until human intervention updates the cfg. | **Dynamic parallel discovery**: Probes all nodes concurrently (sub-second timeouts), detects primary promotion automatically, and follows the new primary without configuration changes. |
-| **Cluster Telemetry** | No cluster health or topology indicators. | Provides cluster-wide health flags: `Nodes Total`, `Nodes Up`, `Primary Count`, `No Primary Flag`, `Split Brain Flag`, `Primary Timeline`, and `Max Replay Backlog`. |
-| **Child Tables** | None. | Dedicated child tables: `Cluster_Nodes` (node reachability, timeline, latency, Patroni DCS state) and `Replication_Standbys` (standby streaming lag, state, and sync mode). |
-| **Agent Resource Impact** | Multiple independent agent execution threads and separate API credit usage. | Single execution thread covering all nodes within 1 second. |
+| **Patroni HA** | **Tested Live** | Verified against live 3-node containerized cluster with DCS (etcd). Tested automatic failover, REST API probes, timeline increment (24 -> 25), and node recovery. |
+| **Streaming Replication (Unmanaged)** | **Tested Live** | Verified against live 2-node PostgreSQL 16 cluster. Validated baseline detection, `pg_promote()` failover, split-brain alert detection (`Split Brain Flag == 1`, Health 2), and teardown. |
+| **Standalone PostgreSQL (14 & 16)** | **Tested Live** | Verified against live containerized PostgreSQL 14 and 16 standalone instances. Verified single-node detection, version extraction, and healthy status code 0. |
+| **repmgr** | **Fixture Validated** | Verified via test fixture detecting `repmgr` extension and `repmgr.nodes` topology catalog table. |
+| **pg_auto_failover** | **Fixture Validated** | Verified via test fixture detecting `pgautofailover` extension and `pgautofailover_standby` replication slot. |
+| **CloudNativePG (CNPG)** | **Fixture Validated** | Verified via test fixture detecting Kubernetes CNPG operator replication slot pattern `_cnpg_*`. |
+| **Stolon** | **Fixture Validated** | Verified via test fixture detecting Stolon keeper slot pattern `stolon_*` and application name signatures. |
+| **Citus Distributed** | **Fixture Validated** | Verified via test fixture detecting `citus` distributed coordinator extension. |
+| **AWS Aurora PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting `aurora_version()` engine function. |
+| **AWS RDS PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Amazon RDS administrative role `rds_superuser`. |
+| **Azure Database for PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Azure managed service role `azure_pg_admin`. |
+| **GCP Cloud SQL PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Google Cloud SQL administrative role `cloudsqlsuperuser`. |
+| **Mixed / HA Conflict** | **Fixture Validated** | Verified via test fixture detecting contradictory HA orchestrator signatures, safely categorized as `mixed/unknown`. |
 
 ---
 
-## 2. Full Resolution of PR #442 Review Comments (11/11 Addressed)
+## 5. Verification Suite Results
 
-This implementation directly addresses all 11 technical considerations raised during the review of PR #442:
-
-1. **Synchronous Standby Classification**: Properly classifies standbys across `sync`, `quorum`, `potential`, and `async` using `COALESCE(sync_state, 'unknown')` from `pg_stat_replication`.
-2. **Replication Backlog & Lag Calculation**: Calculates byte-accurate receive, write, flush, and replay lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)`.
-3. **Backend Direct-Write Handling**: Correctly collects buffer metrics (`buffers_clean`, `buffers_checkpoint`, `buffers_alloc`, `maxwritten_clean`) without breaking under varying backend write patterns.
-4. **PostgreSQL 17+ Version Compatibility**: Dynamically inspects `server_version`. Queries `pg_stat_checkpointer` on PostgreSQL 17+ and falls back gracefully to `pg_stat_bgwriter` on PostgreSQL 16 and older.
-5. **Client Backend Filtering**: Filters active connection counts specifically for client backends (`WHERE backend_type = 'client backend'`), with fallback (`WHERE client_addr IS NOT NULL`) for PostgreSQL < 10, preventing background workers and autovacuum from distorting client connection metrics.
-6. **Recovery Conflict Aggregation**: Aggregates database recovery conflicts (`conflicts_tablespace`, `conflicts_lock`, `conflicts_snapshot`, `conflicts_buffer_pin`, `conflicts_deadlock`) across all databases from `pg_stat_database_conflicts`.
-7. **Role Derivation from Recovery State**: Determines authoritative node role directly via `pg_is_in_recovery()`, correctly identifying standby vs primary even during transient promotion states.
-8. **RFC 8259 Standard JSON Formatting**: Emits strictly valid JSON using `json.dumps(result)`, eliminating single-quote python dict representations that broke automated parsers and linters.
-9. **Safe `psycopg2` Import Handling**: Wraps library imports in guarded try/except blocks. On missing drivers, returns `status: 0` with actionable installation instructions rather than crashing or throwing unhandled stack traces.
-10. **Standby Listening vs Source Port Resolution**: Avoids confusion between standby connection socket ephemeral ports (`client_port`) and server listening ports by concurrently probing each configured cluster endpoint directly.
-11. **Enforcement of 25-Row Child Table Limit**: Caps all tabular metrics (`Cluster_Nodes`, `Replication_Standbys`, `Stats_per_DB`, `Tranasctions_and_Session_per_Database`) at 25 entries (`[:25]`) to strictly observe Site24x7 agent schema constraints.
-
----
-
-## 3. Windows-First Focus & Anonymous Pipe Deadlock Resolution
-
-- **The Problem**: On Windows, the Site24x7 agent (`Site24x7PluginAgent.exe`) captures standard output from plugin scripts via Windows anonymous pipes. The operating system buffer for anonymous pipes is 4 KB. When rich JSON telemetry (with tabs, units, and child tables) exceeds 4 KB, the Python child process blocks on `sys.stdout.write()`. The agent parent process waits for script completion before draining the pipe, creating a textbook circular wait deadlock that terminates only after the agent's 160 s script timeout.
-- **The Solution**: We enabled `redirect_output = 1` under `[global_configurations]` in `postgres_cluster.cfg`. This instructs `Site24x7PluginAgent.exe` to redirect output directly to a temporary file (`PluginOutput\`), bypassing pipe buffer limits completely. Plugin execution drops from a 160 s timeout to **under 1.0 second**.
-
----
-
-## 4. Upstream Repository Structure (`upstream_layout/postgres_cluster/`)
-
-The directory matches the exact conventions of `site24x7/plugins/postgres/` and PR #442:
-
-```
-upstream_layout/postgres_cluster/
-├── postgres_cluster.py                              # Core plugin collector
-├── postgres_cluster.cfg                             # Standard template configuration
-├── README.md                                        # Official documentation & metric tables
-├── installer/
-│   ├── Site24x7PostgresClusterPluginInstaller.ps1   # PowerShell Windows installer
-│   └── Site24x7PostgresClusterPluginInstaller.sh    # Bash Linux installer
-├── prerequisites/
-│   ├── create_user.sql                              # SQL user provisioning script
-│   └── create_user.sh                               # Shell helper for user provisioning
-└── wc_automation/
-    └── installer.sh                                 # Agent automation hook
-```
-
----
-
-## 5. Automated Verification & Test Coverage
-
-- **`check-layout.ps1`**: Verifies directory structure, AST PowerShell syntax, py_compile Python compilation, configuration headers, and live JSON output (15/15 tests passing).
-- **`tester/e2e.ps1`**: One-command end-to-end verification supporting `-Mode quick` and `-Mode full`:
-  - **Stage A (Preflight)**: Docker daemon, 3 Patroni nodes, Python 3, `psycopg2`, agent dev directory.
-  - **Stage B (Timing)**: Probing latency < 5s on healthy cluster (0.53s), 1 replica down (3.38s), primary down (3.27s).
-  - **Stage C (Suites)**: Unit tests, failover assertion, replication lag demo.
-  - **Stage D (Agent)**: Validates real agent execution in `PluginLog.log` and output payload writes to `PluginData\`.
-  - **Stage E (Console)**: Playwright automated browser verification of Site24x7 web console.
-  - **Stage F (Cleanup Guarantee)**: Strict `try/finally` block ensuring all 3 nodes are always returned to healthy state.
+- **`check-layout.ps1`**: 15/15 passed.
+- **`tester/test_cluster_plugin.py`**: 0 failures, 0 warnings.
+- **`tester/test_multi_clusters.py`**: All multi-cluster tests passed (Plain streaming, `pg_promote` split brain, Standalone PG 14, Standalone PG 16).
+- **`tester/e2e.ps1 -Mode quick`**: `RESULT: PASS` (all stages including live Playwright console check).
+- **`tester/e2e.ps1 -Mode full`**: `RESULT: PASS` (all stages including dynamic failover, lag demo, agent logs, and live Playwright console check).
+- **`tester/console_check.py`**: 8 PASS, 0 FAIL against fresh monitor in live Site24x7 web console.
