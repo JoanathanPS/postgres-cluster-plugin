@@ -574,6 +574,25 @@ def test_cluster_type_fixtures(rep):
             "expected_type": "streaming replication (no HA manager detected)"
         },
         {
+            "name": "Multi-Master (Active-Active)",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["sub_mm1"],
+                "slot_types": ["logical"],
+                "logical_replication_count": 2,
+                "primary_count": 2,
+                "app_names": ["sub_mm1"],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "standby_count": 0,
+                "total_nodes": 2
+            },
+            "expected_type": "Multi-Master (Active-Active)"
+        },
+        {
             "name": "standalone",
             "evidence": {
                 "patroni": None,
@@ -836,6 +855,14 @@ def test_cluster_health_rules(rep):
     # 10. Healthy: All OK
     code, reason = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 0, 0)
     rep.check(code == 0 and "Cluster healthy" in reason, f"Healthy: {code}, '{reason}'")
+
+    # 11. Multi-Master: 2 Primaries is Healthy
+    code, reason = evaluate_cluster_health(2, 2, 2, 0, 0, 0, 1, 0.0, 0, 0, 0, cluster_type="Multi-Master (Active-Active)")
+    rep.check(code == 0 and "Multi-master cluster healthy" in reason, f"Multi-master healthy: {code}, '{reason}'")
+
+    # 12. Multi-Master: 1 Node down is Degraded
+    code, reason = evaluate_cluster_health(2, 1, 1, 0, 0, 0, 0, 0.0, 0, 0, 0, cluster_type="Multi-Master (Active-Active)")
+    rep.check(code == 1 and "offline" in reason, f"Multi-master degraded: {code}, '{reason}'")
 
 
 def main():

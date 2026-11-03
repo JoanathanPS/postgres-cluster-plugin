@@ -367,7 +367,8 @@ def get_standalone_queries(major_version, middle_version=0):
 def evaluate_cluster_health(
     nodes_total, nodes_up, primary_count, no_primary_flag, split_brain_flag,
     standbys_expected, standbys_streaming, max_replay_delay_s, max_replay_backlog,
-    slots_inactive, timeline_mismatch_flag, delay_threshold_s=60.0, backlog_threshold_bytes=104857600
+    slots_inactive, timeline_mismatch_flag, delay_threshold_s=60.0, backlog_threshold_bytes=104857600,
+    cluster_type=None
 ):
     """
     Pure health evaluation function for unit testing and live monitoring.
@@ -376,22 +377,28 @@ def evaluate_cluster_health(
       1 = degraded
       2 = critical
     Rule precedence:
-      Critical: No primary, split-brain, or zero streaming standbys when expected.
+      Critical: No primary, split-brain (except multi-master), or zero streaming standbys when expected.
       Degraded: Node down, standby disconnected, lag over threshold, inactive slot, timeline mismatch.
       Healthy: All criteria satisfied.
     """
+    is_multimaster = False
+    if cluster_type:
+        c_lower = str(cluster_type).lower()
+        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower:
+            is_multimaster = True
+
     # 1. Critical rules
     if primary_count == 0 or no_primary_flag == 1:
         return 2, "Critical: No active primary node detected"
-    if split_brain_flag == 1 or primary_count > 1:
+    if not is_multimaster and (split_brain_flag == 1 or primary_count > 1):
         return 2, f"Critical: Split brain detected ({primary_count} primary nodes active)"
-    if standbys_expected > 0 and standbys_streaming == 0:
+    if not is_multimaster and standbys_expected > 0 and standbys_streaming == 0:
         return 2, f"Critical: No streaming standbys connected ({standbys_expected} expected)"
 
     # 2. Degraded rules
     if nodes_up < nodes_total:
         return 1, f"Degraded: {nodes_total - nodes_up} of {nodes_total} node(s) offline"
-    if standbys_streaming < standbys_expected:
+    if not is_multimaster and standbys_streaming < standbys_expected:
         return 1, f"Degraded: {standbys_expected - standbys_streaming} of {standbys_expected} standby(s) not streaming"
     if max_replay_delay_s > delay_threshold_s:
         return 1, f"Degraded: Replay delay {max_replay_delay_s:.1f}s exceeds threshold ({delay_threshold_s:.0f}s)"
@@ -401,10 +408,12 @@ def evaluate_cluster_health(
         return 1, f"Degraded: Replay backlog {mb:.1f}MB exceeds threshold ({thresh_mb:.0f}MB)"
     if slots_inactive > 0:
         return 1, f"Degraded: {slots_inactive} inactive replication slot(s) found"
-    if timeline_mismatch_flag == 1:
+    if not is_multimaster and timeline_mismatch_flag == 1:
         return 1, "Degraded: Timeline mismatch detected across cluster nodes"
 
     # 3. Healthy rule
+    if is_multimaster:
+        return 0, f"Multi-master cluster healthy: {nodes_up}/{nodes_total} active master nodes replicating"
     return 0, f"Cluster healthy: {nodes_up}/{nodes_total} nodes active, {primary_count} primary, {standbys_streaming} standbys streaming"
 
 
@@ -496,11 +505,17 @@ def detect_cluster_type(evidence):
         managers.append("Citus Distributed")
         manager_evidences.append("citus distributed extension installed")
 
-    # 7. Multi-master (pglogical / BDR)
+    # 7. Multi-master (pglogical / BDR / Native Active-Active)
     if "pglogical" in exts or "bdr" in exts:
         found_ext = [e for e in exts if e in ("pglogical", "bdr")]
         managers.append("multi-master (pglogical/BDR)")
-        manager_evidences.append(f"multi-master extension {found_ext} (Split Brain Flag may be expected)")
+        manager_evidences.append(f"multi-master extension {found_ext} (Active-Active)")
+    elif evidence.get("primary_count", 0) >= 2 and (
+        evidence.get("logical_replication_count", 0) > 0 or
+        any("logical" in str(s).lower() for s in evidence.get("slot_types", []))
+    ):
+        managers.append("Multi-Master (Active-Active)")
+        manager_evidences.append(f"Active-Active logical replication mesh ({evidence.get('primary_count')} concurrent primaries)")
 
     # 8. Managed cloud services
     if evidence.get("aurora_version"):
@@ -960,10 +975,18 @@ class PostgresNodeClient:
                     pass
 
                 try:
-                    cur.execute("SELECT slot_name FROM pg_replication_slots;")
-                    evidence["slot_names"] = [r[0] for r in cur.fetchall()]
+                    cur.execute("SELECT slot_name, COALESCE(slot_type, 'physical') FROM pg_replication_slots;")
+                    slot_rows = cur.fetchall()
+                    evidence["slot_names"] = [r[0] for r in slot_rows]
+                    evidence["slot_types"] = [r[1] for r in slot_rows]
                 except Exception:
                     pass
+
+                try:
+                    cur.execute("SELECT (SELECT count(*) FROM pg_publication) + (SELECT count(*) FROM pg_subscription);")
+                    evidence["logical_replication_count"] = int(cur.fetchone()[0] or 0)
+                except Exception:
+                    evidence["logical_replication_count"] = 0
 
                 if not self.is_primary:
                     try:
@@ -1110,6 +1133,9 @@ class PostgresClusterCollector:
             "managed_roles": [],
             "aurora_version": False,
             "slot_names": [],
+            "slot_types": [],
+            "logical_replication_count": 0,
+            "primary_count": primary_count,
             "app_names": [],
             "total_nodes": nodes_total,
             "is_in_recovery": any(not c.is_primary for c in clients if c.is_up),
@@ -1134,11 +1160,14 @@ class PostgresClusterCollector:
                 if ev.get("aurora_version"):
                     agg_evidence["aurora_version"] = True
                 agg_evidence["slot_names"].extend(ev.get("slot_names", []))
+                agg_evidence["slot_types"].extend(ev.get("slot_types", []))
+                agg_evidence["logical_replication_count"] += ev.get("logical_replication_count", 0)
                 agg_evidence["app_names"].extend(ev.get("app_names", []))
 
         agg_evidence["extensions"] = list(set(agg_evidence["extensions"]))
         agg_evidence["managed_roles"] = list(set(agg_evidence["managed_roles"]))
         agg_evidence["slot_names"] = list(set(agg_evidence["slot_names"]))
+        agg_evidence["slot_types"] = list(set(agg_evidence["slot_types"]))
         agg_evidence["app_names"] = list(set(agg_evidence["app_names"]))
 
         # Cluster Type Detection
@@ -1147,6 +1176,11 @@ class PostgresClusterCollector:
             detected_evidence = f"Explicit override via cluster_type parameter ({self.cluster_type_override})"
         else:
             detected_type, detected_evidence = detect_cluster_type(agg_evidence)
+
+        # In multi-master / active-active topologies, multiple concurrent primaries are expected
+        c_lower = str(detected_type).lower()
+        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower:
+            split_brain_flag = 0
 
         results["Cluster Type"] = detected_type
         results["Cluster Type Evidence"] = detected_evidence[:99]
@@ -1633,7 +1667,8 @@ class PostgresClusterCollector:
             max_replay_delay_s=max_replay_delay_s,
             max_replay_backlog=max_replay_backlog,
             slots_inactive=slots_inactive,
-            timeline_mismatch_flag=timeline_mismatch_flag
+            timeline_mismatch_flag=timeline_mismatch_flag,
+            cluster_type=detected_type
         )
         results["Cluster Health"] = int(health_code)
         results["Cluster Health Reason"] = str(health_reason)[:99]

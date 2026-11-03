@@ -31,29 +31,31 @@ The plugin computes `Cluster Health` as an integer status code (`0` = Healthy, `
 
 ### 1. Critical (`Cluster Health = 2`)
 - **No Primary**: Zero reachable nodes report read-write primary status (`Primary Count == 0`).
-  - *Reason*: `Critical: No primary node detected in cluster`
-- **Split Brain**: Multiple nodes simultaneously report read-write primary status (`Primary Count > 1`).
+  - *Reason*: `Critical: No active primary node detected`
+- **Split Brain**: Multiple nodes simultaneously report read-write primary status (`Primary Count > 1`), except in Multi-Master / Active-Active architectures where multiple primaries are expected.
   - *Reason*: `Critical: Split brain detected (N primary nodes active)`
-- **All Standbys Disconnected**: Standbys were expected, but zero standbys are streaming (`Standbys Expected > 0` and `Standbys Streaming == 0`).
-  - *Reason*: `Critical: All standbys disconnected (0/N streaming)`
+- **All Standbys Disconnected**: Standbys were expected, but zero standbys are streaming (`Standbys Expected > 0` and `Standbys Streaming == 0`), except in multi-master topologies.
+  - *Reason*: `Critical: No streaming standbys connected (N expected)`
 
 ### 2. Degraded (`Cluster Health = 1`)
 - **Node Down**: One or more configured cluster nodes are unreachable (`Nodes Up < Nodes Total`).
-  - *Reason*: `Degraded: N node(s) down (Nodes Up/Total)`
+  - *Reason*: `Degraded: N of M node(s) offline`
 - **Standby Disconnected**: Fewer standbys are streaming than expected (`Standbys Streaming < Standbys Expected`).
-  - *Reason*: `Degraded: Standby disconnected (Streaming/Expected streaming)`
-- **Replay Delay Over Threshold**: Standby replication replay delay exceeds 30.0 seconds (`Max Replay Delay > 30.0s`).
-  - *Reason*: `Degraded: High replay delay (X.Xs > 30.0s)`
+  - *Reason*: `Degraded: N of M standby(s) not streaming`
+- **Replay Delay Over Threshold**: Standby replication replay delay exceeds 60.0 seconds (`Max Replay Delay > 60.0s`).
+  - *Reason*: `Degraded: Replay delay X.Xs exceeds threshold (60s)`
 - **Replay Backlog Over Threshold**: Standby replication byte backlog exceeds 100 MB (`Max Replay Backlog > 104,857,600 bytes`).
-  - *Reason*: `Degraded: High replay backlog (X.X MB > 100.0 MB)`
+  - *Reason*: `Degraded: Replay backlog X.XMB exceeds threshold (100MB)`
 - **Inactive Replication Slot**: One or more replication slots are inactive, risking disk fill (`Replication Slots Inactive > 0`).
-  - *Reason*: `Degraded: N inactive replication slot(s) detected`
+  - *Reason*: `Degraded: N inactive replication slot(s) found`
 - **Timeline Mismatch**: Any active node's timeline diverges from the primary's timeline (`Timeline Mismatch Flag == 1`).
-  - *Reason*: `Degraded: Timeline mismatch detected across active nodes`
+  - *Reason*: `Degraded: Timeline mismatch detected across cluster nodes`
 
 ### 3. Healthy (`Cluster Health = 0`)
-- When none of the critical or degraded conditions match:
+- **Standard Single-Primary HA**: All nodes reachable, exactly 1 primary, and all expected standbys streaming.
   - *Reason*: `Cluster healthy: N/N nodes active, 1 primary, M standbys streaming`
+- **Multi-Master (Active-Active)**: All concurrent master nodes reachable and replicating bidirectionally.
+  - *Reason*: `Multi-master cluster healthy: N/N active master nodes replicating`
 
 ---
 
