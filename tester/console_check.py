@@ -34,7 +34,7 @@ CHROME_PROFILE = os.path.join(AUTH_DIR, "chrome-profile")
 CONFIG_FILE = os.path.join(AUTH_DIR, "config.json")
 EVIDENCE_DIR = os.path.join(REPO_ROOT, "evidence", "screenshots")
 
-DEFAULT_MONITOR = "postgres_cluster_fresh"
+DEFAULT_MONITOR = "postgres_cluster_v3"
 LOGIN_URL = "https://www.site24x7.in/login.html"
 
 manual_override_event = threading.Event()

@@ -114,9 +114,9 @@ def validate_schema(data, rep):
     # String top-level metrics
     # String top-level metrics
     allowed_string_metrics = {
-        "Last Archived WAL File", "Archive Mode", "msg"
+        "Last Archived WAL File", "Archive Mode", "Server Version", "msg"
     }
-    for sm in ["Archive Mode", "Last Archived WAL File"]:
+    for sm in ["Archive Mode", "Last Archived WAL File", "Server Version"]:
         if sm in data:
             rep.check(isinstance(data[sm], str), f"Top-level string metric '{sm}' is str ({data.get(sm)})")
 
@@ -305,9 +305,9 @@ def validate_schema(data, rep):
         "Active Connections", "Active Queries", "Active Waiting Queries",
         "Cache Hit Ratio", "Cluster Health", "Database Count", "Heap Blocks Hit",
         "Heap Blocks Read", "Index Rows Fetched", "Index Rows Read", "Index Scans",
-        "Locks Count", "Max Connections", "Nodes Up", "Table Count", "Uptime"
+        "Locks Count", "Max Connections", "Nodes Up", "Server Version", "Table Count", "Uptime"
     ])
-    rep.check(sorted(untabbed) == expected_untabbed, f"Exactly 16 untabbed metrics match OG+Summary spec (found {len(untabbed)}: {sorted(untabbed)})")
+    rep.check(sorted(untabbed) == expected_untabbed, f"Exactly 17 untabbed metrics (OG 14 + Cluster Health + Nodes Up + Server Version) match OG+Summary spec (found {len(untabbed)}: {sorted(untabbed)})")
 
     # Childdiscovery in s247config: strictly per-DB tables
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
@@ -719,7 +719,10 @@ def test_type_consistency(plugin_py, nodes, user, password, db, patroni_port, re
         if k in keys3:
             rep.check(t1 == keys3[k], f"Type consistency (dead cluster) for '{k}': expected {t1.__name__}, got {keys3[k].__name__}")
 
-    rep.check(d3.get('Last Archived WAL File') == 'none', f"Last Archived WAL File defaults to 'none' on dead cluster ({d3.get('Last Archived WAL File')})")
+    fabricated = [k for k in ("Uptime", "Active Connections", "Max Connections", "Total Commits",
+                              "Last Archived WAL File", "Buffers Backend", "Table Count") if k in d3]
+    rep.check(not fabricated, f"Dead cluster omits unreadable metrics, no fabricated zeros (found: {fabricated})")
+    rep.check(d3.get('status') == 0, f"Dead cluster status is 0 ({d3.get('status')})")
 
 def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep):
     print("\n=== Dynamic Failover Assertion ===")
@@ -925,6 +928,85 @@ def test_cluster_health_rules(rep):
     rep.check(code == 1 and "offline" in reason, f"Multi-master degraded: {code}, '{reason}'")
 
 
+def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """Regression tests for bugs found in the v1 audit (fabricated zeros, parity gaps, naming, classification)."""
+    print("\n=== Test: Audit Regressions & OG Parity ===")
+    import sys, math, importlib.util
+    sys.path.insert(0, os.path.dirname(plugin_py))
+    import postgres_cluster as pg_mod
+
+    def collect(n):
+        return pg_mod.PostgresClusterCollector(nodes_str=n, username=user, password=password, db=db, patroni_port=patroni_port).collect()
+
+    healthy = collect(nodes)
+    # Server Version parity (OG reports it as a flat textual metric)
+    rep.check(isinstance(healthy.get("Server Version"), str) and healthy["Server Version"], f"Flat 'Server Version' present ({healthy.get('Server Version')})")
+    # Per-database child table: no null-name row (OG drops it)
+    tx = healthy.get("Tranasctions_and_Session_per_Database", [])
+    rep.check(tx and all(isinstance(r.get("name"), str) and r["name"] for r in tx), f"Tranasctions_and_Session_per_Database has no null-name row ({[r.get('name') for r in tx]})")
+    # Cluster_Info name is alphanumeric
+    ci = (healthy.get("Cluster_Info") or [{}])[0]
+    import re as _re
+    rep.check(bool(_re.fullmatch(r"[A-Za-z0-9]+", str(ci.get("name", "")))), f"Cluster_Info name alphanumeric ({ci.get('name')})")
+
+    # Down node must still emit a status 0 row in every per-node table
+    down = collect(nodes.replace("5443", "5499"))
+    for t in ("Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions", "Cluster_Nodes"):
+        rows = down.get(t, [])
+        zero_rows = [r for r in rows if r.get("status") == 0]
+        rep.check(len(rows) == 3 and len(zero_rows) == 1, f"{t}: 3 rows with exactly one status 0 row for the down node ({len(rows)} rows, {len(zero_rows)} down)")
+    rep.check(down.get("Cluster Health") == 1, f"One node down gives Cluster Health 1 ({down.get('Cluster Health')})")
+
+    # Duplicate aliases are made unique
+    first = nodes.split(",")[0].split("=", 1)[-1]
+    dup = collect(f"n={first},n={nodes.split(',')[1].split('=', 1)[-1]}")
+    names = [r["name"] for r in dup.get("Cluster_Nodes", [])]
+    rep.check(len(names) == len(set(names)) == 2, f"Duplicate aliases made unique ({names})")
+
+    # Empty nodes: explicit failure, not a silent fallback
+    empty = pg_mod.run({"nodes": "", "username": user, "password": password, "db": db, "patroni_port": patroni_port})
+    rep.check(empty.get("status") == 0 and "No nodes" in str(empty.get("msg")), f"Empty nodes gives status 0 with message ({empty.get('msg')})")
+
+    # Cluster type classification
+    base = dict(extensions=[], repmgr_table=False, managed_roles=[], aurora_version=False, slot_names=[], slot_types=[],
+                logical_replication_count=0, primary_count=1, app_names=[], total_nodes=3, is_in_recovery=True,
+                has_standbys=True, has_replication_slots=True, standby_count=2)
+    def typ(**kw):
+        e = dict(base); e.update(kw); return pg_mod.detect_cluster_type(e)[0]
+    rep.check(typ(extensions=["pglogical"]).startswith("streaming"), f"pglogical extension alone is not multi-master ({typ(extensions=['pglogical'])})")
+    rep.check("ulti" in typ(extensions=["pglogical"], primary_count=2), "pglogical with 2 primaries is multi-master")
+    rep.check(typ(patroni={"is_patroni": True, "scope": "x"}, extensions=["pglogical"]) == "Patroni", "Patroni plus pglogical extension stays Patroni")
+    rep.check(typ(patroni={"is_patroni": True, "scope": "x"}, extensions=["citus"]) == "Patroni + Citus", "Patroni plus citus is 'Patroni + Citus'")
+
+    # SQL parity against the standalone postgres.py on the primary node
+    try:
+        og_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(plugin_py))), "..", "postgres", "postgres.py")
+        og_path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "postgres", "postgres.py"))
+        spec = importlib.util.spec_from_file_location("og_postgres", og_path)
+        og = importlib.util.module_from_spec(spec); spec.loader.exec_module(og)
+        prim = [r for r in healthy["Cluster_Nodes"] if r.get("is_primary") == 1][0]
+        parsed = pg_mod.PostgresClusterCollector(nodes_str=nodes, username=user, password=password, db=db, patroni_port=patroni_port)._parse_nodes()
+        pd = [p for p in parsed if p[0] == prim["name"]][0]
+        ogres = og.run({"host": pd[1], "port": str(pd[2]), "username": user, "password": password, "db": db})
+        skip = {"plugin_version", "heartbeat_required", "status", "msg", "tabs", "units", "s247config"}
+        stable = {"Max Connections", "Database Count", "Table Count", "Server Version", "Heap Blocks Read", "Index Scans", "Index Rows Read", "Index Rows Fetched", "Checkpoints Req"}
+        for k, v in ogres.items():
+            if k in skip or isinstance(v, list):
+                continue
+            rep.check(k in healthy, f"OG metric '{k}' exists in plugin output")
+            if k in stable and k in healthy:
+                try:
+                    rep.check(math.isclose(float(v), float(healthy[k]), rel_tol=0.02, abs_tol=2), f"OG parity '{k}': OG={v} plugin={healthy[k]}")
+                except ValueError:
+                    rep.check(str(v) == str(healthy[k]), f"OG parity '{k}': OG={v} plugin={healthy[k]}")
+        for t in ("Tranasctions_and_Session_per_Database", "Stats_per_DB"):
+            og_cols = set(ogres[t][0].keys()); pl_cols = set(healthy[t][0].keys())
+            rep.check(og_cols == pl_cols, f"{t} columns identical to OG ({sorted(og_cols ^ pl_cols)})")
+            rep.check([r['name'] for r in ogres[t]] == [r['name'] for r in healthy[t]], f"{t} rows identical to OG")
+    except Exception as e:
+        rep.fail(f"OG parity test could not run: {type(e).__name__}: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="PostgreSQL Cluster Plugin Test Suite")
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
@@ -1016,6 +1098,9 @@ def main():
 
     # Test: JSON Type Consistency
     test_type_consistency(plugin_py, nodes, user, password, db, patroni_port, rep)
+
+    # Test: audit regressions and OG parity
+    test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep)
 
     # Test 10: Dynamic Failover Assertion
     if args.failover:

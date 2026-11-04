@@ -72,6 +72,7 @@ units = {
     # Cluster tab
     "Cluster Health": "status",
     "Nodes Total": "nodes",
+    "Server PID": "pid",
     "Nodes Up": "nodes",
     "Primary Count": "nodes",
     "No Primary Flag": "flag",
@@ -394,7 +395,7 @@ def detect_cluster_type(evidence):
         manager_evidences.append("citus distributed extension installed")
 
     # 7. Multi-master (pglogical / BDR / Native Active-Active)
-    if "pglogical" in exts or "bdr" in exts:
+    if "bdr" in exts or ("pglogical" in exts and evidence.get("primary_count", 0) >= 2):
         found_ext = [e for e in exts if e in ("pglogical", "bdr")]
         managers.append("multi-master (pglogical/BDR)")
         manager_evidences.append(f"multi-master extension {found_ext} (Active-Active)")
@@ -418,6 +419,9 @@ def detect_cluster_type(evidence):
     elif "cloudsqlsuperuser" in evidence.get("managed_roles", []):
         managers.append("GCP Cloud SQL")
         manager_evidences.append("cloudsqlsuperuser role detected")
+
+    if sorted(managers) == ["Citus Distributed", "Patroni"]:
+        return ("Patroni + Citus", "Patroni REST API plus citus extension installed")
 
     if len(managers) > 1:
         conflicts_str = " and ".join(managers)
@@ -952,6 +956,12 @@ class PostgresClusterCollector:
                 h, p, pat = parts[0], 5432, self.patroni_port
 
             display_name = safe_name(alias) if alias else f"node{len(parsed) + 1}"
+            base_name, dup = display_name, 2
+            while any(p_[0] == display_name for p_ in parsed):
+                display_name = f"{base_name}{dup}"
+                dup += 1
+            if display_name != base_name:
+                self._add_note(f"Duplicate node alias {base_name} renamed to {display_name}")
             parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
 
@@ -977,106 +987,6 @@ class PostgresClusterCollector:
             return results
 
     def _collect_internal(self, results):
-        # Enforce strict type consistency across all scenarios (healthy, node down, no primary)
-        default_metrics = {
-            # Summary (16)
-            "Active Connections": 0,
-            "Active Queries": 0,
-            "Active Waiting Queries": 0,
-            "Cache Hit Ratio": 0.0,
-            "Database Count": 0,
-            "Heap Blocks Hit": 0,
-            "Heap Blocks Read": 0,
-            "Index Rows Fetched": 0,
-            "Index Rows Read": 0,
-            "Index Scans": 0,
-            "Locks Count": 0,
-            "Max Connections": 0,
-            "Table Count": 0,
-            "Uptime": 0,
-            "Cluster Health": 0,
-            "Nodes Up": 0,
-
-            # Tab 1: Cluster (7)
-            "Nodes Total": 0,
-            "Primary Count": 0,
-            "Primary Timeline": 0,
-            "No Primary Flag": 0,
-            "Split Brain Flag": 0,
-            "Timeline Mismatch Flag": 0,
-            "Server PID": 0,
-
-            # Tab 2: Replication (12)
-            "Standbys Expected": 0,
-            "Standbys Streaming": 0,
-            "Standby Disconnect Flag": 0,
-            "Sync Standby Count": 0,
-            "Cascading Standby Count": 0,
-            "Max Replay Backlog": 0,
-            "Max Replay Delay": 0.0,
-            "Replication Slots Total": 0,
-            "Replication Slots Active": 0,
-            "Replication Slots Inactive": 0,
-            "Max Slot Lag Bytes": 0,
-            "Logical Replication In Use": 0,
-
-            # Tab 3: Node Performance (18)
-            "Total Block Hits": 0,
-            "Total Block Reads": 0,
-            "Total Rows Inserted": 0,
-            "Total Rows Updated": 0,
-            "Total Rows Deleted": 0,
-            "Total Rows Fetched": 0,
-            "Total Rows Returned": 0,
-            "Buffers Alloc": 0,
-            "Buffers Checkpoint": 0,
-            "Buffers Clean": 0,
-            "Buffers Backend": 0,
-            "Buffers Backend Fsync": 0,
-            "Checkpoint Sync Time": 0,
-            "Checkpoint Write Time": 0,
-            "Checkpoints Req": 0,
-            "Checkpoints Timed": 0,
-            "Maxwritten Clean": 0,
-            "Dead Tuples": 0,
-
-            # Tab 4: Transactions and Sessions (12)
-            "Total Commits": 0,
-            "Total Rollbacks": 0,
-            "Total Conflicts": 0,
-            "Total Sessions": 0,
-            "Total Sessions Abandoned": 0,
-            "Total Sessions Fatal": 0,
-            "Total Sessions Killed": 0,
-            "Transactions Idle In Transaction": 0,
-            "Transactions Open": 0,
-            "Connection Utilization Percent": 0.0,
-            "Oldest Transaction ID Age": 0,
-            "Oldest Running Transaction Age": 0,
-
-            # Tab 5: WAL and Recovery (16)
-            "WAL Write Position": 0.0,
-            "WAL Insert Position": 0.0,
-            "WAL Flush Position": 0.0,
-            "WAL Files Count": 0,
-            "WAL Total Size": 0.0,
-            "Archive Mode": "off",
-            "Archive Status Success": 0,
-            "Archive Status Failed": 0,
-            "Archive Ready Files Count": 0,
-            "Last Archived WAL File": "none",
-            "Recovery Conflicts Total": 0,
-            "Conflicts Tablespace": 0,
-            "Conflicts Lock": 0,
-            "Conflicts Snapshot": 0,
-            "Conflicts Buffer Pin": 0,
-            "Conflicts Deadlock": 0,
-
-            # Childdiscovery tables defaults
-            "Stats_per_DB": [],
-            "Tranasctions_and_Session_per_Database": []
-        }
-        results.update(default_metrics)
         server_version_str = "unknown"
 
         node_defs = self._parse_nodes()
@@ -1332,6 +1242,8 @@ class PostgresClusterCollector:
                 self._add_note(f"Server PID query: {e}")
 
             server_version_str = active_primary.server_version_str
+            if server_version_str:
+                results["Server Version"] = str(server_version_str)
 
             # 4. Standalone queries execution
             major_v = int(active_primary.server_version_num % 1000000 / 10000)
@@ -1396,7 +1308,7 @@ class PostgresClusterCollector:
 
             # Max connections & active connections from db_stats
             act_conn = 0
-            max_conn = 100
+            max_conn = None
             try:
                 with active_primary.conn.cursor() as cur:
                     cur.execute(std_queries['max_conn'])
@@ -1414,10 +1326,8 @@ class PostgresClusterCollector:
                     results["Total Commits"] = int(r[1] or 0)
                     results["Total Rollbacks"] = int(r[2] or 0)
                     results["Total Conflicts"] = int(r[3] or 0)
-                    if max_conn > 0:
+                    if max_conn:
                         results["Connection Utilization Percent"] = round((act_conn / max_conn) * 100.0, 2)
-                    else:
-                        results["Connection Utilization Percent"] = 0.0
             except Exception as e:
                 self._add_note(f"Database stats: {e}")
 
@@ -1586,17 +1496,18 @@ class PostgresClusterCollector:
                 self._add_note(f"pg_ls_waldir: {e}")
 
             # Recovery Conflicts totals from standbys
-            conf_ts = sum(r.get("confl_tablespace", 0) for r in standby_conflicts_table)
-            conf_lock = sum(r.get("confl_lock", 0) for r in standby_conflicts_table)
-            conf_snap = sum(r.get("confl_snapshot", 0) for r in standby_conflicts_table)
-            conf_pin = sum(r.get("confl_bufferpin", 0) for r in standby_conflicts_table)
-            conf_dead = sum(r.get("confl_deadlock", 0) for r in standby_conflicts_table)
-            results["Conflicts Tablespace"] = conf_ts
-            results["Conflicts Lock"] = conf_lock
-            results["Conflicts Snapshot"] = conf_snap
-            results["Conflicts Buffer Pin"] = conf_pin
-            results["Conflicts Deadlock"] = conf_dead
-            results["Recovery Conflicts Total"] = conf_ts + conf_lock + conf_snap + conf_pin + conf_dead
+            if standby_conflicts_table:
+                conf_ts = sum(r.get("confl_tablespace", 0) for r in standby_conflicts_table)
+                conf_lock = sum(r.get("confl_lock", 0) for r in standby_conflicts_table)
+                conf_snap = sum(r.get("confl_snapshot", 0) for r in standby_conflicts_table)
+                conf_pin = sum(r.get("confl_bufferpin", 0) for r in standby_conflicts_table)
+                conf_dead = sum(r.get("confl_deadlock", 0) for r in standby_conflicts_table)
+                results["Conflicts Tablespace"] = conf_ts
+                results["Conflicts Lock"] = conf_lock
+                results["Conflicts Snapshot"] = conf_snap
+                results["Conflicts Buffer Pin"] = conf_pin
+                results["Conflicts Deadlock"] = conf_dead
+                results["Recovery Conflicts Total"] = conf_ts + conf_lock + conf_snap + conf_pin + conf_dead
 
             # Standalone childdiscovery tables: Stats_per_DB and Tranasctions_and_Session_per_Database
             try:
@@ -1630,8 +1541,10 @@ class PostgresClusterCollector:
                     cur.execute(conn_details_sql)
                     tx_stats_rows = []
                     for row in cur.fetchall():
+                        if row[0] is None:
+                            continue
                         r_dict = {
-                            "name": str(row[0]) if row[0] is not None else None,
+                            "name": str(row[0]),
                             "commits": int(row[1] or 0),
                             "rollbacks": int(row[2] or 0),
                             "conflicts": int(row[3] or 0)
@@ -1716,7 +1629,7 @@ class PostgresClusterCollector:
 
         # Tabular Data (Enforce Site24x7 25-row limit)
         results["Cluster_Info"] = [{
-            "name": str(patroni_scope_discovered or "postgres-cluster"),
+            "name": safe_name(str(patroni_scope_discovered or "postgrescluster")) or "cluster",
             "cluster_type": str(detected_type)[:99],
             "type_evidence": str(detected_evidence)[:99],
             "server_version": str(server_version_str)[:99],
@@ -1756,7 +1669,7 @@ class PostgresClusterCollector:
 def run(param):
     """Site24x7 agent Python plugin entrypoint."""
     try:
-        nodes = param.get("nodes") if param and param.get("nodes") else NODES
+        nodes = param.get("nodes") if param and param.get("nodes") is not None else NODES
         username = param.get("username") if param and param.get("username") else USERNAME
         password = param.get("password") if param and param.get("password") else PASSWORD
         db = param.get("db") if param and param.get("db") else DB

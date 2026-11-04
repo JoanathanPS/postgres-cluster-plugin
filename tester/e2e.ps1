@@ -105,8 +105,8 @@ try {
     Assert-Result "psycopg2 Driver" $psycopg2Ok "Version: $psycopg2Check"
 
     # Check Dev Plugin Folder deployed
-    $devPluginPath = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres_cluster_dev"
-    $devDeployed = (Test-Path (Join-Path $devPluginPath "postgres_cluster_dev.py")) -and (Test-Path (Join-Path $devPluginPath "postgres_cluster_dev.cfg"))
+    $devPluginPath = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres_cluster_v3"
+    $devDeployed = (Test-Path (Join-Path $devPluginPath "postgres_cluster_v3.py")) -and (Test-Path (Join-Path $devPluginPath "postgres_cluster_v3.cfg"))
     Assert-Result "Agent Dev Plugin Deployed" $devDeployed "Path: $devPluginPath"
 
     # --------------------------------------------------------------------------
@@ -268,15 +268,15 @@ try {
 
         foreach ($c in $targetCycles) {
             $pgMatches = @($c | Where-Object { $_ -match "postgres_cluster" })
-            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)$" })
-            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)$" -and $_ -notmatch "postgres_cluster_v1" })
+            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*(postgres_cluster_v3)\s*-\s*(postgres_cluster_v3)$" })
+            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*(postgres_cluster_v3)\s*-\s*(postgres_cluster_v3)$" -and $_ -notmatch "postgres_cluster_v1" })
 
             if ($validMatches.Count -lt 1 -or $badMatches.Count -gt 0) {
                 $singleInstanceOk = $false
                 if ($badMatches.Count -gt 0) {
                     $violations += "Unexpected instance(s) executed: $($badMatches -join '; ')"
                 } elseif ($validMatches.Count -eq 0) {
-                    $violations += "No allowed cluster instance (postgres_cluster_fresh/dev) executed in cycle"
+                    $violations += "No allowed cluster instance (postgres_cluster_v3) executed in cycle"
                 }
             }
             $inspectedSummaries += "Cycle [$($pgMatches -join '; ')]"
@@ -288,10 +288,10 @@ try {
             "Instance violation detected: $($violations -join ' | ')"
         }
 
-        Assert-Result "Single Instance Verification (postgres_cluster_fresh/dev)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
+        Assert-Result "Single Instance Verification (postgres_cluster_v3)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
 
         # Check PythonScript execution
-        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: (postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)"
+        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: (postgres_cluster_v3)"
         Assert-Result "Agent Execution Engine (Python)" ($devExecMatches.Count -ge 1) "Confirmed PythonScript execution without timeout"
 
         # Check PluginData write confirmation in log

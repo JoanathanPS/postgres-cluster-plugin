@@ -10,7 +10,7 @@ In Site24x7, numeric metrics that do not belong to any tab's `tablist` are autom
 
 | OG Standalone Tab / Section | Dev Cluster Tab / Section | Description & Included Metrics | Child Tables |
 | :--- | :--- | :--- | :--- |
-| **Summary (Untabbed)** | **Summary (Untabbed)** | 14 OG metrics + 2 cluster summary metrics: `Active Connections`, `Active Queries`, `Active Waiting Queries`, `Cache Hit Ratio`, `Database Count`, `Heap Blocks Hit`, `Heap Blocks Read`, `Index Rows Fetched`, `Index Rows Read`, `Index Scans`, `Locks Count`, `Max Connections`, `Table Count`, `Uptime`, `Cluster Health`, `Nodes Up`. | *None (Charts only)* |
+| **Summary (Untabbed)** | **Summary (Untabbed)** | 14 OG charts + 2 cluster summary metrics + the OG textual `Server Version`: `Active Connections`, `Active Queries`, `Active Waiting Queries`, `Cache Hit Ratio`, `Database Count`, `Heap Blocks Hit`, `Heap Blocks Read`, `Index Rows Fetched`, `Index Rows Read`, `Index Scans`, `Locks Count`, `Max Connections`, `Table Count`, `Uptime`, `Cluster Health`, `Nodes Up`, `Server Version`. | *None (Charts only)* |
 | *New Cluster Section* | **Cluster** (Order 1) | Cluster topology & health charts: `Nodes Total`, `Primary Count`, `Primary Timeline`, `No Primary Flag`, `Split Brain Flag`, `Timeline Mismatch Flag`, `Server PID` (*needs TL approval*). | `Cluster_Info` (1 row metadata: type, evidence, version, primary, health reason), `Cluster_Nodes` (Per-node role, timeline, latency, connections, backlog). |
 | *Replication Section* | **Replication** (Order 2) | Standby replication & slot tracking: `Standbys Expected`, `Standbys Streaming`, `Standby Disconnect Flag`, `Sync Standby Count`, `Cascading Standby Count`, `Max Replay Backlog`, `Max Replay Delay`, `Replication Slots Total/Active/Inactive`, `Max Slot Lag Bytes`, `Logical Replication In Use`. | `Replication_Standbys` (Live streaming standbys & byte/sec lags), `Replication_Slots` (Replication slots & retained WAL). |
 | **DB and IO / BG Writer** | **Node Performance** (Order 3) | Primary and per-node I/O, tuples, buffers, checkpoints: `Total Rows Inserted/Updated/Deleted/Fetched/Returned`, `Total Block Reads/Hits`, `Buffers Alloc/Checkpoint/Clean/Backend/Backend Fsync`, `Checkpoint Sync/Write Time`, `Checkpoints Req/Timed`, `Maxwritten Clean`, `Dead Tuples`. | `Node_IO` (Per-node DML & cache hits), `Node_Checkpoints` (Per-node checkpoints & buffers), `Stats_per_DB` (Discovered databases on primary). |
@@ -32,7 +32,8 @@ In Site24x7, numeric metrics that do not belong to any tab's `tablist` are autom
 - **Per-Node Standalone Telemetry**: Standalone metrics from official `postgres.py` are collected across **all** reachable cluster nodes (primary AND standby) via dedicated child tables (`Node_IO`, `Node_Checkpoints`, `Node_Activity`, `Node_Transactions`).
 - **Alphanumeric Node Aliasing**: Node names in tables are strictly alphanumeric identifiers (e.g. `pgnode1`, `pgnode2`, `pgnode3`), ensuring clean formatting in Site24x7 child tables.
 - **Strict Site24x7 Tabular Limits Compliant**: Exactly 10 child tables (limit $\le 10$), $\le 15$ columns, $\le 25$ rows, and $\le 5$ string columns (excluding `name`).
-- **Always-Emitted Archive & WAL Telemetry**: `Archive Mode`, `Archive Status Success`, `Archive Status Failed`, `Archive Ready Files Count`, and `Last Archived WAL File` are always emitted with valid default values (e.g. `"none"` when no file has been archived, never numeric `"0"`).
+- **No Fabricated Values**: a metric that cannot be read (query failed, node unreachable, no primary) is omitted and explained in `msg`; it is never filled with a default `0`. `Last Archived WAL File` is the text `"none"` when nothing has been archived. When no primary is reachable the flat OG metrics are absent for that poll and `Cluster Health` is `2`.
+- **OG Parameter Parity**: every flat metric and both child tables of the standalone `postgres.py` are reproduced with the same SQL (verified by an automated parity test that runs `postgres.py` and this plugin against the same primary). Intentional differences: values are numeric instead of strings, the `Tranasctions_and_Session_per_Database` null-name row is dropped exactly as `postgres.py` does, and `Locks Count` is lower than `postgres.py` reports because `postgres.py` counts the locks held by its own open transaction.
 
 ---
 
@@ -78,7 +79,7 @@ The plugin defines exactly **10 child tables** (complying strictly with Site24x7
 | :--- | :--- | :--- | :--- | :--- |
 | `Cluster_Info` | `Cluster` | `name`, `cluster_type`, `type_evidence`, `server_version`, `primary_node`, `health_reason`, `nodes_total`, `nodes_up`, `primary_timeline`, `status` | 5 (`cluster_type`, `type_evidence`, `server_version`, `primary_node`, `health_reason`) | Exactly 1 row for cluster-wide metadata |
 | `Cluster_Nodes` | `Cluster` | `name`, `role`, `status`, `timeline`, `connections`, `replay_backlog_bytes` (bytes), `replay_delay_s` (s), `response_time_ms` (ms), `upstream`, `patroni_state`, `is_primary` (flag) | 3 (`role`, `upstream`, `patroni_state`) | All configured cluster nodes |
-| `Replication_Standbys` | `Replication` | `name`, `client_addr`, `state`, `sync_state`, `role`, `replay_lag_bytes` (bytes), `write_lag_bytes` (bytes), `flush_lag_bytes` (bytes), `replay_lag_s` (s), `is_sync` (flag), `status` (status) | 5 (`client_addr`, `state`, `sync_state`, `role`) | Active standbys streaming from primary |
+| `Replication_Standbys` | `Replication` | `name`, `client_addr`, `state`, `sync_state`, `replay_lag_bytes` (bytes), `write_lag_bytes` (bytes), `flush_lag_bytes` (bytes), `replay_lag_s` (s), `is_sync` (flag), `status` (status) | 3 (`client_addr`, `state`, `sync_state`) | Active standbys streaming from primary |
 | `Replication_Slots` | `Replication` | `name`, `plugin`, `slot_type`, `active` (flag), `wal_retained_bytes` (bytes), `status` (status) | 2 (`plugin`, `slot_type`) | All replication slots on primary |
 | `Node_IO` | `Node Performance` | `name`, `rows_inserted` (rows), `rows_updated` (rows), `rows_deleted` (rows), `rows_fetched` (rows), `rows_returned` (rows), `block_reads` (blocks), `block_hits` (blocks), `heap_blocks_read` (blocks), `heap_blocks_hit` (blocks), `cache_hit_ratio` (ratio), `index_scans` (scans), `index_rows_read` (rows), `index_rows_fetched` (rows), `status` (status) | 0 (excluding name) | All reachable cluster nodes |
 | `Node_Checkpoints` | `Node Performance` | `name`, `checkpoints_timed` (checkpoints), `checkpoints_req` (checkpoints), `checkpoint_write_time` (ms), `checkpoint_sync_time` (ms), `buffers_checkpoint` (buffers), `buffers_clean` (buffers), `maxwritten_clean` (buffers), `buffers_backend` (buffers), `buffers_backend_fsync` (calls), `buffers_alloc` (buffers), `status` (status) | 0 (excluding name) | All reachable cluster nodes |
@@ -86,6 +87,48 @@ The plugin defines exactly **10 child tables** (complying strictly with Site24x7
 | `Node_Activity` | `Transactions and Sessions` | `name`, `active_connections` (connections), `max_connections` (connections), `active_queries` (queries), `active_waiting_queries` (queries), `transactions_open` (transactions), `transactions_idle_in_transaction` (transactions), `locks_count` (locks), `oldest_xact_age_s` (s), `uptime` (s), `status` (status) | 0 (excluding name) | All reachable cluster nodes |
 | `Node_Transactions` | `Transactions and Sessions` | `name`, `commits` (transactions), `rollbacks` (transactions), `conflicts` (conflicts), `sessions` (sessions), `sessions_abandoned` (sessions), `sessions_fatal` (sessions), `sessions_killed` (sessions), `status` (status) | 0 (excluding name) | All reachable cluster nodes |
 | `Tranasctions_and_Session_per_Database` | `Transactions and Sessions` | `name`, `commits`, `rollbacks`, `conflicts`, `sessions`, `sessions_abandoned`, `sessions_fatal`, `sessions_killed`, `session_time`, `sessions_active_time`, `session_idle_in_transaction_time` | 0 (excluding name) | Discovered databases on primary |
+
+---
+
+## What Happens During a Failover
+
+All configured nodes are probed on every poll, so standby details are visible at all times, not only after a promotion. When the primary is stopped and a standby is promoted:
+
+- `Cluster_Info` shows the new `primary_node`, the new `primary_timeline`, and `health_reason` such as `Degraded: 1 of 3 node(s) offline`.
+- `Cluster_Nodes` lists every node; the stopped node has role `offline` and `status` 0.
+- `Node_IO`, `Node_Checkpoints`, `Node_Activity` and `Node_Transactions` keep one row per node; the stopped node has a row with `status` 0 and no numbers, so the console never keeps showing its last good values.
+- The flat Summary metrics are collected from the node that is the primary at poll time.
+- If no primary is reachable, the flat OG metrics are omitted for that poll and `Cluster Health` is `2`.
+
+## Tested Clusters
+
+| Cluster type | How it is tested |
+| :--- | :--- |
+| Patroni (3 nodes, etcd, HAProxy, PostgreSQL 17.2) | Live: healthy, one node stopped, primary stopped and promoted, node rejoining |
+| Plain streaming replication (2 nodes) | Live |
+| repmgr, pg_auto_failover, CloudNativePG, Stolon, Citus, Patroni + Citus, AWS RDS/Aurora, Azure, GCP Cloud SQL, multi-master (BDR, or pglogical with 2+ primaries) | Detection fixtures only (`detect_cluster_type` unit tests); not tested against real clusters |
+
+## Known Limitations
+
+- Multi-master topologies with several primaries look like split brain unless the type is detected as multi-master.
+- On managed services such as RDS Multi-AZ, standbys are usually not reachable by clients, so they appear offline.
+- Database-scoped metrics (`Table Count`, heap and index statistics, `Dead Tuples`) cover only the database named in `db`, exactly as `postgres.py` does.
+- `Buffers Backend` and `Buffers Backend Fsync` do not exist on PostgreSQL 17 (moved to `pg_stat_io`), so they are omitted there.
+- `Server PID` is the PID of the plugin's own connection, kept only for parity with the previous cluster plugin.
+- The console freezes the tabs and metric list at first registration. To change them, install under a new plugin name.
+
+## Recommended Thresholds
+
+Plugin monitors get no limits by default. Create one profile (Admin > Configuration Profiles > Threshold and Availability > Plugin Integrations):
+
+| Metric | Condition | Severity |
+| :--- | :--- | :--- |
+| `Cluster Health` | `>= 1` | Trouble |
+| `Cluster Health` | `= 2` | Critical |
+| `No Primary Flag` | `= 1` | Critical |
+| `Split Brain Flag` | `= 1` | Critical |
+| `Replication Slots Inactive` | `> 0` | Trouble |
+| `Max Replay Backlog` | `> 104857600` | Trouble |
 
 ---
 
@@ -106,7 +149,7 @@ The plugin defines exactly **10 child tables** (complying strictly with Site24x7
      ```
    - **Windows (PowerShell as Administrator)**:
      ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_final" -Nodes "pgnode1=127.0.0.1:5441:8001,pgnode2=127.0.0.1:5442:8002,pgnode3=127.0.0.1:5443:8003" -Username "site24x7" -Password "site24x7" -Database "appdb" -NonInteractive -SkipAdminCheck
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_v3" -Nodes "pgnode1=127.0.0.1:5441:8001,pgnode2=127.0.0.1:5442:8002,pgnode3=127.0.0.1:5443:8003" -Username "site24x7" -Password "site24x7" -Database "appdb" -NonInteractive -SkipAdminCheck
      ```
 
 ### Configuration (`postgres_cluster.cfg`)
