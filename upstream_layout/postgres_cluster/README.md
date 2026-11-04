@@ -141,6 +141,39 @@ db=postgres
 | CloudNativePG (kind, operator 1.24.1, 3 instances, PostgreSQL 16) | Live, plugin run as a pod: type `CloudNative-PG`, all 3 instances found from the read-only service. Node names come from the service and pod names |
 | AWS RDS/Aurora, Azure, Google Cloud SQL | Detection logic only. Not tested on real services; their node lists live in the cloud API, not in PostgreSQL |
 
+## Cluster Support Levels
+
+| Level | Meaning | Clusters |
+| :--- | :--- | :--- |
+| **Supported** | Run live against a real test cluster from one address: nodes, roles, cluster type and health are right. | Patroni, plain streaming replication, repmgr, Stolon, pg_auto_failover, Citus, multi-master (native logical replication), CloudNativePG |
+| **Detected only** | The cluster type is recognised and labelled from catalog evidence, but the plugin was never run against a real cluster of that kind. Monitoring probably works if you list the nodes. | Multi-master through the `pglogical` or `bdr` extensions |
+| **Not supported** | The plugin cannot do it with a plain PostgreSQL login, or it is outside what this plugin is for. | See the list below |
+
+### Not supported
+
+| Cluster or setup | Why |
+| :--- | :--- |
+| AWS RDS and Aurora, Azure Database for PostgreSQL, Google Cloud SQL | Their node lists and failover state live in the cloud provider's API, not in PostgreSQL, and a Multi-AZ standby is usually not reachable by clients. The plugin can label them from catalog roles, but it cannot find or monitor their standbys. |
+| A load balancer, proxy or virtual IP given as a node (HAProxy, PgBouncer, a floating IP) | It is one address that hides the real nodes, so the plugin sees a single node and reports `standalone`. Give the addresses of the real nodes. |
+| Databases that only speak the PostgreSQL protocol (CockroachDB, YugabyteDB and similar) | They do not use PostgreSQL's replication views, so roles, lag and slots cannot be read. |
+| Pacemaker/Corosync (PAF), pgpool-II watchdog, Postgres-XL and other products not listed above | Never tried. A cluster that uses plain streaming replication will probably work by listing its nodes, but nothing has been verified, so it is not claimed. |
+| PostgreSQL versions older than 17, and the Linux agent | The code has separate queries for older versions and a Linux installer, but neither has been run (see "Known Limitations"). |
+
+## Adding Support for a New Cluster Type
+
+Follow these steps in order. A cluster type only moves to **Supported** in the table above after step 7 passes against a real cluster.
+
+1. **Build a test cluster.** Add `testbeds/<name>/docker-compose.yml` (Docker) or a manifest (Kubernetes) that starts the cluster with at least one primary and two standbys. Use the existing beds in `testbeds/` as templates and keep the monitoring user trivial.
+2. **Run the plugin against it first, unchanged.** From inside the bed's network, with one address:
+   `python postgres_cluster.py --nodes <host>:5432:none --username <user> --password <pw> --db postgres`
+   Note what is wrong: missing nodes, wrong roles, wrong `cluster_type`, a false split brain.
+3. **Teach it to recognise the type.** Add the evidence (an extension, a catalog table, a replication slot or application name pattern, an API) to `PostgresNodeClient.collect_evidence`, then add the rule to `detect_cluster_type`. Keep the `type_evidence` text short. Add a fixture for it in `tester/test_cluster_plugin.py`.
+4. **Teach it to find the nodes.** If the cluster stores its member list in a catalog table or an API, add a reader to `_managed_members` (SQL) or write a `discover_via_<name>` function like `discover_via_patroni` and call it from `discover_cluster_members`. If it uses plain streaming replication, the topology walk in `discover_via_sql` already works and nothing needs adding.
+5. **Check the health rules.** `evaluate_cluster_health` assumes one primary. If the cluster legitimately has several (Citus workers, multi-master), add its type there and in the matching check in `_collect_internal`, so it is not reported as split brain.
+6. **Add it to the live test.** Add one line to `BEDS` in `tester/test_discovery_live.py` with the bed's network, seed address, credentials, expected number of nodes, number of primaries and type, then run `python tester/test_discovery_live.py <name>`.
+7. **Run everything.** `python tester/test_cluster_plugin.py`, `.\check-layout.ps1` and `.\tester\e2e.ps1 -Mode full -SkipConsole` must all pass.
+8. **Update this README.** Add the cluster to "Tested Clusters" with exactly what was run, and move it to **Supported** above. If the live test could not be run, list it under **Detected only** or **Not supported**; never as supported.
+
 ## Known Limitations
 
 - Discovery from the replication topology only sees a standby's IP, so the primary's port is assumed for it. Use Patroni or repmgr (exact lists) or list such nodes explicitly if they use another port.
