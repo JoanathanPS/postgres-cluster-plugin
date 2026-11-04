@@ -337,7 +337,7 @@ try {
     Write-Host "  Primary Count:       $($json.'Primary Count')" -ForegroundColor Gray
     Write-Host "  Primary Timeline:    $($json.'Primary Timeline')" -ForegroundColor Gray
     Write-Host "  Max Replay Backlog:  $($json.'Max Replay Backlog') bytes" -ForegroundColor Gray
-    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Physical Slots') physical, $($json.'Logical Slots') logical)" -ForegroundColor Gray
+    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Replication Slots Active') active, $($json.'Replication Slots Inactive') inactive)" -ForegroundColor Gray
     Write-Host "  Cluster Nodes:       $($json.Cluster_Nodes.Count) rows" -ForegroundColor Gray
     Write-Host "  Standbys Detected:   $($json.Replication_Standbys.Count) rows" -ForegroundColor Gray
 } catch {
@@ -362,6 +362,7 @@ Agent Lifecycle:
 3. In Site24x7 Web Console:
    - Navigate to: Plugins -> Plugin Integrations
    - Open monitor: $PluginFolderName
-   - Verify: 6 Dashboard tabs, Cluster_Nodes table, Replication_Standbys table.
+   - Verify: the Summary page and 5 tabs (Cluster, Replication, Node Performance,
+     Transactions and Sessions, WAL and Recovery); Cluster_Info and Cluster_Nodes on the Cluster tab.
 ==================================================================
 "@ -ForegroundColor Green
