@@ -234,6 +234,8 @@ Open a terminal in the plugin folder (the folder that contains `postgres_cluster
 powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "10.0.0.5:5432:8008" -Username "site24x7" -Password "<password>" -Database "postgres"
 ```
 
+The installer finds Python, installs `psycopg2-binary` if it is missing, copies the plugin and config into the agent's plugin folder, runs the plugin once and prints the result. Add `-NonInteractive` to skip all prompts, and `-PluginFolderName <name>` to install under another plugin name.
+
 **Linux**:
 
 ```bash
@@ -290,7 +292,7 @@ Good to know:
    ```bash
    python postgres_cluster.py --nodes 10.0.0.5:5432:8008 --username site24x7 --password '<password>' --db postgres
    ```
-2. **Wait for the agent.** Within about 5 minutes a monitor named `postgres_cluster-<hostname>` appears in the Site24x7 web client under *Plugin Integrations*. Windows agent log: `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\logs\Details\PluginRegisterLog.log` (look for `Register Plugin postgres_cluster`).
+2. **Wait for the agent.** Within about 5 minutes a monitor named `postgres_cluster-<hostname>` appears in the Site24x7 web client under *Plugin Integrations*. The monitor is created after the first poll, and its tables can show empty values until the next poll (up to about 10 minutes after installing). Windows agent log: `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\logs\Details\PluginRegisterLog.log` (look for `Register Plugin postgres_cluster`).
 3. **Open the monitor.** You should see the Summary page and the tabs Cluster, Replication, Node Performance, Transactions and Sessions, and WAL and Recovery. The `Cluster` tab's `Cluster_Info` table states the detected cluster type and which node is the primary.
 
 ### Step 5: set up alerts
@@ -300,6 +302,8 @@ A new plugin monitor has no thresholds, so nothing alerts until you create a pro
 ### Updating or changing the plugin
 
 Site24x7 fixes a monitor's tabs and metric list when it is first registered. If you change `PLUGIN_VERSION` or the set of metrics, install the plugin under a new plugin name (new folder name, `.py` name, `.cfg` name and section name) and delete the old monitor in the web client.
+
+**When you delete a monitor in the web client, also delete its folder from the agent's plugin directory.** If the folder stays, the agent registers the plugin again and the monitor comes back.
 
 ### Troubleshooting
 
