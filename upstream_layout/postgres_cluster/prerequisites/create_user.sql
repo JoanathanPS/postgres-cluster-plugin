@@ -1,64 +1,52 @@
 -- Site24x7 PostgreSQL Cluster Monitoring User Creation Script
 -- Creates a dedicated least-privilege user for PostgreSQL cluster monitoring.
 -- Run this script as a superuser (e.g. 'postgres') on the primary node.
+--
+--   psql -h <primary-host> -U postgres -v mon_user=site24x7 -v mon_pass='your_password' -f create_user.sql
+--
+-- mon_user defaults to 'site24x7' and mon_pass defaults to 'site24x7' if you do not pass them.
+-- Always choose your own password for a real cluster.
 
 \set ON_ERROR_STOP on
 
--- Default monitoring username is 'site24x7'
--- You can override password via: psql -v mon_user=site24x7 -v mon_pass='your_password' -f create_user.sql
+\if :{?mon_user}
+\else
+  \set mon_user site24x7
+\endif
+\if :{?mon_pass}
+\else
+  \set mon_pass site24x7
+\endif
 
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'site24x7') THEN
-        CREATE ROLE site24x7 WITH LOGIN PASSWORD 'site24x7';
-    ELSE
-        ALTER ROLE site24x7 WITH LOGIN;
-    END IF;
-END
-$$;
+-- Create the login role (an existing role keeps its password)
+SELECT format('CREATE ROLE %I WITH LOGIN PASSWORD %L', :'mon_user', :'mon_pass')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mon_user') \gexec
+SELECT format('ALTER ROLE %I WITH LOGIN', :'mon_user') \gexec
 
--- Grant pg_monitor (PostgreSQL 10+) for full read-only monitoring privileges (activity, WAL, archiving)
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
-        EXECUTE 'GRANT pg_monitor TO site24x7';
-    END IF;
-END
-$$;
+-- pg_monitor (PostgreSQL 10+): full read-only monitoring privileges (activity, WAL, archiving)
+SELECT format('GRANT pg_monitor TO %I', :'mon_user')
+ WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') \gexec
 
--- Grant pg_read_all_stats for viewing activity, replication, and bgwriter stats
-GRANT pg_read_all_stats TO site24x7;
+-- pg_read_all_stats: activity, replication and bgwriter statistics
+SELECT format('GRANT pg_read_all_stats TO %I', :'mon_user') \gexec
 
--- Grant pg_read_all_settings for viewing server configuration and settings
-GRANT pg_read_all_settings TO site24x7;
+-- pg_read_all_settings: server configuration and settings
+SELECT format('GRANT pg_read_all_settings TO %I', :'mon_user') \gexec
 
--- Enforce read-only transaction mode and connection limits
-ALTER ROLE site24x7 SET default_transaction_read_only = on;
-ALTER ROLE site24x7 CONNECTION LIMIT 10;
+-- Enforce read-only transactions and a connection limit
+SELECT format('ALTER ROLE %I SET default_transaction_read_only = on', :'mon_user') \gexec
+SELECT format('ALTER ROLE %I CONNECTION LIMIT 10', :'mon_user') \gexec
 
--- Grant execute on WAL inspection functions if present
-DO $$
-BEGIN
-    EXECUTE 'GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO site24x7';
-EXCEPTION WHEN OTHERS THEN
-    NULL;
-END
-$$;
-
-DO $$
-BEGIN
-    EXECUTE 'GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO site24x7';
-EXCEPTION WHEN OTHERS THEN
-    NULL;
-END
-$$;
-
--- Verification queries: assert monitoring user can execute WAL directory functions
-SELECT count(*) AS wal_files_accessible FROM pg_ls_waldir();
-SELECT count(*) AS archive_status_accessible FROM pg_ls_archive_statusdir();
+-- Execute on the WAL directory functions when they exist (pg_ls_archive_statusdir needs PostgreSQL 12+)
+SELECT format('GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO %I', :'mon_user')
+ WHERE EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'pg_ls_waldir') \gexec
+SELECT format('GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO %I', :'mon_user')
+ WHERE EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'pg_ls_archive_statusdir') \gexec
 
 -- OPTIONAL, repmgr clusters only: lets the plugin read the repmgr node list (database "repmgr") for node discovery.
 -- Without it the plugin still finds the nodes by walking the replication topology.
 -- \c repmgr
 -- GRANT USAGE ON SCHEMA repmgr TO site24x7;
 -- GRANT SELECT ON ALL TABLES IN SCHEMA repmgr TO site24x7;
+
+SELECT 'monitoring user ' || :'mon_user' || ' is ready' AS result;

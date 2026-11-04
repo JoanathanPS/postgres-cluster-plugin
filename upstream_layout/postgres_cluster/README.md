@@ -170,27 +170,57 @@ Plugin monitors get no limits by default. Create one profile (Admin > Configurat
 
 ---
 
-## Installation & Configuration
+## Setup Guide
 
-### Automated Installation (From Cloned Repository)
+### What you need
 
-1. **Clone the repository**:
-   ```bash
-   git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git
-   cd postgres-cluster-plugin/upstream_layout/postgres_cluster
-   ```
+- A host with the **Site24x7 server monitoring agent** (Windows or Linux) that can reach the PostgreSQL port of every node of the cluster. The Linux installer is provided but has not been tested by the author; the Windows agent has.
+- **Python 3.6+** and the **psycopg2** module on that host. The Windows installer installs `psycopg2-binary` for you; on Linux run `pip3 install psycopg2-binary`.
+- A **read-only monitoring user** in the cluster (step 1).
+- Patroni clusters only: the **Patroni REST API port** (default `8008`) reachable from the agent. The plugin only reads `/cluster` and `/patroni`.
 
-2. **Run Installer**:
-   - **Linux**:
-     ```bash
-     sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
-     ```
-   - **Windows (PowerShell as Administrator)**:
-     ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_v3" -Nodes "pgnode1=127.0.0.1:5441:8001,pgnode2=127.0.0.1:5442:8002,pgnode3=127.0.0.1:5443:8003" -Username "site24x7" -Password "site24x7" -Database "appdb" -NonInteractive -SkipAdminCheck
-     ```
+### Step 1: create the monitoring user
 
-### Configuration (`postgres_cluster.cfg`)
+Run this once on the **primary**. A user created on the primary of a physical streaming cluster (Patroni, repmgr, Stolon, CloudNativePG, pg_auto_failover, plain streaming) is copied to the standbys automatically. For multi-master or Citus, create it on every node.
+
+```bash
+psql -h <primary-host> -U postgres -v mon_user=site24x7 -v mon_pass='<choose-a-password>' -f prerequisites/create_user.sql
+```
+
+On Linux you can use `bash prerequisites/create_user.sh` instead (it asks for host, admin user and password). The user gets `pg_monitor`, `pg_read_all_stats` and `pg_read_all_settings` and nothing else. Without `pg_monitor` the plugin still runs, but it reports a message such as `permission denied for function pg_ls_waldir` and leaves out those WAL metrics.
+
+repmgr only (optional): the extra grants at the end of `create_user.sql` let the plugin read the repmgr node list.
+
+### Step 2: install the plugin
+
+Open a terminal in the plugin folder (the folder that contains `postgres_cluster.py`).
+
+**Windows** (PowerShell as Administrator):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "10.0.0.5:5432:8008" -Username "site24x7" -Password "<password>" -Database "postgres"
+```
+
+**Linux**:
+
+```bash
+sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
+```
+
+Answer the prompts (nodes, username, password, database, Patroni port). The installer copies the plugin into the agent's plugin folder, writes the config, tests one run and shows the result.
+
+**Manual install** (instead of the installer): create a folder named `postgres_cluster` inside the agent's plugin directory and put `postgres_cluster.py` and `postgres_cluster.cfg` in it.
+
+| OS | Agent plugin directory |
+| :--- | :--- |
+| Windows | `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\` |
+| Linux | `/opt/site24x7/monagent/plugins/` |
+
+The folder name, the `.py` name, the `.cfg` name and the section name inside the `.cfg` must all be exactly `postgres_cluster`. If they differ, the agent creates a second, misnamed monitor.
+
+### Step 3: tell it where the cluster is
+
+Edit `postgres_cluster.cfg` in the plugin folder. **You only need the address of one node**; the plugin finds the others (see "Node Discovery").
 
 ```ini
 [global_configurations]
@@ -198,12 +228,56 @@ use_agent_python=0
 redirect_output=1
 
 [postgres_cluster]
-nodes=pgnode1=127.0.0.1:5441:8001,pgnode2=127.0.0.1:5442:8002,pgnode3=127.0.0.1:5443:8003
+nodes=10.0.0.5:5432:8008
 username=site24x7
-password=site24x7
-db=appdb
+password=<password>
+db=postgres
 patroni_port=8008
 cluster_type=auto
 ```
+
+| Your cluster | What to put in `nodes=` |
+| :--- | :--- |
+| Patroni | `host:5432:8008` (any member; the last number is the Patroni REST port) |
+| repmgr, Stolon, CloudNativePG, plain streaming, multi-master | `host:5432:none` (any node; `none` because there is no Patroni port) |
+| Citus | the coordinator, `host:5432:none` |
+| pg_auto_failover | a data node or the monitor, `host:5432:none` |
+
+Good to know:
+- You may list two or three addresses, comma separated. If the first is down, the next is used. You never need to update the list when nodes are added or removed.
+- You can name a node if you like: `primary1=10.0.0.5:5432:8008`. Names may only use letters and digits.
+- `discover=off` (add it to the config) makes the plugin monitor only the nodes you list.
+- `db` is the database the plugin connects to. Database-scoped numbers (table count, heap and index statistics) describe that database only.
+- `use_agent_python=0` makes the agent use the Python on the machine's PATH. On Windows, restart the **Site24x7 agent service** once after installing, so the agent sees that Python.
+- `redirect_output=1` is required on Windows (see the note below).
+
+### Step 4: check that it works
+
+1. **Run it by hand** from the plugin folder. You should see one line of JSON that contains `"Cluster Health": 0` and the right `"Nodes Up"`:
+   ```bash
+   python postgres_cluster.py --nodes 10.0.0.5:5432:8008 --username site24x7 --password '<password>' --db postgres
+   ```
+2. **Wait for the agent.** Within about 5 minutes a monitor named `postgres_cluster-<hostname>` appears in the Site24x7 web client under *Plugin Integrations*. Windows agent log: `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\logs\Details\PluginRegisterLog.log` (look for `Register Plugin postgres_cluster`).
+3. **Open the monitor.** You should see the Summary page and the tabs Cluster, Replication, Node Performance, Transactions and Sessions, and WAL and Recovery. The `Cluster` tab's `Cluster_Info` table states the detected cluster type and which node is the primary.
+
+### Step 5: set up alerts
+
+A new plugin monitor has no thresholds, so nothing alerts until you create a profile. Use the values in "Recommended Thresholds" above (Admin > Configuration Profiles > Threshold and Availability > Add Threshold Profile > Monitor Type "Plugin Integrations").
+
+### Updating or changing the plugin
+
+Site24x7 fixes a monitor's tabs and metric list when it is first registered. If you change `PLUGIN_VERSION` or the set of metrics, install the plugin under a new plugin name (new folder name, `.py` name, `.cfg` name and section name) and delete the old monitor in the web client.
+
+### Troubleshooting
+
+| What you see | Likely cause and fix |
+| :--- | :--- |
+| No monitor appears after 10 minutes | The agent cannot run Python or psycopg2. Run step 4.1 with the same Python the agent uses. On Windows, restart the agent service. |
+| `password authentication failed` in `msg` | Wrong `username` or `password` in the `.cfg`, or the user was not created (step 1). |
+| A node shows as offline | The agent cannot reach that node's PostgreSQL port. Discovered addresses must be reachable from the agent host; names that only resolve inside Docker or Kubernetes show as offline from outside. |
+| `permission denied for function pg_ls_waldir` | The monitoring user lacks `pg_monitor`. Re-run step 1. |
+| `Cluster Health` is 2 with "No active primary" | No node is currently the primary (failover in progress, or none of the listed addresses is reachable). |
+| A second monitor named `postgres_cluster-<section>` appears | The folder, `.py`, `.cfg` or section names do not match. Make them identical. |
+| Old rows stay in a table after a node is removed | Site24x7 keeps the last row of child tables. Delete and re-add the monitor to clear them. |
 
 > **Note on Windows `redirect_output`**: Setting `redirect_output = 1` in `[global_configurations]` is required on Windows agents. It directs the agent to capture plugin JSON through temporary file redirection instead of anonymous pipes, eliminating pipe buffer deadlock when child table JSON exceeds 4 KB.
