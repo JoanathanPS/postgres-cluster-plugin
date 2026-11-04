@@ -857,6 +857,11 @@ class PostgresNodeClient:
                     r = cur.fetchone()
                     if r and r[0]:
                         evidence["repmgr_table"] = True
+                    else:
+                        # repmgr usually keeps its catalog in its own database named 'repmgr'
+                        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'repmgr';")
+                        if cur.fetchone() and _repmgr_via_database(self.hostname, self.port, self.username, self.password):
+                            evidence["repmgr_table"] = True
                 except Exception:
                     pass
 
@@ -975,6 +980,46 @@ def _conninfo_hostport(conninfo, default_port=5432):
     return (h.group(1) if h else None), int(p.group(1)) if p else default_port
 
 
+def _alias_for(host, app, taken):
+    """Readable alphanumeric name for a node found without an explicit name."""
+    host = str(host)
+    if app and str(app) not in ("walreceiver", "") and safe_name(app):
+        base = safe_name(app)
+    elif re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
+        base = "node" + "".join(host.split(".")[-2:])
+    else:
+        base = safe_name(host.split(".")[0]) or "node"
+    name, k = base, 2
+    while name.lower() in taken:
+        name, k = f"{base}{k}", k + 1
+    taken.add(name.lower())
+    return name
+
+
+def _repmgr_via_database(host, port, user, pw):
+    """repmgr keeps its catalog in a separate database (default name 'repmgr'). Returns its node list."""
+    out = []
+    try:
+        conn = _pg_connect(host, port, user, pw, "repmgr")
+    except Exception:
+        return out
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT node_name, conninfo FROM repmgr.nodes ORDER BY node_id;")
+            for name, conninfo in cur.fetchall():
+                h, p = _conninfo_hostport(conninfo)
+                if h:
+                    out.append({"alias": safe_name(name), "member": str(name), "host": h, "port": p, "patroni_port": "none", "source": "repmgr.nodes"})
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
+
+
 def _managed_members(cur, port):
     """Exact member lists kept in the catalogs of repmgr, Citus and the pg_auto_failover monitor."""
     out = []
@@ -1016,7 +1061,7 @@ def _managed_members(cur, port):
 def discover_via_sql(seeds, user, pw, db, deadline):
     """Walks the replication topology from the seeds. Returns (members, source)."""
     queue = [(h, int(p), None) for h, p in seeds]
-    visited, found = set(), OrderedDict()
+    visited, visited_canon, found = set(), set(), OrderedDict()
     while queue and time.time() < deadline and len(found) < MAX_NODES:
         host, port, app = queue.pop(0)
         key = (_norm_host(host), port)
@@ -1030,11 +1075,26 @@ def discover_via_sql(seeds, user, pw, db, deadline):
         try:
             with conn.cursor() as cur:
                 managed = _managed_members(cur, port)
+                if not managed:
+                    try:
+                        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'repmgr';")
+                        if cur.fetchone():
+                            managed = _repmgr_via_database(host, port, user, pw)
+                    except Exception:
+                        pass
                 if managed:
                     return managed, managed[0]["source"]
-                alias = safe_name(app) if app and app not in ("walreceiver", "") else ""
-                if not alias:
-                    alias = "node" + (safe_name(host)[-6:] if safe_name(host) else str(len(found) + 1))
+                # The same server can be reached by hostname and by IP: identify it by its real address.
+                try:
+                    cur.execute("SELECT host(inet_server_addr()), inet_server_port();")
+                    ra, rp = cur.fetchone()
+                except Exception:
+                    ra, rp = None, None
+                canon = (ra or _norm_host(host), int(rp or port))
+                if canon in visited_canon:
+                    continue
+                visited_canon.add(canon)
+                alias = _alias_for(host, app, {v["alias"].lower() for v in found.values()})
                 found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
                 try:
                     cur.execute("SELECT pg_is_in_recovery();")
@@ -1046,7 +1106,7 @@ def discover_via_sql(seeds, user, pw, db, deadline):
                 except Exception:
                     pass
                 try:
-                    cur.execute("SELECT client_addr::text, application_name FROM pg_stat_replication WHERE client_addr IS NOT NULL;")
+                    cur.execute("SELECT host(client_addr), application_name FROM pg_stat_replication WHERE client_addr IS NOT NULL;")
                     for ca, an in cur.fetchall():
                         queue.append((ca, port, an))
                 except Exception:
@@ -1191,6 +1251,13 @@ class PostgresClusterCollector:
                     node_defs[i] = (mname, h, p, pat, a)
                     known_alias.discard(n.lower())
                     known_alias.add(mname.lower())
+        by_addr = {(_norm_host(m["host"]), int(m["port"])): m["alias"] for m in members if m.get("alias")}
+        for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
+            nm = by_addr.get((_norm_host(h), int(p)))
+            if nm and not a and n.lower() != nm.lower() and nm.lower() not in known_alias:
+                node_defs[i] = (nm, h, p, pat, a)
+                known_alias.discard(n.lower())
+                known_alias.add(nm.lower())
         added = 0
         for m in members:
             key = (_norm_host(m["host"]), int(m["port"]))

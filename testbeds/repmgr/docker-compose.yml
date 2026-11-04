@@ -1,0 +1,20 @@
+# repmgr test bed: 1 primary + 2 standbys, metadata in database "repmgr".
+name: tb-repmgr
+x-node: &node
+  build: .
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U repmgr -d repmgr"]
+    interval: 3s
+    retries: 40
+services:
+  repmgr-node1:
+    <<: *node
+    environment: { NODE_ID: "1", NODE_NAME: repmgr-node1 }
+  repmgr-node2:
+    <<: *node
+    environment: { NODE_ID: "2", NODE_NAME: repmgr-node2, PRIMARY_HOST: repmgr-node1 }
+    depends_on: { repmgr-node1: { condition: service_healthy } }
+  repmgr-node3:
+    <<: *node
+    environment: { NODE_ID: "3", NODE_NAME: repmgr-node3, PRIMARY_HOST: repmgr-node1 }
+    depends_on: { repmgr-node1: { condition: service_healthy } }
