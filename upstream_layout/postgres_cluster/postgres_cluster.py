@@ -33,7 +33,7 @@ CONNECT_TIMEOUT = 2                                                      # Timeo
 STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
 NODE_COLLECT_DEADLINE_S = 15                                             # Maximum seconds allowed for all nodes collection
 
-PLUGIN_VERSION = 12
+PLUGIN_VERSION = 1
 HEARTBEAT = True
 
 # Standard 5-Tab Layout for Site24x7 Console

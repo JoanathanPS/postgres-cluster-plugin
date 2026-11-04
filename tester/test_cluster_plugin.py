@@ -92,8 +92,8 @@ def run_plugin(plugin_py, nodes, user, password, db, patroni_port=None, cluster_
 
 
 def validate_schema(data, rep):
-    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 8,
-              f"plugin_version is integer >= 8 ({data.get('plugin_version')})")
+    rep.check(isinstance(data.get("plugin_version"), int) and data["plugin_version"] >= 1,
+              f"plugin_version is integer >= 1 ({data.get('plugin_version')})")
     rep.check("heartbeat_required" in data and isinstance(data["heartbeat_required"], bool),
               "heartbeat_required is boolean")
     rep.check(data.get("status") in (0, 1), f"status is 0 or 1 ({data.get('status')})")
