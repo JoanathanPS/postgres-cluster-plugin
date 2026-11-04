@@ -1042,6 +1042,12 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         names = [d[0] for d in collector("primary1=10.1.1.1:5432:8008")._apply_discovery(collector("primary1=10.1.1.1:5432:8008")._parse_nodes())]
         rep.check(names == ["primary1", "pg2"], f"Configured alias is kept, same address not duplicated ({names})")
 
+        # A complete explicit list under different addresses/aliases (e.g. a down node cannot report its name) gets no phantom nodes
+        pg_mod.discover_cluster_members = fake([m("x1", "10.9.9.1"), m("x2", "10.9.9.2"), m("x3", "10.9.9.3")])
+        cfg3 = "a=10.1.1.1:5432:8008,b=10.1.1.2:5432:8008,c=10.1.1.3:5432:8008"
+        names = [d[0] for d in collector(cfg3)._apply_discovery(collector(cfg3)._parse_nodes())]
+        rep.check(names == ["a", "b", "c"], f"A complete explicit list gets no phantom nodes ({names})")
+
         # Switch off
         names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]
         rep.check(names == ["a"], f"discover=off monitors only the listed nodes ({names})")

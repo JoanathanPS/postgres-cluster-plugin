@@ -56,3 +56,9 @@ $$;
 -- Verification queries: assert monitoring user can execute WAL directory functions
 SELECT count(*) AS wal_files_accessible FROM pg_ls_waldir();
 SELECT count(*) AS archive_status_accessible FROM pg_ls_archive_statusdir();
+
+-- OPTIONAL, repmgr clusters only: lets the plugin read the repmgr node list (database "repmgr") for node discovery.
+-- Without it the plugin still finds the nodes by walking the replication topology.
+-- \c repmgr
+-- GRANT USAGE ON SCHEMA repmgr TO site24x7;
+-- GRANT SELECT ON ALL TABLES IN SCHEMA repmgr TO site24x7;

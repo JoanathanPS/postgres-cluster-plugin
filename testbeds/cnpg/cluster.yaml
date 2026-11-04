@@ -1,0 +1,10 @@
+# CloudNativePG test bed: 3 instances (1 primary + 2 replicas). Needs a local Kubernetes (kind) with the CNPG operator.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: cnpg-test
+spec:
+  instances: 3
+  enableSuperuserAccess: true
+  storage:
+    size: 1Gi

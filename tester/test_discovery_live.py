@@ -46,8 +46,44 @@ BEDS = [
     ("pg_auto_failover (seed = data node)", "tb-pgaf_default", "tb-pgaf-pgaf-node1-1", "pgaf-node1:5432:none", "docker", lambda: "", "postgres", 2, 1, "pg_auto_failover"),
     ("stolon (seed = keeper)", "tb-stolon_default", "tb-stolon-stolon-keeper1-1", "stolon-keeper1:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 1, "Stolon"),
     ("citus (seed = coordinator)", "tb-citus_default", "tb-citus-citus-coordinator-1", "citus-coordinator:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 3, "Citus"),
-    ("cloudnativepg", "kind", "cnpg-test-control-plane", None, None, None, None, 3, 1, "CloudNative"),
+    ("cloudnativepg", "kind", "cnpg-test-control-plane", "cnpg-test-ro:5432:none", "postgres", lambda: "", "postgres", 3, 1, "CloudNative"),
 ]
+
+
+def run_bed(name, net, seed, user, pw, db):
+    """Runs the plugin once from inside the bed's network and returns its stdout."""
+    if name == "cloudnativepg":
+        return run_in_kubernetes()
+    cmd = ["docker", "run", "--rm", "--network", net, "-v", f"{PLUGIN_DIR}:/p:ro", "python:3.12-slim", "sh", "-c",
+           f"pip install -q psycopg2-binary 2>/dev/null; python /p/postgres_cluster.py --nodes {seed} --username {user} --password '{pw}' --db {db}"]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def run_in_kubernetes():
+    """CloudNativePG: run the plugin as a pod in the kind cluster, seeded with the read-only service (any replica)."""
+    import base64
+    k = ["kubectl", "--context", "kind-cnpg-test"]
+    pw = base64.b64decode(subprocess.run(k + ["get", "secret", "cnpg-test-superuser", "-o", "jsonpath={.data.password}"],
+                                         capture_output=True, text=True).stdout.strip() or b"").decode()
+    cm = subprocess.run(k + ["create", "configmap", "pg-plugin", f"--from-file=postgres_cluster.py={os.path.join(PLUGIN_DIR, 'postgres_cluster.py')}",
+                             "--dry-run=client", "-o", "yaml"], capture_output=True, text=True).stdout
+    subprocess.run(k + ["apply", "-f", "-"], input=cm, capture_output=True, text=True)
+    subprocess.run(k + ["delete", "pod", "plugin-test", "--ignore-not-found", "--wait=true"], capture_output=True, text=True)
+    pod = f"""apiVersion: v1
+kind: Pod
+metadata: {{name: plugin-test}}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: p
+    image: python:3.12-slim
+    command: ["sh", "-c", "pip install -q psycopg2-binary 2>/dev/null; python /p/postgres_cluster.py --nodes cnpg-test-ro:5432:none --username postgres --password '{pw}' --db postgres"]
+    volumeMounts: [{{name: code, mountPath: /p}}]
+  volumes: [{{name: code, configMap: {{name: pg-plugin}}}}]
+"""
+    subprocess.run(k + ["apply", "-f", "-"], input=pod, capture_output=True, text=True)
+    subprocess.run(k + ["wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/plugin-test", "--timeout=240s"], capture_output=True, text=True)
+    return subprocess.run(k + ["logs", "plugin-test"], capture_output=True, text=True).stdout
 
 
 def running(container):
@@ -66,9 +102,7 @@ def main():
             skipped += 1
             continue
         pw = pwf()
-        cmd = ["docker", "run", "--rm", "--network", net, "-v", f"{PLUGIN_DIR}:/p:ro", "python:3.12-slim", "sh", "-c",
-               f"pip install -q psycopg2-binary 2>/dev/null; python /p/postgres_cluster.py --nodes {seed} --username {user} --password '{pw}' --db {db}"]
-        out = subprocess.run(cmd, capture_output=True, text=True).stdout
+        out = run_bed(name, net, seed, user, pw, db)
         line = next((l for l in out.splitlines() if l.startswith("{")), None)
         if not line:
             failures.append(f"{name}: no JSON output")

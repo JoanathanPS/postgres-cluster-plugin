@@ -1129,15 +1129,21 @@ def discover_cluster_members(seeds, user, pw, db, deadline_s):
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(pat_seeds) * 2))
         f_cluster = [(ex.submit(discover_via_patroni, h, pat), h, p) for h, p, pat in pat_seeds]
         f_name = [(ex.submit(_patroni_member_name, h, pat), h, p) for h, p, pat in pat_seeds]
-        concurrent.futures.wait([f for f, _, _ in f_cluster + f_name], timeout=max(0.5, min(2.5, deadline - time.time())))
+        end = time.time() + max(0.5, min(2.5, deadline - time.time()))
+        pending = {f for f, _, _ in f_cluster + f_name}
+        found = []
+        while pending and time.time() < end and not found:
+            _done, pending = concurrent.futures.wait(pending, timeout=max(0.05, end - time.time()), return_when=concurrent.futures.FIRST_COMPLETED)
+            for f, h, p in f_cluster:
+                if f.done() and not f.exception() and f.result()[0]:
+                    found = f.result()[0]
+                    break
+        if found:
+            # short grace so the seeds' own member names can arrive too
+            concurrent.futures.wait([f for f, _, _ in f_name], timeout=0.4)
         for f, h, p in f_name:
             if f.done() and not f.exception() and f.result():
                 seed_names[(_norm_host(h), int(p))] = safe_name(f.result())
-        found = []
-        for f, h, p in f_cluster:
-            if f.done() and not f.exception() and f.result()[0]:
-                found = f.result()[0]
-                break
         ex.shutdown(wait=False, cancel_futures=True)
         if found:
             return found, "Patroni REST API", seed_names
@@ -1258,6 +1264,10 @@ class PostgresClusterCollector:
                 node_defs[i] = (nm, h, p, pat, a)
                 known_alias.discard(n.lower())
                 known_alias.add(nm.lower())
+        if len(node_defs) >= len(members):
+            # Every member is already listed (possibly under another address or alias, e.g. a node that is down
+            # and so cannot report its own name): adding more would only create phantom nodes.
+            return node_defs
         added = 0
         for m in members:
             key = (_norm_host(m["host"]), int(m["port"]))
