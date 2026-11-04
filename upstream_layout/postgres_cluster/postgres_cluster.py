@@ -163,7 +163,6 @@ units = {
         "status": "status"
     },
     "Cluster_Nodes": {
-        "up": "flag",
         "is_primary": "flag",
         "timeline": "timeline",
         "response_time_ms": "ms",
@@ -1107,6 +1106,14 @@ class PostgresClusterCollector:
             if cli.notes:
                 for n in cli.notes:
                     self._add_note(n)
+            # A down node must still emit a status 0 row in every per-node table,
+            # otherwise the console keeps its last (green) row for that node.
+            if not cli.is_up:
+                cli.activity_row = {"name": cli.name, "status": 0}
+                cli.io_row = {"name": cli.name, "status": 0}
+                cli.transactions_row = {"name": cli.name, "status": 0}
+                cli.checkpoints_row = {"name": cli.name, "status": 0}
+                cli.conflicts_row = None
 
         nodes_up = sum(1 for c in clients if c.is_up)
         primary_candidates = [c for c in clients if c.is_up and c.is_primary]
@@ -1305,7 +1312,7 @@ class PostgresClusterCollector:
                             max_slot_lag_bytes = retained
 
                         replication_slots.append({
-                            "name": str(r[0]),
+                            "name": safe_name(str(r[0])) or str(r[0]),
                             "plugin": str(r[1]),
                             "slot_type": str(r[2]),
                             "active": is_act,
