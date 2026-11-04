@@ -1060,15 +1060,29 @@ def discover_via_sql(seeds, user, pw, db, deadline):
 
 
 def discover_cluster_members(seeds, user, pw, db, deadline_s):
-    """seeds: list of (host, pg_port, patroni_port). Returns (members, source)."""
+    """seeds: list of (host, pg_port, patroni_port). Returns (members, source, seed_names).
+    seed_names maps (host, pg_port) of each Patroni seed to its Patroni member alias."""
     deadline = time.time() + deadline_s
-    for host, pg_port, pat in seeds:
-        if pat and str(pat) != "none":
-            members, scope = discover_via_patroni(host, pat)
-            if members:
-                return members, "Patroni REST API"
+    seed_names = {}
+    pat_seeds = [(h, p, pat) for h, p, pat in seeds if pat and str(pat) != "none"]
+    if pat_seeds:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(pat_seeds) * 2))
+        f_cluster = [(ex.submit(discover_via_patroni, h, pat), h, p) for h, p, pat in pat_seeds]
+        f_name = [(ex.submit(_patroni_member_name, h, pat), h, p) for h, p, pat in pat_seeds]
+        concurrent.futures.wait([f for f, _, _ in f_cluster + f_name], timeout=max(0.5, min(2.5, deadline - time.time())))
+        for f, h, p in f_name:
+            if f.done() and not f.exception() and f.result():
+                seed_names[(_norm_host(h), int(p))] = safe_name(f.result())
+        found = []
+        for f, h, p in f_cluster:
+            if f.done() and not f.exception() and f.result()[0]:
+                found = f.result()[0]
+                break
+        ex.shutdown(wait=False, cancel_futures=True)
+        if found:
+            return found, "Patroni REST API", seed_names
     members, source = discover_via_sql([(h, p) for h, p, _ in seeds], user, pw, db, deadline)
-    return members, source
+    return members, source, seed_names
 
 
 def _patroni_member_name(host, patroni_port):
@@ -1152,9 +1166,9 @@ class PostgresClusterCollector:
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             fut = ex.submit(discover_cluster_members, seeds + extra, self.username, self.password, self.db, DISCOVERY_DEADLINE_S)
-            members, source = fut.result(timeout=DISCOVERY_DEADLINE_S + 1)
+            members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S + 1)
         except Exception:
-            members, source = [], ""
+            members, source, seed_names = [], "", {}
         ex.shutdown(wait=False, cancel_futures=True)
         if not members:
             return node_defs
@@ -1169,15 +1183,14 @@ class PostgresClusterCollector:
         # Configured nodes may use their own aliases: also recognise them by their Patroni member name.
         known_member = set()
         for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
-            if pat and str(pat) != "none":
-                mname = _patroni_member_name(h, pat)
-                if mname:
-                    known_member.add(safe_name(mname).lower())
-                    if not a and safe_name(mname):
-                        # An address given without an alias is named after its Patroni member.
-                        node_defs[i] = (safe_name(mname), h, p, pat, a)
-                        known_alias.discard(n.lower())
-                        known_alias.add(safe_name(mname).lower())
+            mname = seed_names.get((_norm_host(h), int(p)))
+            if mname:
+                known_member.add(mname.lower())
+                if not a:
+                    # An address given without an alias is named after its Patroni member.
+                    node_defs[i] = (mname, h, p, pat, a)
+                    known_alias.discard(n.lower())
+                    known_alias.add(mname.lower())
         added = 0
         for m in members:
             key = (_norm_host(m["host"]), int(m["port"]))

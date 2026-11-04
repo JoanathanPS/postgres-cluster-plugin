@@ -959,7 +959,7 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
 
     # Duplicate aliases are made unique
     first = nodes.split(",")[0].split("=", 1)[-1]
-    dup = collect(f"n={first},n={nodes.split(',')[1].split('=', 1)[-1]}")
+    dup = pg_mod.PostgresClusterCollector(nodes_str=f"n={first},n={nodes.split(',')[1].split('=', 1)[-1]}", username=user, password=password, db=db, patroni_port=patroni_port, discover="off").collect()
     names = [r["name"] for r in dup.get("Cluster_Nodes", [])]
     rep.check(len(names) == len(set(names)) == 2, f"Duplicate aliases made unique ({names})")
 
@@ -984,9 +984,9 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
         og_path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "postgres", "postgres.py"))
         spec = importlib.util.spec_from_file_location("og_postgres", og_path)
         og = importlib.util.module_from_spec(spec); spec.loader.exec_module(og)
-        prim = [r for r in healthy["Cluster_Nodes"] if r.get("is_primary") == 1][0]
+        prim_idx = [i for i, r in enumerate(healthy["Cluster_Nodes"]) if r.get("is_primary") == 1][0]
         parsed = pg_mod.PostgresClusterCollector(nodes_str=nodes, username=user, password=password, db=db, patroni_port=patroni_port)._parse_nodes()
-        pd = [p for p in parsed if p[0] == prim["name"]][0]
+        pd = parsed[prim_idx]  # configured nodes keep their order; names may be replaced by Patroni member names
         ogres = og.run({"host": pd[1], "port": str(pd[2]), "username": user, "password": password, "db": db})
         skip = {"plugin_version", "heartbeat_required", "status", "msg", "tabs", "units", "s247config"}
         stable = {"Max Connections", "Database Count", "Table Count", "Server Version", "Heap Blocks Read", "Index Scans", "Index Rows Read", "Index Rows Fetched", "Checkpoints Req"}
@@ -1005,6 +1005,68 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
             rep.check([r['name'] for r in ogres[t]] == [r['name'] for r in healthy[t]], f"{t} rows identical to OG")
     except Exception as e:
         rep.fail(f"OG parity test could not run: {type(e).__name__}: {e}")
+
+
+def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """Node discovery: one address is enough; known nodes are never duplicated; the switch and cap work."""
+    print("\n=== Test: Node Discovery ===")
+    import sys
+    sys.path.insert(0, os.path.dirname(plugin_py))
+    import postgres_cluster as pg_mod
+
+    def collector(n, discover="auto"):
+        return pg_mod.PostgresClusterCollector(nodes_str=n, username=user, password=password, db=db, patroni_port=patroni_port, discover=discover)
+
+    def fake(members):
+        return lambda *a, **k: (members, "Patroni REST API", {})
+
+    real = pg_mod.discover_cluster_members
+    try:
+        base = "a=10.1.1.1:5432:8008"
+        m = lambda alias, host, port=5432: {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "8008", "source": "Patroni REST API"}
+
+        pg_mod.discover_cluster_members = fake([m("a", "10.1.1.1"), m("b", "10.1.1.2"), m("c", "10.1.1.3")])
+        names = [d[0] for d in collector(base)._apply_discovery(collector(base)._parse_nodes())]
+        rep.check(names == ["a", "b", "c"], f"One configured address discovers the other members ({names})")
+
+        # A node added later is picked up without any config change; one removed disappears
+        pg_mod.discover_cluster_members = fake([m("a", "10.1.1.1"), m("b", "10.1.1.2"), m("c", "10.1.1.3"), m("d", "10.1.1.4")])
+        names = [d[0] for d in collector(base)._apply_discovery(collector(base)._parse_nodes())]
+        rep.check(names == ["a", "b", "c", "d"], f"A newly added node is found without editing the config ({names})")
+        pg_mod.discover_cluster_members = fake([m("a", "10.1.1.1"), m("c", "10.1.1.3")])
+        names = [d[0] for d in collector(base)._apply_discovery(collector(base)._parse_nodes())]
+        rep.check(names == ["a", "c"], f"A removed node is no longer listed ({names})")
+
+        # A configured node with a custom alias at the same address is not duplicated
+        pg_mod.discover_cluster_members = fake([m("pg1", "10.1.1.1"), m("pg2", "10.1.1.2")])
+        names = [d[0] for d in collector("primary1=10.1.1.1:5432:8008")._apply_discovery(collector("primary1=10.1.1.1:5432:8008")._parse_nodes())]
+        rep.check(names == ["primary1", "pg2"], f"Configured alias is kept, same address not duplicated ({names})")
+
+        # Switch off
+        names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]
+        rep.check(names == ["a"], f"discover=off monitors only the listed nodes ({names})")
+
+        # Cap at 25 rows
+        pg_mod.discover_cluster_members = fake([m(f"n{i}", f"10.2.0.{i}") for i in range(1, 40)])
+        n = len(collector(base)._apply_discovery(collector(base)._parse_nodes()))
+        rep.check(n == 25, f"Discovered nodes are capped at 25 ({n})")
+
+        # Discovery failure keeps the configured nodes
+        pg_mod.discover_cluster_members = fake([])
+        names = [d[0] for d in collector(base)._apply_discovery(collector(base)._parse_nodes())]
+        rep.check(names == ["a"], f"Failed discovery keeps the configured node ({names})")
+    finally:
+        pg_mod.discover_cluster_members = real
+
+    # Live: Patroni REST discovery from one member
+    try:
+        first = nodes.split(",")[0].split("=", 1)[-1].split(":")
+        if len(first) >= 3:
+            members, scope = pg_mod.discover_via_patroni(first[0], first[2])
+            rep.check(len(members) >= 2 and all(x["alias"] for x in members),
+                      f"Live Patroni /cluster from one member returns the whole cluster ({[x['alias'] for x in members]})")
+    except Exception as e:
+        rep.fail(f"Live Patroni discovery test failed: {type(e).__name__}: {e}")
 
 
 def main():
@@ -1101,6 +1163,7 @@ def main():
 
     # Test: audit regressions and OG parity
     test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep)
+    test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep)
 
     # Test 10: Dynamic Failover Assertion
     if args.failover:
