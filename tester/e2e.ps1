@@ -154,9 +154,9 @@ try {
     # Find current primary
     $currPrimary = "patroni-pg-node1"
     if ($healthyJson -and $healthyJson.Cluster_Nodes) {
-        $pNode = $healthyJson.Cluster_Nodes | Where-Object { $_.role -eq "primary" } | Select-Object -First 1
-        if ($pNode -and $pNode.name -match "5442") { $currPrimary = "patroni-pg-node2" }
-        elseif ($pNode -and $pNode.name -match "5443") { $currPrimary = "patroni-pg-node3" }
+        $pNode = $healthyJson.Cluster_Nodes | Where-Object { $_.role -eq "primary" -or $_.is_primary -eq 1 } | Select-Object -First 1
+        if ($pNode -and ($pNode.name -match "node2" -or $pNode.name -match "5442")) { $currPrimary = "patroni-pg-node2" }
+        elseif ($pNode -and ($pNode.name -match "node3" -or $pNode.name -match "5443")) { $currPrimary = "patroni-pg-node3" }
     }
 
     docker pause $currPrimary 2>$null | Out-Null
@@ -268,8 +268,8 @@ try {
 
         foreach ($c in $targetCycles) {
             $pgMatches = @($c | Where-Object { $_ -match "postgres_cluster" })
-            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh)$" })
-            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh)$" -and $_ -notmatch "postgres_cluster_v1" })
+            $validMatches = @($pgMatches | Where-Object { $_ -match "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)$" })
+            $badMatches = @($pgMatches | Where-Object { $_ -notmatch "RunPluginandWritetoFile\s*::\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)\s*-\s*(postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)$" -and $_ -notmatch "postgres_cluster_v1" })
 
             if ($validMatches.Count -lt 1 -or $badMatches.Count -gt 0) {
                 $singleInstanceOk = $false
@@ -291,7 +291,7 @@ try {
         Assert-Result "Single Instance Verification (postgres_cluster_fresh/dev)" ($singleInstanceOk -and $targetCycles.Count -ge 1) $detailMsg
 
         # Check PythonScript execution
-        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: (postgres_cluster_dev|postgres_cluster_fresh)"
+        $devExecMatches = $recentLogLines | Select-String -Pattern "PythonScript :: output from file  instanceName :: (postgres_cluster_dev|postgres_cluster_fresh|postgres_cluster_final)"
         Assert-Result "Agent Execution Engine (Python)" ($devExecMatches.Count -ge 1) "Confirmed PythonScript execution without timeout"
 
         # Check PluginData write confirmation in log

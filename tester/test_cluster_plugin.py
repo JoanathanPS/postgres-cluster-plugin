@@ -112,18 +112,14 @@ def validate_schema(data, rep):
         rep.check(isinstance(data.get(m), (int, float)), f"Cluster metric '{m}' is numeric type ({type(data.get(m)).__name__})")
 
     # String top-level metrics
+    # String top-level metrics
     allowed_string_metrics = {
-        "Server Version", "Last Archived WAL File", "Cluster Type",
-        "Cluster Type Evidence", "Cluster Name", "Archive Mode",
-        "Cluster Health Reason", "msg"
+        "Last Archived WAL File", "Archive Mode", "msg"
     }
-    for sm in ["Cluster Type", "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Health Reason"]:
+    for sm in ["Archive Mode", "Last Archived WAL File"]:
         if sm in data:
             rep.check(isinstance(data[sm], str), f"Top-level string metric '{sm}' is str ({data.get(sm)})")
-            if sm in ("Cluster Type Evidence", "Cluster Health Reason"):
-                rep.check(len(data[sm]) < 100, f"'{sm}' strictly < 100 chars ({len(data[sm])} chars)")
 
-    rep.check("Cluster Health Reason" in data, f"Cluster Health Reason present ({data.get('Cluster Health Reason')})")
     rep.check("Cluster Health" in data and data.get("Cluster Health") in (0, 1, 2), f"Cluster Health is 0/1/2 ({data.get('Cluster Health')})")
     rep.check("Timeline Mismatch Flag" in data and data.get("Timeline Mismatch Flag") in (0, 1), f"Timeline Mismatch Flag is 0/1 ({data.get('Timeline Mismatch Flag')})")
     rep.check("msg" not in data or data.get("msg") is None, f"msg omitted on healthy run ({data.get('msg')})")
@@ -196,6 +192,19 @@ def validate_schema(data, rep):
 
         rep.check(len(string_cols) <= 5, f"Table '{t_name}' has <= 5 string columns excluding name (found {len(string_cols)}: {string_cols})")
 
+    # Assertions for Cluster_Info
+    rep.check("Cluster_Info" in data and isinstance(data["Cluster_Info"], list), "Cluster_Info table present")
+    if "Cluster_Info" in data:
+        ci_rows = data["Cluster_Info"]
+        rep.check(len(ci_rows) == 1, f"Cluster_Info has exactly 1 row ({len(ci_rows)})")
+        if len(ci_rows) > 0:
+            ci = ci_rows[0]
+            rep.check(ci.get("name") is not None, "Cluster_Info has name key")
+            for sc in ["cluster_type", "type_evidence", "server_version", "primary_node", "health_reason"]:
+                rep.check(isinstance(ci.get(sc), str), f"Cluster_Info column '{sc}' is str ({ci.get(sc)})")
+            for nc in ["nodes_total", "nodes_up", "primary_timeline", "status"]:
+                rep.check(isinstance(ci.get(nc), (int, float)), f"Cluster_Info column '{nc}' is numeric ({ci.get(nc)})")
+
     # Assertions for Cluster_Nodes
     rep.check("Cluster_Nodes" in data and isinstance(data["Cluster_Nodes"], list), "Cluster_Nodes table present")
     if "Cluster_Nodes" in data:
@@ -204,7 +213,6 @@ def validate_schema(data, rep):
         prim_count = 0
         for r in cn_rows:
             rep.check(r.get("status") in (0, 1), f"Cluster_Nodes row status in {{0, 1}} ({r.get('status')})")
-            rep.check(r.get("up") in (0, 1), f"Cluster_Nodes row up in {{0, 1}} ({r.get('up')})")
             rep.check(r.get("is_primary") in (0, 1), f"Cluster_Nodes row is_primary in {{0, 1}} ({r.get('is_primary')})")
             rep.check(isinstance(r.get("timeline"), int), f"Cluster_Nodes row timeline is int ({r.get('timeline')})")
             rep.check(isinstance(r.get("response_time_ms"), (int, float)), f"Cluster_Nodes row response_time_ms is float/int ({r.get('response_time_ms')})")
@@ -212,7 +220,6 @@ def validate_schema(data, rep):
             rep.check(isinstance(r.get("role"), str), f"Cluster_Nodes row role is str ({r.get('role')})")
             rep.check(isinstance(r.get("patroni_state"), str), f"Cluster_Nodes row patroni_state is str ({r.get('patroni_state')})")
             rep.check(isinstance(r.get("upstream"), str), f"Cluster_Nodes row upstream is str ({r.get('upstream')})")
-            rep.check(isinstance(r.get("is_cascading"), int), f"Cluster_Nodes row is_cascading is int ({r.get('is_cascading')})")
             if r.get("is_primary") == 1:
                 prim_count += 1
                 rep.check("replay_backlog_bytes" not in r, "Primary row omits replay_backlog_bytes")
@@ -246,7 +253,7 @@ def validate_schema(data, rep):
 
     # Assertions for 10 Child Tables
     expected_10_tables = [
-        "Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Standby_Conflicts",
+        "Cluster_Info", "Cluster_Nodes", "Replication_Standbys", "Replication_Slots",
         "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Node_Activity",
         "Node_Transactions", "Tranasctions_and_Session_per_Database"
     ]
@@ -256,23 +263,24 @@ def validate_schema(data, rep):
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
-    for tbl_unit in ["Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Standby_Conflicts", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
+    for tbl_unit in ["Cluster_Info", "Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
         rep.check(tbl_unit in units and isinstance(units[tbl_unit], dict), f"units contains nested dict '{tbl_unit}'")
 
-    # Tabs verification: strictly 4 tabs
+    # Tabs verification: strictly 5 tabs
     tabs = data.get("tabs", {})
-    expected_tab_names = ["Cluster", "Replication", "Node Performance", "Transactions and Sessions"]
-    rep.check(len(tabs) == 4, f"Exactly 4 tabs defined in plugin tabs metadata (found {len(tabs)}: {list(tabs.keys())})")
+    expected_tab_names = ["Cluster", "Replication", "Node Performance", "Transactions and Sessions", "WAL and Recovery"]
+    tab_keys = list(tabs.keys())
+    rep.check(len(tabs) == 5, f"Exactly 5 tabs defined in plugin tabs metadata (found {len(tabs)}: {tab_keys})")
     for et in expected_tab_names:
         rep.check(et in tabs, f"Tab '{et}' present in tabs definition")
 
     cl_tablist = tabs.get("Cluster", {}).get("tablist", [])
+    rep.check("Cluster_Info" in cl_tablist, "Cluster_Info present in Cluster tab tablist")
     rep.check("Cluster_Nodes" in cl_tablist, "Cluster_Nodes present in Cluster tab tablist")
 
     rep_tablist = tabs.get("Replication", {}).get("tablist", [])
     rep.check("Replication_Standbys" in rep_tablist, "Replication_Standbys present in Replication tab tablist")
     rep.check("Replication_Slots" in rep_tablist, "Replication_Slots present in Replication tab tablist")
-    rep.check("Standby_Conflicts" in rep_tablist, "Standby_Conflicts present in Replication tab tablist")
 
     perf_tablist = tabs.get("Node Performance", {}).get("tablist", [])
     rep.check("Node_IO" in perf_tablist, "Node_IO present in Node Performance tab tablist")
@@ -284,14 +292,29 @@ def validate_schema(data, rep):
     rep.check("Node_Transactions" in tx_tablist, "Node_Transactions present in Transactions and Sessions tab tablist")
     rep.check("Tranasctions_and_Session_per_Database" in tx_tablist, "Tranasctions_and_Session_per_Database present in Transactions and Sessions tab tablist")
 
+    wal_tablist = tabs.get("WAL and Recovery", {}).get("tablist", [])
+    rep.check("WAL Write Position" in wal_tablist, "WAL Write Position in WAL and Recovery tab tablist")
+
+    # Assert exactly 16 untabbed Summary metrics
+    all_tabbed = set()
+    for t_def in tabs.values():
+        all_tabbed.update(t_def.get("tablist", []))
+    collector_ignored = {"tabs", "units", "s247config", "plugin_version", "heartbeat_required", "status", "msg"}
+    untabbed = [k for k, v in data.items() if k not in all_tabbed and k not in collector_ignored and not isinstance(v, (list, dict))]
+    expected_untabbed = sorted([
+        "Active Connections", "Active Queries", "Active Waiting Queries",
+        "Cache Hit Ratio", "Cluster Health", "Database Count", "Heap Blocks Hit",
+        "Heap Blocks Read", "Index Rows Fetched", "Index Rows Read", "Index Scans",
+        "Locks Count", "Max Connections", "Nodes Up", "Table Count", "Uptime"
+    ])
+    rep.check(sorted(untabbed) == expected_untabbed, f"Exactly 16 untabbed metrics match OG+Summary spec (found {len(untabbed)}: {sorted(untabbed)})")
+
     # Childdiscovery in s247config: strictly per-DB tables
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
     rep.check("Cluster_Nodes" not in childdiscovery, "Cluster_Nodes removed from s247config.childdiscovery")
     rep.check("Replication_Standbys" not in childdiscovery, "Replication_Standbys removed from s247config.childdiscovery")
     rep.check("Stats_per_DB" in childdiscovery, "Stats_per_DB present in s247config.childdiscovery")
     rep.check("Tranasctions_and_Session_per_Database" in childdiscovery, "Tranasctions_and_Session_per_Database present in s247config.childdiscovery")
-
-
 def test_coverage_map_assertion(data, rep):
     """
     Validates that every single mapped item from PR #442 and standalone postgres.py
@@ -309,7 +332,8 @@ def test_coverage_map_assertion(data, rep):
     rep.check(len(cov) >= 90, f"Coverage map contains comprehensive mappings ({len(cov)} entries)")
 
     unmapped = []
-    is_pg17 = "PostgreSQL 17" in str(data.get("Server Version", "")) or "17." in str(data.get("Server Version", ""))
+    server_ver_str = str(data.get("Server Version", "")) or str(((data.get("Cluster_Info") or [{}])[0]).get("server_version", ""))
+    is_pg17 = "PostgreSQL 17" in server_ver_str or "17." in server_ver_str
 
     for entry in cov:
         old_item = entry.get("old_item")
@@ -661,6 +685,42 @@ def test_deadline_behavior(plugin_py, nodes, user, password, db, patroni_port, r
         time.sleep(2)
 
 
+
+def test_type_consistency(plugin_py, nodes, user, password, db, patroni_port, rep):
+    """
+    Asserts consistent JSON data types across healthy, single node down, and dead cluster states.
+    """
+    print("\n=== Test: JSON Type Consistency Across States ===")
+    import sys
+    sys.path.insert(0, os.path.dirname(plugin_py))
+    import postgres_cluster as pg_mod
+
+    # 1. Healthy cluster
+    p1 = pg_mod.PostgresClusterCollector(nodes_str=nodes, username=user, password=password, db=db, patroni_port=patroni_port)
+    d1 = p1.collect()
+
+    # 2. Node down
+    bad_nodes = nodes.replace('5443', '5499')
+    p2 = pg_mod.PostgresClusterCollector(nodes_str=bad_nodes, username=user, password=password, db=db, patroni_port=patroni_port)
+    d2 = p2.collect()
+
+    # 3. Dead cluster
+    dead_nodes = 'pgnode1=127.0.0.1:5491:8001,pgnode2=127.0.0.1:5492:8002,pgnode3=127.0.0.1:5493:8003'
+    p3 = pg_mod.PostgresClusterCollector(nodes_str=dead_nodes, username=user, password=password, db=db, patroni_port=patroni_port)
+    d3 = p3.collect()
+
+    keys1 = {k: type(v) for k, v in d1.items() if not isinstance(v, (list, dict)) and k not in ('msg',)}
+    keys2 = {k: type(v) for k, v in d2.items() if not isinstance(v, (list, dict)) and k not in ('msg',)}
+    keys3 = {k: type(v) for k, v in d3.items() if not isinstance(v, (list, dict)) and k not in ('msg',)}
+
+    for k, t1 in keys1.items():
+        if k in keys2:
+            rep.check(t1 == keys2[k], f"Type consistency (node down) for '{k}': expected {t1.__name__}, got {keys2[k].__name__}")
+        if k in keys3:
+            rep.check(t1 == keys3[k], f"Type consistency (dead cluster) for '{k}': expected {t1.__name__}, got {keys3[k].__name__}")
+
+    rep.check(d3.get('Last Archived WAL File') == 'none', f"Last Archived WAL File defaults to 'none' on dead cluster ({d3.get('Last Archived WAL File')})")
+
 def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep):
     print("\n=== Dynamic Failover Assertion ===")
     containers = ["patroni-pg-node1", "patroni-pg-node2", "patroni-pg-node3"]
@@ -953,6 +1013,9 @@ def main():
 
     # Test 9: Unexpected Exception Injection Handling
     test_exception_injection(plugin_py, nodes, user, password, db, patroni_port, rep)
+
+    # Test: JSON Type Consistency
+    test_type_consistency(plugin_py, nodes, user, password, db, patroni_port, rep)
 
     # Test 10: Dynamic Failover Assertion
     if args.failover:

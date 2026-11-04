@@ -418,7 +418,8 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             "Cluster",
             "Replication",
             "Node Performance",
-            "Transactions and Sessions"
+            "Transactions and Sessions",
+            "WAL and Recovery"
         ]
 
         # Gather visible tabs on tab bar (case and exact label preservation)
@@ -544,16 +545,13 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
 
                 if tab_name == "Cluster":
                     has_nodes = "cluster_nodes" in content_lower
-                    node_rows = page.locator("tr:has-text('5441'), tr:has-text('5442'), tr:has-text('5443')").all()
-                    if len(node_rows) == 0:
-                        c_widget = page.locator("text='Cluster_Nodes list'").locator("xpath=ancestor::div[contains(@class, 'widget') or contains(@class, 'box') or contains(@class, 'panel')][1]")
-                        if c_widget.count() > 0:
-                            node_rows = c_widget.locator("tbody tr, tr").all()
+                    # Target table rows containing pgnode
+                    node_rows = [r for r in page.locator("tr").all() if "pgnode" in r.inner_text()]
 
                     row_count = len(node_rows)
                     primary_rows = [
                         r for r in node_rows 
-                        if "primary" in r.inner_text().lower() or "is_primary: 1" in r.inner_text().lower()
+                        if "primary" in r.inner_text().lower()
                     ]
                     primary_count = len(primary_rows)
                     nodes_ok = (has_nodes and row_count >= 3 and primary_count == 1)

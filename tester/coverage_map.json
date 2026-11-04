@@ -4,24 +4,24 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Connections",
-    "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Active Queries",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Queries",
-    "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Active Waiting Queries",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Active Waiting Queries",
-    "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Buffers Alloc",
@@ -52,8 +52,8 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Cache Hit Ratio",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Checkpoint Sync Time",
@@ -92,64 +92,64 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Database Count",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Heap Blocks Hit",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Heap Blocks Hit",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Heap Blocks Read",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Heap Blocks Read",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Index Rows Fetched",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Rows Fetched",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Index Rows Read",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Rows Read",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Index Scans",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Index Scans",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Locks Count",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Locks Count",
-    "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Max Connections",
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Max Connections",
-    "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Maxwritten Clean",
@@ -162,10 +162,11 @@
   {
     "old_item": "Server Version",
     "source": "standalone_postgres",
-    "type": "metric",
-    "v2_item": "Server Version",
+    "type": "column",
+    "v2_item": "server_version",
     "tab": "Cluster",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "notes": "Emitted as Cluster_Info table column (string) to prevent untabbed metric pollution and maintain clean 5 custom tabs",
+    "v2_table": "Cluster_Info"
   },
   {
     "old_item": "Stats_per_DB",
@@ -180,8 +181,8 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Table Count",
-    "tab": "Node Performance",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Total Block Hits",
@@ -324,16 +325,16 @@
     "source": "standalone_postgres",
     "type": "metric",
     "v2_item": "Uptime",
-    "tab": "Cluster",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Active Connections",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Active Connections",
-    "tab": "Transactions and Sessions",
-    "notes": "Same metric name"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Active Replication Slots",
@@ -348,7 +349,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Ready Files Count",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Retained and always emitted"
   },
   {
@@ -356,7 +357,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Status Failed",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Retained and always emitted"
   },
   {
@@ -364,7 +365,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Archive Status Success",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Retained and always emitted"
   },
   {
@@ -443,10 +444,11 @@
   {
     "old_item": "Cluster Name",
     "source": "pr442",
-    "type": "metric",
-    "v2_item": "Cluster Name",
+    "type": "column",
+    "v2_item": "name",
     "tab": "Cluster",
-    "notes": "Top-level cluster identifier / Patroni scope"
+    "notes": "Emitted as Cluster_Info table name/primary key",
+    "v2_table": "Cluster_Info"
   },
   {
     "old_item": "Cluster Nodes",
@@ -469,40 +471,40 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Buffer Pin",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Conflicts Deadlock",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Deadlock",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Conflicts Lock",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Lock",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Conflicts Snapshot",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Snapshot",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Conflicts Tablespace",
     "source": "pr442",
     "type": "metric",
     "v2_item": "Conflicts Tablespace",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Connection Utilization Percent",
@@ -517,7 +519,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Write Position",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Converted to MB numeric position"
   },
   {
@@ -551,7 +553,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Last Archived WAL File",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Emitted when archiving enabled"
   },
   {
@@ -559,7 +561,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Flush Position",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Represents primary WAL flush / standby receive equivalent position"
   },
   {
@@ -584,8 +586,8 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Max Connections",
-    "tab": "Transactions and Sessions",
-    "notes": "Same metric name"
+    "tab": "Summary (untabbed)",
+    "notes": "Untabbed metric automatically charted on Site24x7 Summary page"
   },
   {
     "old_item": "Maxwritten Clean",
@@ -609,7 +611,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Oldest Running Transaction Age",
-    "tab": "Replication",
+    "tab": "Transactions and Sessions",
     "notes": "Same metric name"
   },
   {
@@ -624,10 +626,11 @@
   {
     "old_item": "PostgreSQL Version",
     "source": "pr442",
-    "type": "metric",
-    "v2_item": "Server Version",
+    "type": "column",
+    "v2_item": "server_version",
     "tab": "Cluster",
-    "notes": "Renamed to official standard"
+    "notes": "Emitted as Cluster_Info table column (string) to prevent untabbed metric pollution and maintain clean 5 custom tabs",
+    "v2_table": "Cluster_Info"
   },
   {
     "old_item": "Receive Apply Lag",
@@ -642,8 +645,8 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "Recovery Conflicts Total",
-    "tab": "Replication",
-    "notes": "Same metric name"
+    "tab": "WAL and Recovery",
+    "notes": "Flat conflict metric as sum across standbys (Standby_Conflicts table removed to keep total tables <= 10)"
   },
   {
     "old_item": "Replay Lag",
@@ -700,7 +703,7 @@
     "type": "metric",
     "v2_item": "Server PID",
     "tab": "Cluster",
-    "notes": "needs TL approval (preserved on Transactions and Sessions tab)"
+    "notes": "needs TL approval (preserved on Cluster tab for parity)"
   },
   {
     "old_item": "Server Uptime",
@@ -748,7 +751,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Files Count",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Count of 16MB WAL segment files in pg_wal"
   },
   {
@@ -756,7 +759,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Flush Position",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Durably committed WAL position in MB"
   },
   {
@@ -764,7 +767,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Insert Position",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Buffered WAL insert position in MB"
   },
   {
@@ -780,7 +783,7 @@
     "source": "pr442",
     "type": "metric",
     "v2_item": "WAL Total Size",
-    "tab": "Replication",
+    "tab": "WAL and Recovery",
     "notes": "Disk size of WAL directory in MB"
   },
   {

@@ -13,10 +13,14 @@ import sys
 import json
 import time
 import copy
+import re
 import urllib.request
 import urllib.error
 import concurrent.futures
 from collections import OrderedDict
+
+def safe_name(raw):
+    return re.sub(r'[^A-Za-z0-9]', '', str(raw))
 
 # Default cluster configuration
 NODES = '127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003'  # host:port or alias=host:port:patroni_port
@@ -29,128 +33,39 @@ CONNECT_TIMEOUT = 2                                                      # Timeo
 STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
 NODE_COLLECT_DEADLINE_S = 15                                             # Maximum seconds allowed for all nodes collection
 
-PLUGIN_VERSION = 11
+PLUGIN_VERSION = 12
 HEARTBEAT = True
 
-# Standard 4-Tab Layout for Site24x7 Console
+# Standard 5-Tab Layout for Site24x7 Console
 tabs = {
     "tabs": {
-        "Cluster": {
-            "order": "1",
-            "tablist": [
-                "Cluster Type",
-                "Cluster Health",
-                "Cluster Health Reason",
-                "Cluster Name",
-                "Cluster Type Evidence",
-                "Nodes Total",
-                "Nodes Up",
-                "Primary Count",
-                "No Primary Flag",
-                "Split Brain Flag",
-                "Primary Timeline",
-                "Timeline Mismatch Flag",
-                "Cluster_Nodes"
-            ]
-        },
-        "Replication": {
-            "order": "2",
-            "tablist": [
-                "Standbys Expected",
-                "Standbys Streaming",
-                "Standby Disconnect Flag",
-                "Sync Standby Count",
-                "Cascading Standby Count",
-                "Max Replay Backlog",
-                "Max Replay Delay",
-                "Replication Slots Total",
-                "Replication Slots Active",
-                "Replication Slots Inactive",
-                "Max Slot Lag Bytes",
-                "Logical Replication In Use",
-                "WAL Write Position",
-                "WAL Insert Position",
-                "WAL Flush Position",
-                "WAL Files Count",
-                "WAL Total Size",
-                "Archive Mode",
-                "Archive Status Success",
-                "Archive Status Failed",
-                "Archive Ready Files Count",
-                "Last Archived WAL File",
-                "Recovery Conflicts Total",
-                "Conflicts Tablespace",
-                "Conflicts Lock",
-                "Conflicts Snapshot",
-                "Conflicts Buffer Pin",
-                "Conflicts Deadlock",
-                "Oldest Running Transaction Age",
-                "Replication_Standbys",
-                "Replication_Slots",
-                "Standby_Conflicts"
-            ]
-        },
-        "Node Performance": {
-            "order": "3",
-            "tablist": [
-                "Total Rows Inserted",
-                "Total Rows Updated",
-                "Total Rows Deleted",
-                "Total Rows Fetched",
-                "Total Rows Returned",
-                "Total Block Reads",
-                "Total Block Hits",
-                "Heap Blocks Read",
-                "Heap Blocks Hit",
-                "Cache Hit Ratio",
-                "Index Scans",
-                "Index Rows Read",
-                "Index Rows Fetched",
-                "Checkpoints Timed",
-                "Checkpoints Req",
-                "Checkpoint Write Time",
-                "Checkpoint Sync Time",
-                "Buffers Checkpoint",
-                "Buffers Clean",
-                "Maxwritten Clean",
-                "Buffers Backend",
-                "Buffers Backend Fsync",
-                "Buffers Alloc",
-                "Dead Tuples",
-                "Node_IO",
-                "Node_Checkpoints",
-                "Stats_per_DB"
-            ]
-        },
-        "Transactions and Sessions": {
-            "order": "4",
-            "tablist": [
-                "Active Connections",
-                "Max Connections",
-                "Connection Utilization Percent",
-                "Active Queries",
-                "Active Waiting Queries",
-                "Locks Count",
-                "Oldest Transaction ID Age",
-                "Total Commits",
-                "Total Rollbacks",
-                "Total Conflicts",
-                "Transactions Open",
-                "Transactions Idle In Transaction",
-                "Total Sessions",
-                "Total Sessions Abandoned",
-                "Total Sessions Fatal",
-                "Total Sessions Killed",
-                "Uptime",
-                "Table Count",
-                "Database Count",
-                "Server Version",
-                "Server PID",
-                "Node_Activity",
-                "Node_Transactions",
-                "Tranasctions_and_Session_per_Database"
-            ]
-        }
+        "Cluster": {"order": "1", "tablist": [
+            "Cluster_Info", "Cluster_Nodes", "Nodes Total", "Primary Count", "Primary Timeline",
+            "No Primary Flag", "Split Brain Flag", "Timeline Mismatch Flag", "Server PID"]},
+        "Replication": {"order": "2", "tablist": [
+            "Replication_Standbys", "Replication_Slots", "Standbys Expected", "Standbys Streaming",
+            "Standby Disconnect Flag", "Sync Standby Count", "Cascading Standby Count",
+            "Max Replay Backlog", "Max Replay Delay", "Replication Slots Total",
+            "Replication Slots Active", "Replication Slots Inactive", "Max Slot Lag Bytes",
+            "Logical Replication In Use"]},
+        "Node Performance": {"order": "3", "tablist": [
+            "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Total Rows Inserted", "Total Rows Updated",
+            "Total Rows Deleted", "Total Rows Fetched", "Total Rows Returned", "Total Block Reads",
+            "Total Block Hits", "Checkpoints Timed", "Checkpoints Req", "Checkpoint Write Time",
+            "Checkpoint Sync Time", "Buffers Checkpoint", "Buffers Clean", "Maxwritten Clean",
+            "Buffers Backend", "Buffers Backend Fsync", "Buffers Alloc", "Dead Tuples"]},
+        "Transactions and Sessions": {"order": "4", "tablist": [
+            "Node_Activity", "Node_Transactions", "Tranasctions_and_Session_per_Database",
+            "Total Commits", "Total Rollbacks", "Total Conflicts", "Total Sessions",
+            "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed",
+            "Transactions Open", "Transactions Idle In Transaction", "Connection Utilization Percent",
+            "Oldest Transaction ID Age", "Oldest Running Transaction Age"]},
+        "WAL and Recovery": {"order": "5", "tablist": [
+            "WAL Write Position", "WAL Insert Position", "WAL Flush Position", "WAL Files Count",
+            "WAL Total Size", "Archive Mode", "Archive Status Success", "Archive Status Failed",
+            "Archive Ready Files Count", "Last Archived WAL File", "Recovery Conflicts Total",
+            "Conflicts Tablespace", "Conflicts Lock", "Conflicts Snapshot", "Conflicts Buffer Pin",
+            "Conflicts Deadlock"]}
     }
 }
 units = {
@@ -241,6 +156,12 @@ units = {
     "Database Count": "databases",
 
     # Nested Table Units
+    "Cluster_Info": {
+        "nodes_total": "nodes",
+        "nodes_up": "nodes",
+        "primary_timeline": "timeline",
+        "status": "status"
+    },
     "Cluster_Nodes": {
         "up": "flag",
         "is_primary": "flag",
@@ -262,15 +183,6 @@ units = {
     "Replication_Slots": {
         "active": "flag",
         "wal_retained_bytes": "bytes",
-        "status": "status"
-    },
-    "Standby_Conflicts": {
-        "confl_tablespace": "conflicts",
-        "confl_lock": "conflicts",
-        "confl_snapshot": "conflicts",
-        "confl_bufferpin": "conflicts",
-        "confl_deadlock": "conflicts",
-        "total_conflicts": "conflicts",
         "status": "status"
     },
     "Node_IO": {
@@ -417,29 +329,6 @@ def evaluate_cluster_health(
     return 0, f"Cluster healthy: {nodes_up}/{nodes_total} nodes active, {primary_count} primary, {standbys_streaming} standbys streaming"
 
 
-def coerce_metric_value(val_name, raw_val):
-    """Site24x7 value coercion: strings stay strings, numerics become int or float."""
-    if raw_val is None:
-        return None
-    str_val = str(raw_val).strip()
-
-    if val_name in (
-        "Server Version", "Last Archived WAL File", "Cluster Type",
-        "Cluster Type Evidence", "Cluster Name", "Archive Mode", "Cluster Health Reason"
-    ):
-        return str_val
-
-    try:
-        if "." in str_val:
-            return round(float(str_val), 4)
-        return int(str_val)
-    except (ValueError, TypeError):
-        try:
-            return float(str_val)
-        except (ValueError, TypeError):
-            return str_val
-
-
 def detect_cluster_type(evidence):
     """
     Pure evidence-based cluster type detection supporting all major architectures.
@@ -580,6 +469,7 @@ class PostgresNodeClient:
         self.is_up = False
         self.patroni_state = "N/A"
         self.patroni_info = None
+        self.patroni_member = None
         self.notes = []
 
         # Per-node lag & connection counts
@@ -618,15 +508,6 @@ class PostgresNodeClient:
             cur.execute("SHOW server_version;")
             self.server_version_str = cur.fetchone()[0]
 
-            if not self.has_explicit_alias and self.name.startswith(("127.0.0.1", "localhost", "D127")):
-                try:
-                    cur.execute("SELECT current_setting('cluster_name', true);")
-                    row = cur.fetchone()
-                    if row and row[0] and row[0].strip():
-                        self.name = row[0].strip()
-                except Exception:
-                    pass
-
     def close(self):
         if self.conn:
             try:
@@ -654,9 +535,9 @@ class PostgresNodeClient:
                         "timeline": data.get("timeline")
                     }
                     self.patroni_state = data.get("state", "N/A")
-                    patroni_member_name = data.get("patroni", {}).get("name")
-                    if patroni_member_name and not self.has_explicit_alias:
-                        self.name = str(patroni_member_name).strip()
+                    member = data.get("patroni", {}).get("name")
+                    if member:
+                        self.patroni_member = str(member).strip()
         except Exception:
             self.patroni_state = "N/A"
 
@@ -738,17 +619,6 @@ class PostgresNodeClient:
                         else:
                             self.replay_backlog_bytes = 0
                             self.replay_delay_s = 0.0
-
-                        if not self.has_explicit_alias and self.name.startswith(("127.0.0.1", "localhost", "D127")):
-                            try:
-                                cur.execute("SELECT slot_name FROM pg_stat_wal_receiver WHERE slot_name IS NOT NULL LIMIT 1;")
-                                r_slot = cur.fetchone()
-                                if r_slot and r_slot[0]:
-                                    clean_slot = r_slot[0].replace('_', '-')
-                                    if clean_slot:
-                                        self.name = clean_slot
-                            except Exception:
-                                pass
                     except Exception as e:
                         self.notes.append(f"Standby lag query error on {self.name}: {e}")
 
@@ -1082,7 +952,7 @@ class PostgresClusterCollector:
             else:
                 h, p, pat = parts[0], 5432, self.patroni_port
 
-            display_name = alias if alias else f"{h}:{p}"
+            display_name = safe_name(alias) if alias else f"node{len(parsed) + 1}"
             parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
 
@@ -1108,6 +978,108 @@ class PostgresClusterCollector:
             return results
 
     def _collect_internal(self, results):
+        # Enforce strict type consistency across all scenarios (healthy, node down, no primary)
+        default_metrics = {
+            # Summary (16)
+            "Active Connections": 0,
+            "Active Queries": 0,
+            "Active Waiting Queries": 0,
+            "Cache Hit Ratio": 0.0,
+            "Database Count": 0,
+            "Heap Blocks Hit": 0,
+            "Heap Blocks Read": 0,
+            "Index Rows Fetched": 0,
+            "Index Rows Read": 0,
+            "Index Scans": 0,
+            "Locks Count": 0,
+            "Max Connections": 0,
+            "Table Count": 0,
+            "Uptime": 0,
+            "Cluster Health": 0,
+            "Nodes Up": 0,
+
+            # Tab 1: Cluster (7)
+            "Nodes Total": 0,
+            "Primary Count": 0,
+            "Primary Timeline": 0,
+            "No Primary Flag": 0,
+            "Split Brain Flag": 0,
+            "Timeline Mismatch Flag": 0,
+            "Server PID": 0,
+
+            # Tab 2: Replication (12)
+            "Standbys Expected": 0,
+            "Standbys Streaming": 0,
+            "Standby Disconnect Flag": 0,
+            "Sync Standby Count": 0,
+            "Cascading Standby Count": 0,
+            "Max Replay Backlog": 0,
+            "Max Replay Delay": 0.0,
+            "Replication Slots Total": 0,
+            "Replication Slots Active": 0,
+            "Replication Slots Inactive": 0,
+            "Max Slot Lag Bytes": 0,
+            "Logical Replication In Use": 0,
+
+            # Tab 3: Node Performance (18)
+            "Total Block Hits": 0,
+            "Total Block Reads": 0,
+            "Total Rows Inserted": 0,
+            "Total Rows Updated": 0,
+            "Total Rows Deleted": 0,
+            "Total Rows Fetched": 0,
+            "Total Rows Returned": 0,
+            "Buffers Alloc": 0,
+            "Buffers Checkpoint": 0,
+            "Buffers Clean": 0,
+            "Buffers Backend": 0,
+            "Buffers Backend Fsync": 0,
+            "Checkpoint Sync Time": 0,
+            "Checkpoint Write Time": 0,
+            "Checkpoints Req": 0,
+            "Checkpoints Timed": 0,
+            "Maxwritten Clean": 0,
+            "Dead Tuples": 0,
+
+            # Tab 4: Transactions and Sessions (12)
+            "Total Commits": 0,
+            "Total Rollbacks": 0,
+            "Total Conflicts": 0,
+            "Total Sessions": 0,
+            "Total Sessions Abandoned": 0,
+            "Total Sessions Fatal": 0,
+            "Total Sessions Killed": 0,
+            "Transactions Idle In Transaction": 0,
+            "Transactions Open": 0,
+            "Connection Utilization Percent": 0.0,
+            "Oldest Transaction ID Age": 0,
+            "Oldest Running Transaction Age": 0,
+
+            # Tab 5: WAL and Recovery (16)
+            "WAL Write Position": 0.0,
+            "WAL Insert Position": 0.0,
+            "WAL Flush Position": 0.0,
+            "WAL Files Count": 0,
+            "WAL Total Size": 0.0,
+            "Archive Mode": "off",
+            "Archive Status Success": 0,
+            "Archive Status Failed": 0,
+            "Archive Ready Files Count": 0,
+            "Last Archived WAL File": "none",
+            "Recovery Conflicts Total": 0,
+            "Conflicts Tablespace": 0,
+            "Conflicts Lock": 0,
+            "Conflicts Snapshot": 0,
+            "Conflicts Buffer Pin": 0,
+            "Conflicts Deadlock": 0,
+
+            # Childdiscovery tables defaults
+            "Stats_per_DB": [],
+            "Tranasctions_and_Session_per_Database": []
+        }
+        results.update(default_metrics)
+        server_version_str = "unknown"
+
         node_defs = self._parse_nodes()
         nodes_total = len(node_defs)
         if nodes_total == 0:
@@ -1121,30 +1093,20 @@ class PostgresClusterCollector:
         for dname, h, p, pat, has_alias in node_defs:
             clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat, has_explicit_alias=has_alias))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, nodes_total)) as executor:
-            future_to_client = {executor.submit(cli.collect_full): cli for cli in clients}
-            done, not_done = concurrent.futures.wait(future_to_client.keys(), timeout=NODE_COLLECT_DEADLINE_S)
-            for fut in not_done:
-                cli = future_to_client[fut]
-                cli.is_up = False
-                cli.notes.append(f"Node probe timed out after {NODE_COLLECT_DEADLINE_S}s")
-                self._add_note(f"Node {cli.name} exceeded collection deadline ({NODE_COLLECT_DEADLINE_S}s)")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, nodes_total))
+        future_to_client = {executor.submit(cli.collect_full): cli for cli in clients}
+        done, not_done = concurrent.futures.wait(future_to_client.keys(), timeout=NODE_COLLECT_DEADLINE_S)
+        executor.shutdown(wait=False, cancel_futures=True)
+        for fut in not_done:
+            cli = future_to_client[fut]
+            cli.is_up = False
+            cli.notes.append(f"Node probe timed out after {NODE_COLLECT_DEADLINE_S}s")
+            self._add_note(f"Node {cli.name} exceeded collection deadline ({NODE_COLLECT_DEADLINE_S}s)")
 
         for cli in clients:
             if cli.notes:
                 for n in cli.notes:
                     self._add_note(n)
-            # Sync discovered readable name to per-node child table rows
-            if cli.activity_row:
-                cli.activity_row["name"] = cli.name
-            if cli.io_row:
-                cli.io_row["name"] = cli.name
-            if cli.transactions_row:
-                cli.transactions_row["name"] = cli.name
-            if cli.checkpoints_row:
-                cli.checkpoints_row["name"] = cli.name
-            if cli.conflicts_row:
-                cli.conflicts_row["name"] = cli.name
 
         nodes_up = sum(1 for c in clients if c.is_up)
         primary_candidates = [c for c in clients if c.is_up and c.is_primary]
@@ -1220,10 +1182,6 @@ class PostgresClusterCollector:
         if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower:
             split_brain_flag = 0
 
-        results["Cluster Type"] = detected_type
-        results["Cluster Type Evidence"] = detected_evidence[:99]
-        results["Cluster Name"] = patroni_scope_discovered or "postgres_cluster"
-
         # Build Cluster_Nodes child table
         cluster_nodes = []
         for c in clients:
@@ -1231,22 +1189,21 @@ class PostgresClusterCollector:
             if c.is_up:
                 role_str = "primary" if c.is_primary else "standby"
 
+            upstream_val = str(c.upstream if c.upstream else "none")
+            if c.is_cascading and "cascading" not in upstream_val.lower():
+                upstream_val = f"{upstream_val} (cascading)" if upstream_val != "none" else "cascading"
+
             node_row = {
                 "name": c.name,
                 "role": role_str,
-                "cluster_type": detected_type,
-                "patroni_state": c.patroni_state,
-                "upstream": c.upstream,
-                "is_cascading": int(c.is_cascading),
-                "up": 1 if c.is_up else 0,
                 "is_primary": 1 if (c.is_up and c.is_primary) else 0,
-                "response_time_ms": c.response_time_ms,
-                "status": 1 if c.is_up else 0
+                "status": 1 if c.is_up else 0,
+                "timeline": int(c.timeline) if c.timeline is not None else 0,
+                "connections": int(c.connections) if c.connections is not None else 0,
+                "response_time_ms": float(c.response_time_ms),
+                "upstream": upstream_val,
+                "patroni_state": str(c.patroni_state if c.patroni_state else "none")
             }
-            if c.timeline is not None:
-                node_row["timeline"] = int(c.timeline)
-            if c.connections is not None:
-                node_row["connections"] = int(c.connections)
             if c.is_up and not c.is_primary:
                 if c.replay_backlog_bytes is not None:
                     node_row["replay_backlog_bytes"] = max(0, int(c.replay_backlog_bytes))
@@ -1272,6 +1229,8 @@ class PostgresClusterCollector:
         slots_active = 0
         slots_inactive = 0
         max_slot_lag_bytes = 0
+
+        member_to_name = {c.patroni_member: c.name for c in clients if c.patroni_member}
 
         if active_primary and active_primary.conn:
             # 1. Replication standbys
@@ -1304,21 +1263,13 @@ class PostgresClusterCollector:
 
                         app_name = str(r[0] or "").strip()
                         client_ip = str(r[1] or "").strip()
-                        standby_name = app_name
-                        if not standby_name or standby_name in ('unknown', 'none', 'walreceiver', ''):
-                            for c in clients:
-                                if client_ip and (c.hostname in client_ip or c.raw_host in client_ip or client_ip.startswith(c.raw_host)):
-                                    standby_name = c.name
-                                    break
-                        if not standby_name or standby_name == 'unknown':
-                            standby_name = client_ip or "standby"
+                        standby_name = member_to_name.get(app_name) or safe_name(app_name) or "standby"
 
                         replication_standbys.append({
                             "name": standby_name,
                             "client_addr": client_ip,
                             "state": str(r[2]),
                             "sync_state": str(r[3]),
-                            "role": "standby",
                             "replay_lag_bytes": rep_lag_bytes,
                             "write_lag_bytes": w_lag_bytes,
                             "flush_lag_bytes": f_lag_bytes,
@@ -1373,7 +1324,7 @@ class PostgresClusterCollector:
             except Exception as e:
                 self._add_note(f"Server PID query: {e}")
 
-            results["Server Version"] = active_primary.server_version_str
+            server_version_str = active_primary.server_version_str
 
             # 4. Standalone queries execution
             major_v = int(active_primary.server_version_num % 1000000 / 10000)
@@ -1595,7 +1546,7 @@ class PostgresClusterCollector:
                     if r and r[0] is not None:
                         results["Archive Status Success"] = int(r[0] or 0)
                         results["Archive Status Failed"] = int(r[1] or 0)
-                        results["Last Archived WAL File"] = str(r[2] or "0")
+                        results["Last Archived WAL File"] = str(r[2]) if r[2] else "none"
             except Exception as e:
                 self._add_note(f"pg_stat_archiver: {e}")
 
@@ -1734,7 +1685,6 @@ class PostgresClusterCollector:
             cluster_type=detected_type
         )
         results["Cluster Health"] = int(health_code)
-        results["Cluster Health Reason"] = str(health_reason)[:99]
 
         results["Nodes Total"] = int(nodes_total)
         results["Nodes Up"] = int(nodes_up)
@@ -1758,10 +1708,21 @@ class PostgresClusterCollector:
         results["Max Slot Lag Bytes"] = int(max_slot_lag_bytes)
 
         # Tabular Data (Enforce Site24x7 25-row limit)
+        results["Cluster_Info"] = [{
+            "name": str(patroni_scope_discovered or "postgres-cluster"),
+            "cluster_type": str(detected_type)[:99],
+            "type_evidence": str(detected_evidence)[:99],
+            "server_version": str(server_version_str)[:99],
+            "primary_node": active_primary.name if active_primary else "none",
+            "health_reason": str(health_reason)[:99],
+            "nodes_total": int(nodes_total),
+            "nodes_up": int(nodes_up),
+            "primary_timeline": int(primary_timeline),
+            "status": 1 if nodes_up else 0,
+        }]
         results["Cluster_Nodes"] = cluster_nodes[:25]
         results["Replication_Standbys"] = replication_standbys[:25]
         results["Replication_Slots"] = replication_slots[:25]
-        results["Standby_Conflicts"] = standby_conflicts_table[:25]
         results["Node_IO"] = node_io_table[:25]
         results["Node_Checkpoints"] = node_checkpoints_table[:25]
         results["Node_Activity"] = node_activity_table[:25]
@@ -1774,13 +1735,6 @@ class PostgresClusterCollector:
                 "Stats_per_DB"
             ]
         }
-
-        # Assert total tables stay at or under 10
-        active_tables = [
-            k for k, v in results.items()
-            if isinstance(v, list) and k not in ("tabs", "units", "s247config")
-        ]
-        assert len(active_tables) <= 10, f"Table limit exceeded: {len(active_tables)} tables present: {active_tables}"
 
         # Apply tabs and nested units
         results.update(copy.deepcopy(tabs))
