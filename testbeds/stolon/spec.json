@@ -1,0 +1,1 @@
+{"initMode": "new", "synchronousReplication": false, "pgParameters": {"max_replication_slots": "10"}}

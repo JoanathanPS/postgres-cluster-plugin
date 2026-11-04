@@ -1,0 +1,20 @@
+# pg_auto_failover test bed (PostgreSQL 11 demo image): 1 monitor + 2 data nodes. Trust auth, test only.
+name: tb-pgaf
+x-pgaf: &pgaf
+  image: citusdata/pg_auto_failover:latest
+  environment: { PG_AUTOCTL_DEBUG: "0" }
+services:
+  monitor:
+    <<: *pgaf
+    hostname: monitor
+    command: pg_autoctl create monitor --pgdata /tmp/pgaf/monitor --pgport 5432 --hostname monitor --auth trust --ssl-self-signed --run
+  pgaf-node1:
+    <<: *pgaf
+    hostname: pgaf-node1
+    command: sh -c "sleep 15 && pg_autoctl create postgres --pgdata /tmp/pgaf/node --pgport 5432 --hostname pgaf-node1 --dbname postgres --auth trust --ssl-self-signed --pg-hba-lan --monitor 'postgres://autoctl_node@monitor:5432/pg_auto_failover?sslmode=require' --run"
+    depends_on: [monitor]
+  pgaf-node2:
+    <<: *pgaf
+    hostname: pgaf-node2
+    command: sh -c "sleep 45 && pg_autoctl create postgres --pgdata /tmp/pgaf/node --pgport 5432 --hostname pgaf-node2 --dbname postgres --auth trust --ssl-self-signed --pg-hba-lan --monitor 'postgres://autoctl_node@monitor:5432/pg_auto_failover?sslmode=require' --run"
+    depends_on: [monitor]

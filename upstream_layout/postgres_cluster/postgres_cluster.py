@@ -1040,7 +1040,7 @@ def _managed_members(cur, port):
         if cur.fetchone():
             cur.execute("SELECT nodename, nodeport, noderole FROM pg_dist_node WHERE isactive ORDER BY nodeid;")
             for i, (h, p, role) in enumerate(cur.fetchall(), 1):
-                out.append({"alias": safe_name(f"{role}{i}"), "member": f"{role}{i}", "host": str(h), "port": int(p), "patroni_port": "none", "source": "Citus pg_dist_node"})
+                out.append({"alias": safe_name(str(h).split(".")[0]) or safe_name(f"{role}{i}"), "member": f"{role}{i}", "host": str(h), "port": int(p), "patroni_port": "none", "source": "Citus pg_dist_node"})
             if out:
                 return out
     except Exception:

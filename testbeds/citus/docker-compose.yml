@@ -1,0 +1,9 @@
+# Citus test bed: 1 coordinator + 2 workers (each worker is its own primary).
+name: tb-citus
+x-citus: &citus
+  image: citusdata/citus:12.1
+  environment: { POSTGRES_PASSWORD: pgpass, POSTGRES_HOST_AUTH_METHOD: trust }
+services:
+  citus-coordinator: { <<: *citus, hostname: citus-coordinator }
+  citus-worker1: { <<: *citus, hostname: citus-worker1 }
+  citus-worker2: { <<: *citus, hostname: citus-worker2 }

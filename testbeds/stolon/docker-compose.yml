@@ -1,0 +1,32 @@
+﻿# Stolon test bed: etcd store, 1 sentinel, 3 keepers (1 master + 2 standbys), 1 proxy.
+name: tb-stolon
+x-stolon: &stolon
+  image: sorintlab/stolon:master-pg15
+  tmpfs: ["/data:mode=1777"]
+  environment: &env
+    STOLONCTL_CLUSTER_NAME: stolon-cluster
+    STOLONCTL_STORE_BACKEND: etcdv3
+    STOLONCTL_STORE_ENDPOINTS: http://etcd:2379
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    command: etcd --name etcd --data-dir /etcd-data --advertise-client-urls http://etcd:2379 --listen-client-urls http://0.0.0.0:2379
+  stolon-sentinel:
+    <<: *stolon
+    command: gosu stolon stolon-sentinel --cluster-name stolon-cluster --store-backend etcdv3 --store-endpoints http://etcd:2379 --initial-cluster-spec /spec.json
+    volumes: ["./spec.json:/spec.json:ro"]
+    depends_on: [etcd]
+  stolon-keeper1: &keeper
+    <<: *stolon
+    command: gosu stolon stolon-keeper --cluster-name stolon-cluster --store-backend etcdv3 --store-endpoints http://etcd:2379 --uid keeper1 --data-dir /data/keeper1 --pg-su-username postgres --pg-su-password pgpass --pg-repl-username repluser --pg-repl-password replpass --pg-listen-address stolon-keeper1
+    depends_on: [etcd]
+  stolon-keeper2:
+    <<: *keeper
+    command: gosu stolon stolon-keeper --cluster-name stolon-cluster --store-backend etcdv3 --store-endpoints http://etcd:2379 --uid keeper2 --data-dir /data/keeper2 --pg-su-username postgres --pg-su-password pgpass --pg-repl-username repluser --pg-repl-password replpass --pg-listen-address stolon-keeper2
+  stolon-keeper3:
+    <<: *keeper
+    command: gosu stolon stolon-keeper --cluster-name stolon-cluster --store-backend etcdv3 --store-endpoints http://etcd:2379 --uid keeper3 --data-dir /data/keeper3 --pg-su-username postgres --pg-su-password pgpass --pg-repl-username repluser --pg-repl-password replpass --pg-listen-address stolon-keeper3
+  stolon-proxy:
+    <<: *stolon
+    command: gosu stolon stolon-proxy --cluster-name stolon-cluster --store-backend etcdv3 --store-endpoints http://etcd:2379 --listen-address 0.0.0.0
+    depends_on: [etcd]
