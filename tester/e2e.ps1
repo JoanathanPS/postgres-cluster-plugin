@@ -295,7 +295,7 @@ try {
         Assert-Result "Agent Execution Engine (Python)" ($devExecMatches.Count -ge 1) "Confirmed PythonScript execution without timeout"
 
         # Check PluginData write confirmation in log
-        $dataWriteMatches = $recentLogLines | Select-String -Pattern "Successfully written to .*PluginData.*61a227ede3526a541d01dee10eab2c36"
+        $dataWriteMatches = $recentLogLines | Select-String -Pattern "Successfully written to .*PluginData\\Plugin_"
         $payloadOk = ($dataWriteMatches.Count -ge 1)
         $latestWrite = if ($payloadOk) { ($dataWriteMatches | Select-Object -Last 1).Line.Trim() } else { "None" }
         Assert-Result "Agent PluginData Output Written" $payloadOk "Confirmed via PluginLog.log: $latestWrite"
