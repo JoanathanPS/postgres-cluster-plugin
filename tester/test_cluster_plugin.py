@@ -1051,14 +1051,6 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         names = [d[0] for d in collector(cfg3)._apply_discovery(collector(cfg3)._parse_nodes())]
         rep.check(names == ["a", "b", "c"], f"A complete explicit list gets no phantom nodes ({names})")
 
-        # address_map translates Docker/NAT addresses to reachable ones, so a one-address config reaches every node
-        pg_mod.discover_cluster_members = fake([{"alias": "n1", "member": "n1", "host": "pg-n1", "port": 5432, "patroni_port": "8008", "source": "Patroni REST API"},
-                                                {"alias": "n2", "member": "n2", "host": "pg-n2", "port": 5432, "patroni_port": "8008", "source": "Patroni REST API"}])
-        amap = "pg-n1:5432=127.0.0.1:6001:9001,pg-n2:5432=127.0.0.1:6002:9002"
-        cm = pg_mod.PostgresClusterCollector(nodes_str="127.0.0.1:6001:9001", username=user, password=password, db=db, patroni_port=patroni_port, address_map=amap)
-        nd = cm._apply_discovery(cm._parse_nodes())
-        rep.check([(d[1], int(d[2])) for d in nd] == [("127.0.0.1", 6001), ("127.0.0.1", 6002)], f"address_map makes discovered nodes reachable and does not duplicate the seed ({[(d[0], d[1], d[2]) for d in nd]})")
-
         # Switch off
         names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]
         rep.check(names == ["a"], f"discover=off monitors only the listed nodes ({names})")

@@ -125,8 +125,6 @@ db=postgres
 
 `host:port:patroni_port` is the format of each address (use `none` as the Patroni port for non-Patroni clusters). Several addresses can be given, comma separated; if the first is down the next is used. A discovered node that is already configured (same address, same alias, or same Patroni member name) is not added twice.
 
-If the addresses a cluster reports are not reachable from the agent (Docker, NAT or port forwarding, for example Patroni reporting `pg-node2:5432`), translate them with `address_map=found_host:found_port=reachable_host:port[:patroni_port],...`. This is a lab setting: in a normal network the reported addresses are reachable and no map is needed. Without a map, unreachable nodes are shown as offline.
-
 ## Tested Clusters
 
 "Live" means the plugin ran inside the bed's Docker or Kubernetes network with a single seed address (`tester/test_discovery_live.py`). The test beds are in `testbeds/`.

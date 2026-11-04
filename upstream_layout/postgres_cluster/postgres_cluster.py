@@ -30,7 +30,6 @@ DB = 'postgres'                                                          # Datab
 PATRONI_PORT = '8008'                                                    # Optional Patroni REST API port or mapping
 CLUSTER_TYPE = 'auto'                                                    # 'auto' or explicit override
 DISCOVER = 'auto'                                                        # 'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes
-ADDRESS_MAP = ''                                                         # optional: 'found_host:found_port=reachable_host:port[:patroni_port],...' for NAT/Docker/port-forward labs
 DISCOVERY_DEADLINE_S = 4                                                 # Max seconds spent discovering cluster members
 MAX_NODES = 25                                                           # Site24x7 allows at most 25 rows per table
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
@@ -1163,7 +1162,7 @@ class PostgresClusterCollector:
     Main collector coordinating concurrent node probes, cluster-level metrics,
     per-node tables, cluster type detection, and Site24x7 JSON packaging.
     """
-    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP):
+    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER):
         self.nodes_str = nodes_str
         self.username = username
         self.password = password
@@ -1171,7 +1170,6 @@ class PostgresClusterCollector:
         self.patroni_port = patroni_port
         self.cluster_type_override = cluster_type
         self.discover = discover
-        self.address_map = self._parse_address_map(address_map)
         self.discovery_added = 0
         self.discovery_source = ""
         self.msg_notes = []
@@ -1213,22 +1211,6 @@ class PostgresClusterCollector:
                 self._add_note(f"Duplicate node alias {base_name} renamed to {display_name}")
             parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
-
-    @staticmethod
-    def _parse_address_map(raw):
-        """'pg-node1:5432=127.0.0.1:5441:8001,...' -> {('pg-node1', 5432): ('127.0.0.1', 5441, '8001')}"""
-        out = {}
-        for entry in str(raw or "").split(","):
-            if "=" not in entry:
-                continue
-            left, right = entry.strip().split("=", 1)
-            try:
-                lh, lp = left.strip().rsplit(":", 1)
-                parts = right.strip().split(":")
-                out[(lh.lower(), int(lp))] = (parts[0], int(parts[1]), parts[2] if len(parts) > 2 else None)
-            except (ValueError, IndexError):
-                continue
-        return out
 
     def _cache_path(self, seeds):
         import hashlib, tempfile
@@ -1275,13 +1257,6 @@ class PostgresClusterCollector:
                     node_defs[i] = (mname, h, p, pat, a)
                     known_alias.discard(n.lower())
                     known_alias.add(mname.lower())
-        if self.address_map:
-            for m in members:
-                tgt = self.address_map.get((str(m["host"]).lower(), int(m["port"])))
-                if tgt:
-                    m["host"], m["port"] = tgt[0], tgt[1]
-                    if tgt[2]:
-                        m["patroni_port"] = tgt[2]
         by_addr = {(_norm_host(m["host"]), int(m["port"])): m["alias"] for m in members if m.get("alias")}
         for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
             nm = by_addr.get((_norm_host(h), int(p)))
@@ -2024,9 +1999,8 @@ def run(param):
         patroni_port = param.get("patroni_port") if param and param.get("patroni_port") else PATRONI_PORT
         cluster_type = param.get("cluster_type") if param and param.get("cluster_type") else CLUSTER_TYPE
         discover = param.get("discover") if param and param.get("discover") else DISCOVER
-        address_map = param.get("address_map") if param and param.get("address_map") else ADDRESS_MAP
 
-        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover, address_map)
+        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover)
         return collector.collect()
     except Exception as e:
         return {
@@ -2047,7 +2021,6 @@ if __name__ == '__main__':
     parser.add_argument('--patroni_port', help='Patroni REST API port', default=PATRONI_PORT)
     parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=CLUSTER_TYPE)
     parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=DISCOVER)
-    parser.add_argument('--address_map', help="Translate discovered addresses: 'found_host:found_port=reachable_host:port[:patroni_port],...' (NAT, Docker, port-forward labs)", default=ADDRESS_MAP)
     args = parser.parse_args()
 
     param = {
@@ -2057,8 +2030,7 @@ if __name__ == '__main__':
         "db": args.db,
         "patroni_port": args.patroni_port,
         "cluster_type": args.cluster_type,
-        "discover": args.discover,
-        "address_map": args.address_map
+        "discover": args.discover
     }
 
     try:
