@@ -22,12 +22,13 @@ from collections import OrderedDict
 def safe_name(raw):
     return re.sub(r'[^A-Za-z0-9]', '', str(raw))
 
-# Default cluster configuration
-NODES = '127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003'  # host:port or alias=host:port:patroni_port
-USERNAME = 'site24x7'                                                    # Monitoring username
-PASSWORD = 'site24x7'                                                    # Monitoring password
-DB = 'postgres'                                                          # Database name to connect to
-PATRONI_PORT = '8008'                                                    # Optional Patroni REST API port or mapping
+# There are NO built-in defaults for the cluster, login or database: they must come from postgres_cluster.cfg
+# (or the command line). A missing required setting is reported in the monitor's message and the monitor stays Down.
+NODES = ''                                                               # required: host:port[:patroni_port], or alias=host:port[:patroni_port], comma separated
+USERNAME = ''                                                            # required: monitoring user
+PASSWORD = ''                                                            # monitoring password (may be empty only if the server trusts the user)
+DB = ''                                                                  # required: database to connect to
+PATRONI_PORT = ''                                                        # Patroni REST API port; leave empty if the cluster is not Patroni
 CLUSTER_TYPE = 'auto'                                                    # 'auto' or explicit override
 DISCOVER = 'auto'                                                        # 'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes
 DISCOVERY_DEADLINE_S = 4                                                 # Max seconds spent discovering cluster members
@@ -1157,6 +1158,14 @@ def _patroni_member_name(host, patroni_port):
 
 
 
+def _evidence_with_discovery(evidence, nodes_total, added, source):
+    """Appends how many nodes were listed in the config and how many discovery found, within 99 characters."""
+    suffix = f" | {int(nodes_total) - int(added)} listed, {int(added)} found"
+    if added and source:
+        suffix += f" via {str(source)[:24]}"
+    return (str(evidence)[:max(0, 99 - len(suffix))] + suffix)[:99]
+
+
 class PostgresClusterCollector:
     """
     Main collector coordinating concurrent node probes, cluster-level metrics,
@@ -1200,7 +1209,9 @@ class PostgresClusterCollector:
             elif len(parts) == 2:
                 h, p, pat = parts[0], parts[1], self.patroni_port
             else:
-                h, p, pat = parts[0], 5432, self.patroni_port
+                # A port is required: there is no assumed default port
+                self._add_note(f"Node '{entry}' has no port; write it as host:port (ignored)")
+                continue
 
             display_name = safe_name(alias) if alias else f"node{len(parsed) + 1}"
             base_name, dup = display_name, 2
@@ -1954,7 +1965,7 @@ class PostgresClusterCollector:
         results["Cluster_Info"] = [{
             "name": safe_name(str(patroni_scope_discovered or "postgrescluster")) or "cluster",
             "cluster_type": str(detected_type)[:99],
-            "type_evidence": (str(detected_evidence)[:58] + f" | {self.discovery_added} node(s) found via {self.discovery_source}")[:99] if self.discovery_added else str(detected_evidence)[:99],
+            "type_evidence": _evidence_with_discovery(detected_evidence, nodes_total, self.discovery_added, self.discovery_source),
             "server_version": str(server_version_str)[:99],
             "primary_node": active_primary.name if active_primary else "none",
             "health_reason": str(health_reason)[:99],
@@ -1992,13 +2003,23 @@ class PostgresClusterCollector:
 def run(param):
     """Site24x7 agent Python plugin entrypoint."""
     try:
-        nodes = param.get("nodes") if param and param.get("nodes") is not None else NODES
-        username = param.get("username") if param and param.get("username") else USERNAME
-        password = param.get("password") if param and param.get("password") else PASSWORD
-        db = param.get("db") if param and param.get("db") else DB
-        patroni_port = param.get("patroni_port") if param and param.get("patroni_port") else PATRONI_PORT
-        cluster_type = param.get("cluster_type") if param and param.get("cluster_type") else CLUSTER_TYPE
-        discover = param.get("discover") if param and param.get("discover") else DISCOVER
+        param = param or {}
+        nodes = str(param.get("nodes") or "").strip()
+        username = str(param.get("username") or "").strip()
+        password = str(param.get("password") or "")
+        db = str(param.get("db") or "").strip()
+        patroni_port = str(param.get("patroni_port") or "").strip()
+        cluster_type = param.get("cluster_type") or CLUSTER_TYPE
+        discover = param.get("discover") or DISCOVER
+
+        missing = [k for k, v in (("nodes", nodes), ("username", username), ("db", db)) if not v]
+        if missing:
+            return {
+                "plugin_version": PLUGIN_VERSION,
+                "heartbeat_required": HEARTBEAT,
+                "status": 0,
+                "msg": "Missing required setting(s): " + ", ".join(missing) + ". Set them in postgres_cluster.cfg."
+            }
 
         collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover)
         return collector.collect()
@@ -2014,11 +2035,11 @@ def run(param):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Site24x7 PostgreSQL Cluster Plugin")
-    parser.add_argument('--nodes', help='Comma-separated nodes (host:port, name=host:port, or host:port:patroni_port)', default=NODES)
-    parser.add_argument('--username', help='PostgreSQL username', default=USERNAME)
+    parser.add_argument('--nodes', help='Required. Comma-separated nodes (host:port, name=host:port, or host:port:patroni_port)', default=NODES)
+    parser.add_argument('--username', help='Required. PostgreSQL monitoring username', default=USERNAME)
     parser.add_argument('--password', help='PostgreSQL password', default=PASSWORD)
-    parser.add_argument('--db', help='Database name', default=DB)
-    parser.add_argument('--patroni_port', help='Patroni REST API port', default=PATRONI_PORT)
+    parser.add_argument('--db', help='Required. Database name', default=DB)
+    parser.add_argument('--patroni_port', help='Patroni REST API port (empty if not Patroni)', default=PATRONI_PORT)
     parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=CLUSTER_TYPE)
     parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=DISCOVER)
     args = parser.parse_args()

@@ -968,7 +968,10 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
 
     # Empty nodes: explicit failure, not a silent fallback
     empty = pg_mod.run({"nodes": "", "username": user, "password": password, "db": db, "patroni_port": patroni_port})
-    rep.check(empty.get("status") == 0 and "No nodes" in str(empty.get("msg")), f"Empty nodes gives status 0 with message ({empty.get('msg')})")
+    rep.check(empty.get("status") == 0 and "Missing required" in str(empty.get("msg")), f"Empty nodes gives status 0 with message ({empty.get('msg')})")
+    none_cfg = pg_mod.run({})
+    rep.check(none_cfg.get("status") == 0 and "nodes" in str(none_cfg.get("msg")) and "username" in str(none_cfg.get("msg")) and "db" in str(none_cfg.get("msg")),
+              f"No built-in fallback: missing nodes, username and db are reported ({none_cfg.get('msg')})")
 
     # Cluster type classification
     base = dict(extensions=[], repmgr_table=False, managed_roles=[], aurora_version=False, slot_names=[], slot_types=[],
