@@ -950,7 +950,10 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
     rep.check(bool(_re.fullmatch(r"[A-Za-z0-9]+", str(ci.get("name", "")))), f"Cluster_Info name alphanumeric ({ci.get('name')})")
 
     # Down node must still emit a status 0 row in every per-node table
-    down = collect(nodes.replace("5443", "5499"))
+    # take down a STANDBY (whichever node is a standby right now), not a fixed port
+    sb_idx = [i for i, r in enumerate(healthy["Cluster_Nodes"]) if r.get("is_primary") != 1][0]
+    sb_port = str(pg_mod.PostgresClusterCollector(nodes_str=nodes, username=user, password=password, db=db, patroni_port=patroni_port)._parse_nodes()[sb_idx][2])
+    down = collect(nodes.replace(sb_port, "5499", 1))
     for t in ("Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions", "Cluster_Nodes"):
         rows = down.get(t, [])
         zero_rows = [r for r in rows if r.get("status") == 0]
@@ -1047,6 +1050,14 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         cfg3 = "a=10.1.1.1:5432:8008,b=10.1.1.2:5432:8008,c=10.1.1.3:5432:8008"
         names = [d[0] for d in collector(cfg3)._apply_discovery(collector(cfg3)._parse_nodes())]
         rep.check(names == ["a", "b", "c"], f"A complete explicit list gets no phantom nodes ({names})")
+
+        # address_map translates Docker/NAT addresses to reachable ones, so a one-address config reaches every node
+        pg_mod.discover_cluster_members = fake([{"alias": "n1", "member": "n1", "host": "pg-n1", "port": 5432, "patroni_port": "8008", "source": "Patroni REST API"},
+                                                {"alias": "n2", "member": "n2", "host": "pg-n2", "port": 5432, "patroni_port": "8008", "source": "Patroni REST API"}])
+        amap = "pg-n1:5432=127.0.0.1:6001:9001,pg-n2:5432=127.0.0.1:6002:9002"
+        cm = pg_mod.PostgresClusterCollector(nodes_str="127.0.0.1:6001:9001", username=user, password=password, db=db, patroni_port=patroni_port, address_map=amap)
+        nd = cm._apply_discovery(cm._parse_nodes())
+        rep.check([(d[1], int(d[2])) for d in nd] == [("127.0.0.1", 6001), ("127.0.0.1", 6002)], f"address_map makes discovered nodes reachable and does not duplicate the seed ({[(d[0], d[1], d[2]) for d in nd]})")
 
         # Switch off
         names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]
