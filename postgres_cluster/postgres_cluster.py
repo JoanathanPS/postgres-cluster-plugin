@@ -29,6 +29,9 @@ PASSWORD = 'site24x7'                                                    # Monit
 DB = 'postgres'                                                          # Database name to connect to
 PATRONI_PORT = '8008'                                                    # Optional Patroni REST API port or mapping
 CLUSTER_TYPE = 'auto'                                                    # 'auto' or explicit override
+DISCOVER = 'auto'                                                        # 'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes
+DISCOVERY_DEADLINE_S = 4                                                 # Max seconds spent discovering cluster members
+MAX_NODES = 25                                                           # Site24x7 allows at most 25 rows per table
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
 STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
 NODE_COLLECT_DEADLINE_S = 15                                             # Maximum seconds allowed for all nodes collection
@@ -296,7 +299,7 @@ def evaluate_cluster_health(
     is_multimaster = False
     if cluster_type:
         c_lower = str(cluster_type).lower()
-        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower:
+        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower or "citus" in c_lower:
             is_multimaster = True
 
     # 1. Critical rules
@@ -913,18 +916,182 @@ class PostgresNodeClient:
         return evidence
 
 
+# ---------------------------------------------------------------------------
+# Node discovery: give one address, find every node of the cluster.
+#   1. Patroni      -> GET /cluster on any member (exact: names, hosts, ports, roles)
+#   2. repmgr       -> repmgr.nodes
+#   3. Citus        -> pg_dist_node
+#   4. pg_auto_failover monitor -> pgautofailover.node
+#   5. anything else with streaming replication (plain, Stolon, CloudNativePG, ...)
+#                   -> walk pg_stat_wal_receiver (upstream) and pg_stat_replication (downstream)
+# Standbys found through pg_stat_replication only expose an IP, so the primary's port is assumed.
+# ---------------------------------------------------------------------------
+def _norm_host(h):
+    h = str(h).strip().lower()
+    return "127.0.0.1" if h in ("localhost", "::1", "127.0.0.1") else h
+
+
+def _http_json(url, timeout=1.5):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Site24x7-PGCluster'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        pass
+    return None
+
+
+def discover_via_patroni(host, patroni_port):
+    """Returns (members, scope) from the Patroni REST API of one member, or ([], None)."""
+    data = _http_json(f"http://{host}:{patroni_port}/cluster")
+    if not data or not isinstance(data.get("members"), list):
+        return [], None
+    members = []
+    for m in data["members"]:
+        name, h, p = m.get("name"), m.get("host"), m.get("port")
+        if not (name and h and p):
+            continue
+        pp = str(patroni_port)
+        mm = re.match(r"https?://[^:/]+:(\d+)", str(m.get("api_url") or ""))
+        if mm:
+            pp = mm.group(1)
+        members.append({"alias": safe_name(name), "member": str(name), "host": str(h), "port": int(p),
+                        "patroni_port": pp, "source": "Patroni REST API"})
+    return members, data.get("scope")
+
+
+def _pg_connect(host, port, user, pw, db):
+    import psycopg2
+    conn = psycopg2.connect(dbname=db, user=user, password=pw, host=_norm_host(host) if _norm_host(host) == "127.0.0.1" else host,
+                            port=int(port), connect_timeout=2, options="-c statement_timeout=2000")
+    conn.autocommit = True
+    return conn
+
+
+def _conninfo_hostport(conninfo, default_port=5432):
+    h = re.search(r"host=([^\s']+)", conninfo or "")
+    p = re.search(r"port=(\d+)", conninfo or "")
+    return (h.group(1) if h else None), int(p.group(1)) if p else default_port
+
+
+def _managed_members(cur, port):
+    """Exact member lists kept in the catalogs of repmgr, Citus and the pg_auto_failover monitor."""
+    out = []
+    try:
+        cur.execute("SELECT to_regclass('repmgr.nodes');")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT node_name, conninfo FROM repmgr.nodes ORDER BY node_id;")
+            for name, conninfo in cur.fetchall():
+                h, p = _conninfo_hostport(conninfo)
+                if h:
+                    out.append({"alias": safe_name(name), "member": str(name), "host": h, "port": p, "patroni_port": "none", "source": "repmgr.nodes"})
+            if out:
+                return out
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'citus';")
+        if cur.fetchone():
+            cur.execute("SELECT nodename, nodeport, noderole FROM pg_dist_node WHERE isactive ORDER BY nodeid;")
+            for i, (h, p, role) in enumerate(cur.fetchall(), 1):
+                out.append({"alias": safe_name(f"{role}{i}"), "member": f"{role}{i}", "host": str(h), "port": int(p), "patroni_port": "none", "source": "Citus pg_dist_node"})
+            if out:
+                return out
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT to_regclass('pgautofailover.node');")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT nodename, nodehost, nodeport FROM pgautofailover.node ORDER BY nodeid;")
+            for name, h, p in cur.fetchall():
+                out.append({"alias": safe_name(name), "member": str(name), "host": str(h), "port": int(p), "patroni_port": "none", "source": "pgautofailover.node"})
+            if out:
+                return out
+    except Exception:
+        pass
+    return out
+
+
+def discover_via_sql(seeds, user, pw, db, deadline):
+    """Walks the replication topology from the seeds. Returns (members, source)."""
+    queue = [(h, int(p), None) for h, p in seeds]
+    visited, found = set(), OrderedDict()
+    while queue and time.time() < deadline and len(found) < MAX_NODES:
+        host, port, app = queue.pop(0)
+        key = (_norm_host(host), port)
+        if key in visited:
+            continue
+        visited.add(key)
+        try:
+            conn = _pg_connect(host, port, user, pw, db)
+        except Exception:
+            continue
+        try:
+            with conn.cursor() as cur:
+                managed = _managed_members(cur, port)
+                if managed:
+                    return managed, managed[0]["source"]
+                alias = safe_name(app) if app and app not in ("walreceiver", "") else ""
+                if not alias:
+                    alias = "node" + (safe_name(host)[-6:] if safe_name(host) else str(len(found) + 1))
+                found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
+                try:
+                    cur.execute("SELECT pg_is_in_recovery();")
+                    if cur.fetchone()[0]:
+                        cur.execute("SELECT sender_host, sender_port FROM pg_stat_wal_receiver WHERE sender_host IS NOT NULL LIMIT 1;")
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            queue.append((r[0], int(r[1] or port), None))
+                except Exception:
+                    pass
+                try:
+                    cur.execute("SELECT client_addr::text, application_name FROM pg_stat_replication WHERE client_addr IS NOT NULL;")
+                    for ca, an in cur.fetchall():
+                        queue.append((ca, port, an))
+                except Exception:
+                    pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return list(found.values()), "streaming replication topology"
+
+
+def discover_cluster_members(seeds, user, pw, db, deadline_s):
+    """seeds: list of (host, pg_port, patroni_port). Returns (members, source)."""
+    deadline = time.time() + deadline_s
+    for host, pg_port, pat in seeds:
+        if pat and str(pat) != "none":
+            members, scope = discover_via_patroni(host, pat)
+            if members:
+                return members, "Patroni REST API"
+    members, source = discover_via_sql([(h, p) for h, p, _ in seeds], user, pw, db, deadline)
+    return members, source
+
+
+def _patroni_member_name(host, patroni_port):
+    data = _http_json(f"http://{host}:{patroni_port}/patroni", timeout=1.0)
+    return str(((data or {}).get("patroni") or {}).get("name") or "") or None
+
+
+
 class PostgresClusterCollector:
     """
     Main collector coordinating concurrent node probes, cluster-level metrics,
     per-node tables, cluster type detection, and Site24x7 JSON packaging.
     """
-    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE):
+    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER):
         self.nodes_str = nodes_str
         self.username = username
         self.password = password
         self.db = db
         self.patroni_port = patroni_port
         self.cluster_type_override = cluster_type
+        self.discover = discover
+        self.discovery_added = 0
+        self.discovery_source = ""
         self.msg_notes = []
 
     def _add_note(self, text):
@@ -965,6 +1132,72 @@ class PostgresClusterCollector:
             parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
 
+    def _cache_path(self, seeds):
+        import hashlib, tempfile
+        key = hashlib.md5((",".join(f"{h}:{p}" for h, p, _ in seeds) + "|" + str(self.username)).encode()).hexdigest()[:12]
+        return os.path.join(tempfile.gettempdir(), f"s247_pgcluster_{key}.json")
+
+    def _apply_discovery(self, node_defs):
+        """Adds cluster members found from the configured address(es) that are not configured yet."""
+        if str(self.discover).strip().lower() in ("off", "false", "0", "no") or not node_defs:
+            return node_defs
+        seeds = [(h, p, pat) for (_n, h, p, pat, _a) in node_defs]
+        cache_file = self._cache_path(seeds)
+        extra = []
+        try:
+            with open(cache_file, "r") as fh:
+                extra = [tuple(x) for x in json.load(fh) if (x[0], x[1]) not in {(h, p) for h, p, _ in seeds}]
+        except Exception:
+            pass
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = ex.submit(discover_cluster_members, seeds + extra, self.username, self.password, self.db, DISCOVERY_DEADLINE_S)
+            members, source = fut.result(timeout=DISCOVERY_DEADLINE_S + 1)
+        except Exception:
+            members, source = [], ""
+        ex.shutdown(wait=False, cancel_futures=True)
+        if not members:
+            return node_defs
+        try:
+            with open(cache_file, "w") as fh:
+                json.dump([[m["host"], m["port"], m["patroni_port"]] for m in members], fh)
+        except Exception:
+            pass
+
+        known_addr = {(_norm_host(h), int(p)) for (_n, h, p, _pat, _a) in node_defs}
+        known_alias = {n.lower() for (n, *_rest) in node_defs}
+        # Configured nodes may use their own aliases: also recognise them by their Patroni member name.
+        known_member = set()
+        for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
+            if pat and str(pat) != "none":
+                mname = _patroni_member_name(h, pat)
+                if mname:
+                    known_member.add(safe_name(mname).lower())
+                    if not a and safe_name(mname):
+                        # An address given without an alias is named after its Patroni member.
+                        node_defs[i] = (safe_name(mname), h, p, pat, a)
+                        known_alias.discard(n.lower())
+                        known_alias.add(safe_name(mname).lower())
+        added = 0
+        for m in members:
+            key = (_norm_host(m["host"]), int(m["port"]))
+            if key in known_addr or m["alias"].lower() in known_alias or m["alias"].lower() in known_member:
+                continue
+            if len(node_defs) >= MAX_NODES:
+                self._add_note(f"Cluster has more than {MAX_NODES} nodes; extra nodes are not shown")
+                break
+            name, k = m["alias"] or "node", 2
+            while name.lower() in known_alias:
+                name = f"{m['alias']}{k}"
+                k += 1
+            node_defs.append((name, m["host"], m["port"], m["patroni_port"], False))
+            known_alias.add(name.lower())
+            known_addr.add(key)
+            added += 1
+        self.discovery_added = added
+        self.discovery_source = source
+        return node_defs
+
     def collect(self):
         results = OrderedDict()
         results["plugin_version"] = PLUGIN_VERSION
@@ -989,7 +1222,7 @@ class PostgresClusterCollector:
     def _collect_internal(self, results):
         server_version_str = "unknown"
 
-        node_defs = self._parse_nodes()
+        node_defs = self._apply_discovery(self._parse_nodes())
         nodes_total = len(node_defs)
         if nodes_total == 0:
             results["status"] = 0
@@ -1096,7 +1329,7 @@ class PostgresClusterCollector:
 
         # In multi-master / active-active topologies, multiple concurrent primaries are expected
         c_lower = str(detected_type).lower()
-        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower:
+        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower or "citus" in c_lower:
             split_brain_flag = 0
 
         # Build Cluster_Nodes child table
@@ -1631,7 +1864,7 @@ class PostgresClusterCollector:
         results["Cluster_Info"] = [{
             "name": safe_name(str(patroni_scope_discovered or "postgrescluster")) or "cluster",
             "cluster_type": str(detected_type)[:99],
-            "type_evidence": str(detected_evidence)[:99],
+            "type_evidence": (str(detected_evidence)[:58] + f" | {self.discovery_added} node(s) found via {self.discovery_source}")[:99] if self.discovery_added else str(detected_evidence)[:99],
             "server_version": str(server_version_str)[:99],
             "primary_node": active_primary.name if active_primary else "none",
             "health_reason": str(health_reason)[:99],
@@ -1675,8 +1908,9 @@ def run(param):
         db = param.get("db") if param and param.get("db") else DB
         patroni_port = param.get("patroni_port") if param and param.get("patroni_port") else PATRONI_PORT
         cluster_type = param.get("cluster_type") if param and param.get("cluster_type") else CLUSTER_TYPE
+        discover = param.get("discover") if param and param.get("discover") else DISCOVER
 
-        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type)
+        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover)
         return collector.collect()
     except Exception as e:
         return {
@@ -1696,6 +1930,7 @@ if __name__ == '__main__':
     parser.add_argument('--db', help='Database name', default=DB)
     parser.add_argument('--patroni_port', help='Patroni REST API port', default=PATRONI_PORT)
     parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=CLUSTER_TYPE)
+    parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=DISCOVER)
     args = parser.parse_args()
 
     param = {
@@ -1704,7 +1939,8 @@ if __name__ == '__main__':
         "password": args.password,
         "db": args.db,
         "patroni_port": args.patroni_port,
-        "cluster_type": args.cluster_type
+        "cluster_type": args.cluster_type,
+        "discover": args.discover
     }
 
     try:
