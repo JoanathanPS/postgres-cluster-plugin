@@ -1,0 +1,35 @@
+{
+  "timestamp": 1793861225,
+  "source": "Patroni REST API",
+  "endpoints": {
+    "127.0.0.1:5441": "pgnode1",
+    "127.0.0.1:5442": "pgnode2",
+    "127.0.0.1:5443": "pgnode3",
+    "5441": "pgnode1",
+    "5442": "pgnode2",
+    "5443": "pgnode3",
+    "8001": "pgnode1",
+    "8002": "pgnode2",
+    "8003": "pgnode3"
+  },
+  "members": [
+    {
+      "name": "pgnode1",
+      "host": "127.0.0.1",
+      "port": 5441,
+      "patroni_port": "8001"
+    },
+    {
+      "name": "pgnode2",
+      "host": "127.0.0.1",
+      "port": 5442,
+      "patroni_port": "8002"
+    },
+    {
+      "name": "pgnode3",
+      "host": "127.0.0.1",
+      "port": 5443,
+      "patroni_port": "8003"
+    }
+  ]
+}

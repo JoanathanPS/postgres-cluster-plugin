@@ -22,6 +22,60 @@ from collections import OrderedDict
 def safe_name(raw):
     return re.sub(r'[^A-Za-z0-9]', '', str(raw))
 
+
+class PluginError(Exception):
+    """Base exception for postgres_cluster plugin."""
+    pass
+
+class ConfigError(PluginError):
+    """Configuration missing or invalid."""
+    pass
+
+class AuthError(PluginError):
+    """PostgreSQL or Patroni authentication failure."""
+    pass
+
+class UnreachableError(PluginError):
+    """Host or port unreachable / connection refused / timeout."""
+    pass
+
+class DiscoveryError(PluginError):
+    """Cluster discovery failed (e.g. seed down with no cache)."""
+    pass
+
+class UnsupportedClusterError(PluginError):
+    """Cluster type detected but unsupported by this plugin version."""
+    def __init__(self, cluster_type, evidence=""):
+        super().__init__(f"Detected {cluster_type}: not supported by this plugin version")
+        self.cluster_type = cluster_type
+        self.evidence = evidence
+
+class MetricUnavailable(PluginError):
+    """Specific metric query failed due to permissions or missing views."""
+    pass
+
+def classify(e):
+    """Classifies an exception into typed PluginError hierarchy."""
+    try:
+        import psycopg2
+        if isinstance(e, psycopg2.OperationalError):
+            msg = str(e).lower()
+            if "authentication failed" in msg or "password authentication" in msg or "pg_hba.conf" in msg:
+                return AuthError(str(e))
+            return UnreachableError(str(e))
+        pgcode = getattr(e, 'pgcode', None)
+        if pgcode in ('42501', '42P01', '42883', '42703', '57014'):
+            return MetricUnavailable(str(e))
+        name = type(e).__name__
+        if name in ('InsufficientPrivilege', 'UndefinedTable', 'UndefinedFunction', 'UndefinedColumn', 'QueryCanceled'):
+            return MetricUnavailable(str(e))
+    except ImportError:
+        pass
+    if isinstance(e, PluginError):
+        return e
+    return e
+
+
 # There are NO built-in defaults for the cluster, login or database: they must come from postgres_cluster.cfg
 # (or the command line). A missing required setting is reported in the monitor's message and the monitor stays Down.
 NODES = ''                                                               # required: host:port[:patroni_port], or alias=host:port[:patroni_port], comma separated
@@ -174,6 +228,7 @@ units = {
         "connections": "connections",
         "replay_backlog_bytes": "bytes",
         "replay_delay_s": "s",
+        "monitored": "flag",
         "status": "status"
     },
     "Replication_Standbys": {
@@ -975,10 +1030,11 @@ def _pg_connect(host, port, user, pw, db):
     return conn
 
 
-def _conninfo_hostport(conninfo, default_port=5432):
+def _conninfo_hostport(conninfo, default_port=None):
     h = re.search(r"host=([^\s']+)", conninfo or "")
     p = re.search(r"port=(\d+)", conninfo or "")
-    return (h.group(1) if h else None), int(p.group(1)) if p else default_port
+    port_val = int(p.group(1)) if p else default_port
+    return (h.group(1) if h else None), port_val
 
 
 def _alias_for(host, app, taken):
@@ -986,10 +1042,8 @@ def _alias_for(host, app, taken):
     host = str(host)
     if app and str(app) not in ("walreceiver", "") and safe_name(app):
         base = safe_name(app)
-    elif re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
-        base = "node" + "".join(host.split(".")[-2:])
     else:
-        base = safe_name(host.split(".")[0]) or "node"
+        base = safe_name(host)
     name, k = base, 2
     while name.lower() in taken:
         name, k = f"{base}{k}", k + 1
@@ -1188,8 +1242,74 @@ class PostgresClusterCollector:
         if clean and clean not in self.msg_notes:
             self.msg_notes.append(clean)
 
+    def _cache_path(self):
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(plugin_dir, "topology_cache.json")
+
+    def _load_cache(self):
+        cache_file = self._cache_path()
+        if not os.path.exists(cache_file):
+            return None
+        try:
+            with open(cache_file, "r") as f:
+                data = json.load(f)
+            ts = data.get("timestamp", 0)
+            if time.time() - ts > 86400:  # 24 hours expiry
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _save_cache(self, members, source="", seed_names=None):
+        cache_file = self._cache_path()
+        try:
+            existing = self._load_cache() or {}
+            endpoints = existing.get("endpoints", {})
+            if seed_names:
+                for k, v in seed_names.items():
+                    if isinstance(k, tuple):
+                        h, p = k
+                        endpoints[f"{h}:{p}"] = str(v)
+                        endpoints[str(p)] = str(v)
+                    else:
+                        endpoints[str(k)] = str(v)
+            data = {
+                "timestamp": int(time.time()),
+                "source": str(source),
+                "endpoints": endpoints,
+                "members": [
+                    {
+                        "name": str(m.get("alias") or m.get("member") or m.get("name")),
+                        "host": str(m.get("host")),
+                        "port": int(m.get("port")),
+                        "patroni_port": str(m.get("patroni_port", "none"))
+                    }
+                    for m in members if (m.get("alias") or m.get("member") or m.get("name"))
+                ]
+            }
+            with open(cache_file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
     def _parse_nodes(self):
         parsed = []
+        cache = self._load_cache()
+        cached_endpoints = (cache or {}).get("endpoints", {})
+        cached_map = {}
+        if cache and "members" in cache:
+            for m in cache["members"]:
+                mname = safe_name(m.get("name"))
+                if mname:
+                    h_norm = str(m.get("host")).strip().lower()
+                    p_val = int(m.get("port", 0))
+                    pat_val = str(m.get("patroni_port", "none"))
+                    cached_map[(h_norm, p_val)] = mname
+                    cached_map[str(p_val)] = mname
+                    if pat_val != "none":
+                        cached_map[(h_norm, pat_val)] = mname
+                        cached_map[pat_val] = mname
+
         for raw in self.nodes_str.split(','):
             entry = raw.strip()
             if not entry:
@@ -1209,11 +1329,34 @@ class PostgresClusterCollector:
             elif len(parts) == 2:
                 h, p, pat = parts[0], parts[1], self.patroni_port
             else:
-                # A port is required: there is no assumed default port
                 self._add_note(f"Node '{entry}' has no port; write it as host:port (ignored)")
                 continue
 
-            display_name = safe_name(alias) if alias else f"node{len(parsed) + 1}"
+            h_norm = str(h).strip().lower()
+            p_str = str(p).strip()
+            pat_str = str(pat).strip()
+            ep_key = f"{h}:{p}"
+            ep_pat_key = f"{h}:{pat}" if pat_str and pat_str != "none" else None
+
+            if alias:
+                display_name = safe_name(alias)
+            elif cached_endpoints.get(ep_key):
+                display_name = safe_name(cached_endpoints[ep_key])
+            elif ep_pat_key and cached_endpoints.get(ep_pat_key):
+                display_name = safe_name(cached_endpoints[ep_pat_key])
+            elif cached_endpoints.get(p_str):
+                display_name = safe_name(cached_endpoints[p_str])
+            elif pat_str and cached_endpoints.get(pat_str):
+                display_name = safe_name(cached_endpoints[pat_str])
+            elif (h_norm, int(p)) in cached_map:
+                display_name = cached_map[(h_norm, int(p))]
+            elif p_str in cached_map:
+                display_name = cached_map[p_str]
+            elif pat_str and pat_str in cached_map:
+                display_name = cached_map[pat_str]
+            else:
+                display_name = safe_name(f"{h}_{p}")
+
             base_name, dup = display_name, 2
             while any(p_[0] == display_name for p_ in parsed):
                 display_name = f"{base_name}{dup}"
@@ -1223,51 +1366,78 @@ class PostgresClusterCollector:
             parsed.append((display_name, h, p, pat, has_explicit_alias))
         return parsed
 
-    def _cache_path(self, seeds):
-        import hashlib, tempfile
-        key = hashlib.md5((",".join(f"{h}:{p}" for h, p, _ in seeds) + "|" + str(self.username)).encode()).hexdigest()[:12]
-        return os.path.join(tempfile.gettempdir(), f"s247_pgcluster_{key}.json")
-
     def _apply_discovery(self, node_defs):
         """Adds cluster members found from the configured address(es) that are not configured yet."""
         if str(self.discover).strip().lower() in ("off", "false", "0", "no") or not node_defs:
             return node_defs
         seeds = [(h, p, pat) for (_n, h, p, pat, _a) in node_defs]
-        cache_file = self._cache_path(seeds)
-        extra = []
+        cache = self._load_cache()
+        cached_extra = []
+        if cache and "members" in cache:
+            known_seeds = {(str(h).strip().lower(), int(p)) for h, p, _ in seeds}
+            for m in cache["members"]:
+                m_h = str(m.get("host")).strip().lower()
+                m_p = int(m.get("port", 0))
+                m_pat = str(m.get("patroni_port", "none"))
+                if (m_h, m_p) not in known_seeds:
+                    cached_extra.append((m_h, m_p, m_pat))
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(seeds + cached_extra) * 2 + 1))
         try:
-            with open(cache_file, "r") as fh:
-                extra = [tuple(x) for x in json.load(fh) if (x[0], x[1]) not in {(h, p) for h, p, _ in seeds}]
-        except Exception:
-            pass
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            fut = ex.submit(discover_cluster_members, seeds + extra, self.username, self.password, self.db, DISCOVERY_DEADLINE_S)
+            fut = ex.submit(discover_cluster_members, seeds + cached_extra, self.username, self.password, self.db, DISCOVERY_DEADLINE_S)
             members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S + 1)
         except Exception:
             members, source, seed_names = [], "", {}
         ex.shutdown(wait=False, cancel_futures=True)
+
+        if not members and cache and "members" in cache:
+            ts_str = time.strftime('%Y-%m-%d %H:%M:%S GMT', time.gmtime(cache.get('timestamp', time.time())))
+            self._add_note(f"seed unreachable, members from {ts_str}")
+            members = [
+                {"alias": m["name"], "member": m["name"], "host": m["host"], "port": m["port"], "patroni_port": m.get("patroni_port", "none"), "source": "topology cache"}
+                for m in cache["members"]
+            ]
+            source = "topology cache"
+        elif members:
+            self._save_cache(members, source, seed_names=seed_names)
+
         if not members:
             return node_defs
-        try:
-            with open(cache_file, "w") as fh:
-                json.dump([[m["host"], m["port"], m["patroni_port"]] for m in members], fh)
-        except Exception:
-            pass
 
         known_addr = {(_norm_host(h), int(p)) for (_n, h, p, _pat, _a) in node_defs}
         known_alias = {n.lower() for (n, *_rest) in node_defs}
-        # Configured nodes may use their own aliases: also recognise them by their Patroni member name.
         known_member = set()
+
         for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
-            mname = seed_names.get((_norm_host(h), int(p)))
+            h_norm = str(h).strip().lower()
+            p_int = int(p)
+            pat_str = str(pat).strip()
+            mname = seed_names.get((_norm_host(h), p_int)) or seed_names.get(p_int)
+            if not mname and pat_str and pat_str != "none":
+                mname = seed_names.get((h_norm, pat_str)) or seed_names.get(pat_str)
+            if not mname:
+                for m in members:
+                    if int(m.get("port", 0)) == p_int:
+                        mname = safe_name(m.get("alias") or m.get("name"))
+                        break
+                    if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str:
+                        mname = safe_name(m.get("alias") or m.get("name"))
+                        break
+            if not mname and cache and "members" in cache:
+                for m in cache["members"]:
+                    if int(m.get("port", 0)) == p_int:
+                        mname = safe_name(m.get("name"))
+                        break
+                    if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str:
+                        mname = safe_name(m.get("name"))
+                        break
             if mname:
                 known_member.add(mname.lower())
                 if not a:
-                    # An address given without an alias is named after its Patroni member.
                     node_defs[i] = (mname, h, p, pat, a)
                     known_alias.discard(n.lower())
                     known_alias.add(mname.lower())
+
         by_addr = {(_norm_host(m["host"]), int(m["port"])): m["alias"] for m in members if m.get("alias")}
         for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
             nm = by_addr.get((_norm_host(h), int(p)))
@@ -1275,10 +1445,10 @@ class PostgresClusterCollector:
                 node_defs[i] = (nm, h, p, pat, a)
                 known_alias.discard(n.lower())
                 known_alias.add(nm.lower())
+
         if len(node_defs) >= len(members):
-            # Every member is already listed (possibly under another address or alias, e.g. a node that is down
-            # and so cannot report its own name): adding more would only create phantom nodes.
             return node_defs
+
         added = 0
         for m in members:
             key = (_norm_host(m["host"]), int(m["port"]))
@@ -1287,7 +1457,7 @@ class PostgresClusterCollector:
             if len(node_defs) >= MAX_NODES:
                 self._add_note(f"Cluster has more than {MAX_NODES} nodes; extra nodes are not shown")
                 break
-            name, k = m["alias"] or "node", 2
+            name, k = m["alias"] or safe_name(f"{m['host']}_{m['port']}"), 2
             while name.lower() in known_alias:
                 name = f"{m['alias']}{k}"
                 k += 1
@@ -1453,14 +1623,11 @@ class PostgresClusterCollector:
                 "connections": int(c.connections) if c.connections is not None else 0,
                 "response_time_ms": float(c.response_time_ms),
                 "upstream": upstream_val,
-                "patroni_state": str(c.patroni_state if c.patroni_state else "none")
+                "patroni_state": str(c.patroni_state if c.patroni_state else "none"),
+                "replay_backlog_bytes": max(0, int(c.replay_backlog_bytes)) if (c.is_up and c.replay_backlog_bytes is not None) else 0,
+                "replay_delay_s": max(0.0, float(c.replay_delay_s)) if (c.is_up and c.replay_delay_s is not None) else 0.0,
+                "monitored": 1 if c.is_up else 0
             }
-            if c.is_up and not c.is_primary:
-                if c.replay_backlog_bytes is not None:
-                    node_row["replay_backlog_bytes"] = max(0, int(c.replay_backlog_bytes))
-                if c.replay_delay_s is not None:
-                    node_row["replay_delay_s"] = max(0.0, float(c.replay_delay_s))
-
             cluster_nodes.append(node_row)
 
         node_io_table = [c.io_row for c in clients if c.io_row is not None]
