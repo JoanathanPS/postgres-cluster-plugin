@@ -40,6 +40,7 @@ param(
     [string]$Password = "",
     [string]$Database = "postgres",
     [string]$PatroniPort = "8008",
+    [string]$AddressMap = "",
     [string]$AgentDir = "C:\Program Files (x86)\Site24x7\WinAgent",
     [string]$PluginFolderName = "postgres_cluster",
     [switch]$NonInteractive,
@@ -270,18 +271,22 @@ if ($DryRun) {
             Write-Success "Deployed collector to $destPy"
 
             # Deploy configuration file with redirect_output=1 under [global_configurations]
-            $cfgContent = @"
-[global_configurations]
-use_agent_python=0
-redirect_output=1
-
-[$PluginFolderName]
-nodes="$Nodes"
-username="$Username"
-password="$Password"
-db="$Database"
-patroni_port="$PatroniPort"
-"@
+            $cfgLines = @(
+                "[global_configurations]",
+                "use_agent_python=0",
+                "redirect_output=1",
+                "",
+                "[$PluginFolderName]",
+                "nodes=`"$Nodes`"",
+                "username=`"$Username`"",
+                "password=`"$Password`"",
+                "db=`"$Database`"",
+                "patroni_port=`"$PatroniPort`""
+            )
+            if ($AddressMap) {
+                $cfgLines += "address_map=`"$AddressMap`""
+            }
+            $cfgContent = $cfgLines -join "`r`n" + "`r`n"
 
             $targetCfg = Join-Path $targetPluginsDir "$PluginFolderName.cfg"
             Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii
@@ -309,6 +314,9 @@ $testArgs = @(
 )
 if ($PatroniPort -and $PatroniPort -ne "none") {
     $testArgs += @("--patroni_port", $PatroniPort)
+}
+if ($AddressMap) {
+    $testArgs += @("--address_map", $AddressMap)
 }
 
 Write-Host "Running collector verification via $PythonExe..."
@@ -339,7 +347,8 @@ try {
     Write-Host "  Max Replay Backlog:  $($json.'Max Replay Backlog') bytes" -ForegroundColor Gray
     Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Replication Slots Active') active, $($json.'Replication Slots Inactive') inactive)" -ForegroundColor Gray
     Write-Host "  Cluster Nodes:       $($json.Cluster_Nodes.Count) rows" -ForegroundColor Gray
-    Write-Host "  Standbys Detected:   $($json.Replication_Standbys.Count) rows" -ForegroundColor Gray
+    $linksCount = if ($json.Replication_Links) { $json.Replication_Links.Count } else { ($json.Replication_Standbys).Count }
+    Write-Host "  Replication Links:   $linksCount rows" -ForegroundColor Gray
 } catch {
     Write-ErrorMsg "Failed to parse plugin output as JSON: $_"
     Write-Host $output
