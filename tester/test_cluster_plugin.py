@@ -14,7 +14,7 @@ Validates:
      - Generic metric count <= 200
      - Numeric types: ints and floats emitted for all numeric columns and generic metrics
      - String types only for Server Version, Last Archived WAL File, Cluster Type, Cluster Type Evidence, Cluster Name, Archive Mode, msg
-     - Nested units format: units["Cluster_Nodes"], units["Replication_Standbys"], units["Replication_Slots"],
+     - Nested units format: units["Cluster_Nodes"], units["Replication_Links"], units["Replication_Slots"],
        units["Node_Activity"], units["Node_Throughput"], units["Node_Checkpoints"], units["Standby_Conflicts"]
      - 7 tabs properly formed: Cluster, Replication, DB and IO stats, BG Writer, Transactions and Sessions, Write Ahead Log, Recovery Conflicts
      - s247config.childdiscovery strictly contains per-DB tables (no Cluster child tables)
@@ -229,18 +229,19 @@ def validate_schema(data, rep):
                 rep.check(isinstance(r.get("replay_delay_s"), (int, float)), f"Cluster_Nodes row replay_delay_s is float/int ({r.get('replay_delay_s')})")
         rep.check(prim_count == 1, f"Cluster_Nodes has exactly one primary node with is_primary=1 ({prim_count})")
 
-    # Assertions for Replication_Standbys
-    rep.check("Replication_Standbys" in data and isinstance(data["Replication_Standbys"], list), "Replication_Standbys table present")
-    if "Replication_Standbys" in data:
-        for r in data["Replication_Standbys"]:
-            rep.check(r.get("is_sync") in (0, 1), f"Replication_Standbys row is_sync in {{0, 1}} ({r.get('is_sync')})")
-            rep.check(isinstance(r.get("replay_lag_bytes"), int), f"Replication_Standbys row replay_lag_bytes is int ({r.get('replay_lag_bytes')})")
-            rep.check(isinstance(r.get("write_lag_bytes"), int), f"Replication_Standbys row write_lag_bytes is int ({r.get('write_lag_bytes')})")
-            rep.check(isinstance(r.get("flush_lag_bytes"), int), f"Replication_Standbys row flush_lag_bytes is int ({r.get('flush_lag_bytes')})")
-            rep.check(isinstance(r.get("replay_lag_s"), (int, float)), f"Replication_Standbys row replay_lag_s is float/int ({r.get('replay_lag_s')})")
-            rep.check(isinstance(r.get("state"), str), f"Replication_Standbys row state is str ({r.get('state')})")
-            rep.check(isinstance(r.get("sync_state"), str), f"Replication_Standbys row sync_state is str ({r.get('sync_state')})")
-            rep.check(isinstance(r.get("client_addr"), str), f"Replication_Standbys row client_addr is str ({r.get('client_addr')})")
+    # Assertions for Replication_Links
+    rep.check("Replication_Links" in data and isinstance(data["Replication_Links"], list), "Replication_Links table present")
+    if "Replication_Links" in data:
+        for r in data["Replication_Links"]:
+            rep.check(r.get("is_sync") in (0, 1), f"Replication_Links row is_sync in {{0, 1}} ({r.get('is_sync')})")
+            rep.check(isinstance(r.get("replay_lag_bytes"), int), f"Replication_Links row replay_lag_bytes is int ({r.get('replay_lag_bytes')})")
+            rep.check(isinstance(r.get("write_lag_bytes"), int), f"Replication_Links row write_lag_bytes is int ({r.get('write_lag_bytes')})")
+            rep.check(isinstance(r.get("flush_lag_bytes"), int), f"Replication_Links row flush_lag_bytes is int ({r.get('flush_lag_bytes')})")
+            rep.check(isinstance(r.get("replay_lag_s"), (int, float)), f"Replication_Links row replay_lag_s is float/int ({r.get('replay_lag_s')})")
+            rep.check(isinstance(r.get("state"), str), f"Replication_Links row state is str ({r.get('state')})")
+            rep.check(isinstance(r.get("link_type"), str), f"Replication_Links row link_type is str ({r.get('link_type')})")
+            rep.check(isinstance(r.get("source"), str), f"Replication_Links row source is str ({r.get('source')})")
+            rep.check(isinstance(r.get("target"), str), f"Replication_Links row target is str ({r.get('target')})")
 
     # Assertions for Replication_Slots
     rep.check("Replication_Slots" in data and isinstance(data["Replication_Slots"], list), "Replication_Slots table present")
@@ -253,7 +254,7 @@ def validate_schema(data, rep):
 
     # Assertions for 10 Child Tables
     expected_10_tables = [
-        "Cluster_Info", "Cluster_Nodes", "Replication_Standbys", "Replication_Slots",
+        "Cluster_Info", "Cluster_Nodes", "Replication_Links", "Replication_Slots",
         "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Node_Activity",
         "Node_Transactions", "Tranasctions_and_Session_per_Database"
     ]
@@ -263,7 +264,7 @@ def validate_schema(data, rep):
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
-    for tbl_unit in ["Cluster_Info", "Cluster_Nodes", "Replication_Standbys", "Replication_Slots", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
+    for tbl_unit in ["Cluster_Info", "Cluster_Nodes", "Replication_Links", "Replication_Slots", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
         rep.check(tbl_unit in units and isinstance(units[tbl_unit], dict), f"units contains nested dict '{tbl_unit}'")
 
     # Tabs verification: strictly 5 tabs
@@ -279,7 +280,7 @@ def validate_schema(data, rep):
     rep.check("Cluster_Nodes" in cl_tablist, "Cluster_Nodes present in Cluster tab tablist")
 
     rep_tablist = tabs.get("Replication", {}).get("tablist", [])
-    rep.check("Replication_Standbys" in rep_tablist, "Replication_Standbys present in Replication tab tablist")
+    rep.check("Replication_Links" in rep_tablist, "Replication_Links present in Replication tab tablist")
     rep.check("Replication_Slots" in rep_tablist, "Replication_Slots present in Replication tab tablist")
 
     perf_tablist = tabs.get("Node Performance", {}).get("tablist", [])
@@ -312,7 +313,7 @@ def validate_schema(data, rep):
     # Childdiscovery in s247config: strictly per-DB tables
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
     rep.check("Cluster_Nodes" not in childdiscovery, "Cluster_Nodes removed from s247config.childdiscovery")
-    rep.check("Replication_Standbys" not in childdiscovery, "Replication_Standbys removed from s247config.childdiscovery")
+    rep.check("Replication_Links" not in childdiscovery, "Replication_Links removed from s247config.childdiscovery")
     rep.check("Stats_per_DB" in childdiscovery, "Stats_per_DB present in s247config.childdiscovery")
     rep.check("Tranasctions_and_Session_per_Database" in childdiscovery, "Tranasctions_and_Session_per_Database present in s247config.childdiscovery")
 def test_coverage_map_assertion(data, rep):
@@ -598,23 +599,85 @@ def test_cluster_type_fixtures(rep):
             "expected_type": "streaming replication (no HA manager detected)"
         },
         {
-            "name": "Multi-Master (Active-Active)",
+            "name": "Multi-Master (native logical)",
             "evidence": {
                 "patroni": None,
                 "extensions": [],
                 "repmgr_table": False,
-                "slot_names": ["sub_mm1"],
-                "slot_types": ["logical"],
-                "logical_replication_count": 2,
+                "slot_names": ["sub_mm1", "sub_mm2"],
+                "slot_types": ["logical", "logical"],
+                "logical_replication_count": 4,
                 "primary_count": 2,
-                "app_names": ["sub_mm1"],
+                "subscriptions_count": 2,
+                "publications_count": 2,
+                "all_up_subscribe": True,
+                "all_up_publish": True,
+                "app_names": ["sub_mm1", "sub_mm2"],
                 "managed_roles": [],
                 "aurora_version": False,
                 "has_standbys": False,
                 "standby_count": 0,
                 "total_nodes": 2
             },
-            "expected_type": "Multi-Master (Active-Active)"
+            "expected_type": "Multi-Master (native logical)"
+        },
+        {
+            "name": "Multi-Master (pglogical)",
+            "evidence": {
+                "patroni": None,
+                "extensions": ["pglogical"],
+                "repmgr_table": False,
+                "slot_names": ["pglogical_sub"],
+                "slot_types": ["logical"],
+                "logical_replication_count": 2,
+                "primary_count": 2,
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "standby_count": 0,
+                "total_nodes": 2
+            },
+            "expected_type": "Multi-Master (pglogical)"
+        },
+        {
+            "name": "logical replication (one-way)",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": ["sub1"],
+                "slot_types": ["logical"],
+                "logical_replication_count": 1,
+                "subscriptions_count": 1,
+                "primary_count": 1,
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "is_in_recovery": False,
+                "total_nodes": 1
+            },
+            "expected_type": "logical replication (one-way)"
+        },
+        {
+            "name": "Split Brain physical streaming",
+            "evidence": {
+                "patroni": None,
+                "extensions": [],
+                "repmgr_table": False,
+                "slot_names": [],
+                "slot_types": [],
+                "logical_replication_count": 0,
+                "primary_count": 2,
+                "app_names": [],
+                "managed_roles": [],
+                "aurora_version": False,
+                "has_standbys": False,
+                "standby_count": 0,
+                "total_nodes": 2
+            },
+            "expected_type": "streaming replication (no HA manager detected)"
         },
         {
             "name": "standalone",
@@ -1065,7 +1128,9 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
 
         # Discovery failure keeps the configured nodes
         pg_mod.discover_cluster_members = fake([])
-        names = [d[0] for d in collector(base)._apply_discovery(collector(base)._parse_nodes())]
+        c_fail = collector(base)
+        c_fail._load_cache = lambda: None
+        names = [d[0] for d in c_fail._apply_discovery(c_fail._parse_nodes())]
         rep.check(names == ["a"], f"Failed discovery keeps the configured node ({names})")
     finally:
         pg_mod.discover_cluster_members = real

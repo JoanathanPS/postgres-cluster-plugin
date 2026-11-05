@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Sets up PostgreSQL Active-Active Multi-Master Logical Replication between pg-mm1 and pg-mm2.
+Sets up PostgreSQL 17 Active-Active Multi-Master Logical Replication between 3 nodes:
+pg-mm1 (5451), pg-mm2 (5452), pg-mm3 (5453).
+Full mesh topology using origin = 'none' and copy_data = false.
 """
 
 import time
-import subprocess
 import psycopg2
 
-def run_cmd(cmd, check=True):
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if check and res.returncode != 0:
-        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(cmd)}\nStderr: {res.stderr}\nStdout: {res.stdout}")
-    return res
+NODES = [
+    {"name": "pg-mm1", "host": "127.0.0.1", "port": 5451, "docker_host": "pg-mm1", "id_start": 1},
+    {"name": "pg-mm2", "host": "127.0.0.1", "port": 5452, "docker_host": "pg-mm2", "id_start": 2},
+    {"name": "pg-mm3", "host": "127.0.0.1", "port": 5453, "docker_host": "pg-mm3", "id_start": 3},
+]
 
 def wait_for_db(port, max_retries=20):
     for i in range(max_retries):
@@ -32,116 +33,86 @@ def wait_for_db(port, max_retries=20):
     raise TimeoutError(f"PostgreSQL on port {port} not ready in {max_retries} seconds")
 
 def setup_multimaster():
-    print("Waiting for both nodes to become ready...")
-    wait_for_db(5451)
-    wait_for_db(5452)
+    print("Waiting for all 3 nodes to become ready...")
+    for n in NODES:
+        wait_for_db(n["port"])
 
-    # 1. Create table app_data on both nodes
-    ddl_1 = """
-    DROP TABLE IF EXISTS app_data CASCADE;
-    CREATE TABLE app_data (
-        id bigint GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 2) PRIMARY KEY,
-        node_origin text NOT NULL,
-        message text NOT NULL,
-        created_at timestamp DEFAULT now()
-    );
-    """
-    ddl_2 = """
-    DROP TABLE IF EXISTS app_data CASCADE;
-    CREATE TABLE app_data (
-        id bigint GENERATED ALWAYS AS IDENTITY (START WITH 2 INCREMENT BY 2) PRIMARY KEY,
-        node_origin text NOT NULL,
-        message text NOT NULL,
-        created_at timestamp DEFAULT now()
-    );
-    """
-    conn1 = psycopg2.connect(host="127.0.0.1", port=5451, user="site24x7", password="site24x7", dbname="postgres")
-    conn1.autocommit = True
-    with conn1.cursor() as cur:
-        cur.execute(ddl_1)
-        cur.execute("SELECT count(*) FROM pg_publication WHERE pubname = 'pub_mm1';")
-        if cur.fetchone()[0] == 0:
-            cur.execute("CREATE PUBLICATION pub_mm1 FOR TABLE app_data;")
-        else:
-            cur.execute("ALTER PUBLICATION pub_mm1 SET TABLE app_data;")
-    conn1.close()
-    print("Configured schema and pub_mm1 on pg-mm1")
+    # 1. Create table app_data and publication on each node
+    for n in NODES:
+        ddl = f"""
+        DROP TABLE IF EXISTS app_data CASCADE;
+        CREATE TABLE app_data (
+            id bigint GENERATED ALWAYS AS IDENTITY (START WITH {n['id_start']} INCREMENT BY 3) PRIMARY KEY,
+            node_origin text NOT NULL,
+            message text NOT NULL,
+            created_at timestamp DEFAULT now()
+        );
+        """
+        conn = psycopg2.connect(host="127.0.0.1", port=n["port"], user="site24x7", password="site24x7", dbname="postgres")
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+            pubname = f"pub_{n['name'].replace('-', '_')}"
+            cur.execute("SELECT count(*) FROM pg_publication WHERE pubname = %s;", (pubname,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f"CREATE PUBLICATION {pubname} FOR TABLE app_data;")
+            else:
+                cur.execute(f"ALTER PUBLICATION {pubname} SET TABLE app_data;")
+        conn.close()
+        print(f"Configured schema and {pubname} on {n['name']}")
 
-    conn2 = psycopg2.connect(host="127.0.0.1", port=5452, user="site24x7", password="site24x7", dbname="postgres")
-    conn2.autocommit = True
-    with conn2.cursor() as cur:
-        cur.execute(ddl_2)
-        cur.execute("SELECT count(*) FROM pg_publication WHERE pubname = 'pub_mm2';")
-        if cur.fetchone()[0] == 0:
-            cur.execute("CREATE PUBLICATION pub_mm2 FOR TABLE app_data;")
-        else:
-            cur.execute("ALTER PUBLICATION pub_mm2 SET TABLE app_data;")
-    conn2.close()
-    print("Configured schema and pub_mm2 on pg-mm2")
+    # 2. Create mesh subscriptions (using origin = 'none' to prevent replication loops)
+    for n in NODES:
+        conn = psycopg2.connect(host="127.0.0.1", port=n["port"], user="site24x7", password="site24x7", dbname="postgres")
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for peer in NODES:
+                if peer["name"] == n["name"]:
+                    continue
+                subname = f"sub_{n['name'].replace('-', '_')}_from_{peer['name'].replace('-', '_')}"
+                pubname = f"pub_{peer['name'].replace('-', '_')}"
+                conninfo = f"host={peer['docker_host']} port=5432 dbname=postgres user=site24x7 password=site24x7"
 
-    # 2. Create subscriptions (using origin = 'none' to prevent replication loops in PG 16)
-    conn1 = psycopg2.connect(host="127.0.0.1", port=5451, user="site24x7", password="site24x7", dbname="postgres")
-    conn1.autocommit = True
-    with conn1.cursor() as cur:
-        # Check if sub exists
-        cur.execute("SELECT count(*) FROM pg_subscription WHERE subname = 'sub_mm1';")
-        if cur.fetchone()[0] == 0:
-            cur.execute("""
-                CREATE SUBSCRIPTION sub_mm1 
-                CONNECTION 'host=pg-mm2 port=5432 dbname=postgres user=site24x7 password=site24x7' 
-                PUBLICATION pub_mm2 
-                WITH (copy_data = false, origin = 'none');
-            """)
-            print("Created subscription sub_mm1 on pg-mm1")
-    conn1.close()
+                cur.execute("SELECT count(*) FROM pg_subscription WHERE subname = %s;", (subname,))
+                if cur.fetchone()[0] == 0:
+                    cur.execute(f"""
+                        CREATE SUBSCRIPTION {subname}
+                        CONNECTION '{conninfo}'
+                        PUBLICATION {pubname}
+                        WITH (copy_data = false, origin = 'none');
+                    """)
+                    print(f"Created subscription {subname} on {n['name']} from {peer['name']}")
+        conn.close()
 
-    conn2 = psycopg2.connect(host="127.0.0.1", port=5452, user="site24x7", password="site24x7", dbname="postgres")
-    conn2.autocommit = True
-    with conn2.cursor() as cur:
-        cur.execute("SELECT count(*) FROM pg_subscription WHERE subname = 'sub_mm2';")
-        if cur.fetchone()[0] == 0:
-            cur.execute("""
-                CREATE SUBSCRIPTION sub_mm2 
-                CONNECTION 'host=pg-mm1 port=5432 dbname=postgres user=site24x7 password=site24x7' 
-                PUBLICATION pub_mm1 
-                WITH (copy_data = false, origin = 'none');
-            """)
-            print("Created subscription sub_mm2 on pg-mm2")
-    conn2.close()
+    print("\nMulti-Master 3-node logical replication mesh established!")
+    time.sleep(3)
 
-    print("Multi-Master logical replication successfully established!")
+    # 3. Test bi-directional replication across all 3 nodes
+    print("\n--- Testing 3-Way Active-Active Replication ---")
+    for n in NODES:
+        conn = psycopg2.connect(host="127.0.0.1", port=n["port"], user="site24x7", password="site24x7", dbname="postgres")
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            msg = f"Hello from {n['name']}"
+            cur.execute("INSERT INTO app_data (node_origin, message) VALUES (%s, %s);", (n['name'], msg))
+        conn.close()
+        print(f"Inserted row on {n['name']}")
 
-    # 3. Test bi-directional replication!
-    time.sleep(2)
-    conn1 = psycopg2.connect(host="127.0.0.1", port=5451, user="site24x7", password="site24x7", dbname="postgres")
-    conn1.autocommit = True
-    with conn1.cursor() as cur:
-        cur.execute("INSERT INTO app_data (node_origin, message) VALUES ('pg-mm1', 'Hello from Node 1');")
-    conn1.close()
+    time.sleep(3)
 
-    time.sleep(2)
-    conn2 = psycopg2.connect(host="127.0.0.1", port=5452, user="site24x7", password="site24x7", dbname="postgres")
-    conn2.autocommit = True
-    with conn2.cursor() as cur:
-        cur.execute("SELECT count(*) FROM app_data WHERE node_origin = 'pg-mm1';")
-        cnt = cur.fetchone()[0]
-        assert cnt > 0, "Replication from pg-mm1 to pg-mm2 failed!"
-        print(f"Verified forward replication: pg-mm2 received row from pg-mm1 (count={cnt})")
-        # Now insert on node 2
-        cur.execute("INSERT INTO app_data (node_origin, message) VALUES ('pg-mm2', 'Hello from Node 2');")
-    conn2.close()
+    # Verify every node has all 3 rows
+    for n in NODES:
+        conn = psycopg2.connect(host="127.0.0.1", port=n["port"], user="site24x7", password="site24x7", dbname="postgres")
+        with conn.cursor() as cur:
+            cur.execute("SELECT node_origin, message FROM app_data ORDER BY id;")
+            rows = cur.fetchall()
+            print(f"\nRows seen by {n['name']} (total: {len(rows)}):")
+            for r in rows:
+                print(f"   [{n['name']}] origin: {r[0]}, message: {r[1]}")
+            assert len(rows) == 3, f"{n['name']} only saw {len(rows)} rows, expected 3!"
+        conn.close()
 
-    time.sleep(2)
-    conn1 = psycopg2.connect(host="127.0.0.1", port=5451, user="site24x7", password="site24x7", dbname="postgres")
-    conn1.autocommit = True
-    with conn1.cursor() as cur:
-        cur.execute("SELECT count(*) FROM app_data WHERE node_origin = 'pg-mm2';")
-        cnt = cur.fetchone()[0]
-        assert cnt > 0, "Replication from pg-mm2 to pg-mm1 failed!"
-        print(f"Verified reverse replication: pg-mm1 received row from pg-mm2 (count={cnt})")
-    conn1.close()
-
-    print("\n[SUCCESS] Bi-directional Active-Active Multi-Master replication is FULLY WORKING!")
+    print("\n[SUCCESS] 3-node Full-Mesh Active-Active Multi-Master replication is 100% VERIFIED!")
 
 if __name__ == "__main__":
     setup_multimaster()

@@ -529,7 +529,7 @@
     "v2_item": "flush_lag_bytes",
     "tab": "Replication",
     "notes": "Tracked per standby in Replication_Standbys table and top-level",
-    "v2_table": "Replication_Standbys"
+    "v2_table": "Replication_Links"
   },
   {
     "old_item": "Inactive Replication Slots",
@@ -695,7 +695,7 @@
     "v2_item": "state",
     "tab": "Replication",
     "notes": "Per-standby streaming state in Replication_Standbys table",
-    "v2_table": "Replication_Standbys"
+    "v2_table": "Replication_Links"
   },
   {
     "old_item": "Server PID",
@@ -736,7 +736,7 @@
     "v2_item": "sync_state",
     "tab": "Replication",
     "notes": "Per-standby sync state and Sync Standby Count metric",
-    "v2_table": "Replication_Standbys"
+    "v2_table": "Replication_Links"
   },
   {
     "old_item": "Timeline ID",
@@ -793,6 +793,6 @@
     "v2_item": "write_lag_bytes",
     "tab": "Replication",
     "notes": "Tracked per standby in Replication_Standbys table",
-    "v2_table": "Replication_Standbys"
+    "v2_table": "Replication_Links"
   }
 ]

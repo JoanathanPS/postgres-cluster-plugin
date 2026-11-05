@@ -98,13 +98,13 @@ Assert-Check "Bash installer uses standardized [postgres_cluster] section" {
 Write-Host "`n--- Step 4: Live Execution Smoke Test ---" -ForegroundColor Yellow
 
 Assert-Check "Plugin runs cleanly against active cluster with valid JSON output" {
-    $output = & $pyExe $pyPath --nodes "localhost:5441,localhost:5442,localhost:5443" --username "site24x7" --password "site24x7" 2>$null
+    $output = & $pyExe $pyPath --nodes "localhost:5441,localhost:5442,localhost:5443" --username "site24x7" --password "site24x7" --db "appdb" 2>$null
     if ($LASTEXITCODE -ne 0) { return $false }
     $json = $output | ConvertFrom-Json
     if (-not $json) { return $false }
     if ($json.plugin_version -lt 1) { return $false }
     if (-not $json.Cluster_Nodes) { return $false }
-    if (-not $json.Replication_Standbys) { return $false }
+    if (-not ($json.Replication_Links -or $json.Replication_Standbys)) { return $false }
     if (-not $json.tabs.Cluster) { return $false }
     return $true
 }

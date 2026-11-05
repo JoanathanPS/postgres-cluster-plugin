@@ -43,6 +43,10 @@ SELECT format('GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO %I', :'mon_user')
 SELECT format('GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO %I', :'mon_user')
  WHERE EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'pg_ls_archive_statusdir') \gexec
 
+-- OPTIONAL, Multi-Master (native logical replication): lets the plugin read pg_subscription for peer node discovery.
+SELECT format('GRANT SELECT ON pg_catalog.pg_subscription TO %I', :'mon_user')
+ WHERE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_subscription') \gexec
+
 -- OPTIONAL, repmgr clusters only: lets the plugin read the repmgr node list (database "repmgr") for node discovery.
 -- Without it the plugin still finds the nodes by walking the replication topology.
 -- \c repmgr

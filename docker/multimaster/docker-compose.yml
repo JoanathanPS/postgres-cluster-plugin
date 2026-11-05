@@ -2,7 +2,7 @@ name: pg-multimaster
 
 services:
   pg-mm1:
-    image: postgres:16
+    image: postgres:17
     container_name: pg-mm1
     environment:
       POSTGRES_USER: site24x7
@@ -27,7 +27,7 @@ services:
       retries: 15
 
   pg-mm2:
-    image: postgres:16
+    image: postgres:17
     container_name: pg-mm2
     environment:
       POSTGRES_USER: site24x7
@@ -45,6 +45,31 @@ services:
       - track_commit_timestamp=on
     ports:
       - "127.0.0.1:5452:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U site24x7 -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  pg-mm3:
+    image: postgres:17
+    container_name: pg-mm3
+    environment:
+      POSTGRES_USER: site24x7
+      POSTGRES_PASSWORD: site24x7
+      POSTGRES_DB: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - track_commit_timestamp=on
+    ports:
+      - "127.0.0.1:5453:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U site24x7 -d postgres"]
       interval: 3s
