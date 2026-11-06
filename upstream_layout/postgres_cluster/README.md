@@ -22,7 +22,7 @@ In Site24x7, numeric metrics that do not belong to any tab's `tablist` are autom
 ## Key Capabilities
 
 - **Unified Cluster Topology**: Monitors multiple PostgreSQL endpoints simultaneously under a single Site24x7 monitor instance.
-- **Node Discovery from One Address**: you only configure the address of any one node (or two for safety). On every poll the plugin finds the rest of the cluster, so adding or removing nodes needs no config edit. See "Node Discovery" below.
+- **Node Discovery from One Address**: for Patroni, repmgr, Citus, pgpool-II and multi-master clusters one address is enough and the plugin finds the rest on every poll, so adding or removing nodes needs no config edit. For Stolon, CloudNativePG, pg_auto_failover and plain streaming you list every node. See "Node Discovery" below.
 - **Cluster Manager Auto-Detection**: Dynamically inspects engine catalogs, extensions, endpoints, and environment signatures to identify the underlying HA orchestrator or cloud platform (reporting `cluster_type` and `type_evidence` in the `Cluster_Info` table).
 - **Dynamic Primary Discovery & Auto-Failover**: Evaluates all configured nodes concurrently in sub-second probes to determine the active primary and standbys. On failover, the plugin automatically follows the newly elected primary and tracks the new WAL timeline without configuration updates.
 - **Hierarchical Cluster Health Evaluation**: Evaluates cluster state dynamically into `Cluster Health` (0: Healthy, 1: Degraded, 2: Critical) and reports an actionable `health_reason` in `Cluster_Info`.
@@ -116,9 +116,10 @@ Give the plugin the address of one node and it finds the others on every poll (`
 | Patroni | `GET /cluster` on the Patroni REST port of any member (exact member list, hosts, ports) |
 | repmgr | `repmgr.nodes` (in the `repmgr` database or the current one) |
 | Citus | `pg_dist_node` |
-| pg_auto_failover | `pgautofailover.node` when you point at the monitor; from a data node the replication topology is walked |
+| pg_auto_failover | `pgautofailover.node` when you point at the monitor; from a data node only that node and the primary it follows are found, so list both data nodes |
 | pgpool-II | `SHOW POOL_NODES` on the pgpool address (port 9999 is recognised automatically, or set `cluster_type` to `pgpool`). The pgpool address is replaced by its backends, which are monitored directly. |
-| Stolon, CloudNativePG, plain streaming, multi-master logical replication | The replication topology is walked: `pg_stat_wal_receiver` (upstream) and `pg_stat_replication` (downstream), from every node reached |
+| Multi-master (native logical replication) | The peers named in `pg_subscription` (needs a superuser, or the grant in `create_user.sql`) |
+| Stolon, CloudNativePG, plain streaming | Only the upstream chain is followed (`pg_stat_wal_receiver`). A standby's own port is not known from the primary (`pg_stat_replication` shows an IP only), so standbys are not followed downstream: **list every node** |
 
 Configuration for a cluster you want to add nodes to later:
 
@@ -139,21 +140,21 @@ db=postgres
 | Cluster type | Result |
 | :--- | :--- |
 | Patroni (3 nodes, etcd, HAProxy, PostgreSQL 17.2) | Live: all 3 nodes and roles from one member; healthy, node stopped, primary stopped and promoted, node rejoining; Site24x7 console verified |
-| Plain streaming replication (2 nodes) | Live: all nodes from either the standby or the primary |
+| Plain streaming replication (2 nodes) | Live: both nodes found when both addresses are listed, or from the standby alone (it follows its upstream). From the primary alone only the primary is found |
 | repmgr (1 primary + 2 standbys + 1 witness node, PostgreSQL 17, repmgr 5.5.0) | Live: automatic failover via repmgrd, node down, standby down, witness role detection (excluded from Standbys Expected, no false split brain), failover history via repmgr.events |
-| Stolon (etcd, 3 keepers, PostgreSQL 15) | Live: type `Stolon`, 3 nodes, roles after Stolon's own election |
-| pg_auto_failover (monitor + 2 nodes, PostgreSQL 11 demo image) | Live from a data node: type `pg_auto_failover`, 2 nodes |
+| Stolon (etcd, 3 keepers, PostgreSQL 15) | Live with all three keepers listed: type `Stolon`, 3 nodes, roles after Stolon's own election. From one keeper only that keeper and its primary are found |
+| pg_auto_failover (monitor + 2 nodes, PostgreSQL 11 demo image) | Live with both data nodes listed: type `pg_auto_failover`, 2 nodes |
 | Citus (coordinator + 2 workers) | Live: type `Citus Distributed`, 3 nodes, no false split brain |
 | pgpool-II 4.3 (3 PostgreSQL 16 backends, streaming replication) | Live, from only the pgpool address: type `pgpool-II`, 3 backends, roles right, the proxy itself not listed |
 | Multi-master (native logical replication, 2 nodes, PostgreSQL 16) | Live: type `Multi-Master (Active-Active)`, 2 primaries, no false split brain |
-| CloudNativePG (kind, operator 1.24.1, 3 instances, PostgreSQL 16) | Live, plugin run as a pod: type `CloudNative-PG`, all 3 instances found from the read-only service. Node names come from the service and pod names |
+| CloudNativePG (kind, operator 1.24.1, 3 instances, PostgreSQL 16) | Live, plugin run as a pod: type `CloudNative-PG`. From the read-only service address the primary and the one replica reached are found (2 of 3 instances); other replicas are monitored only if you list their own addresses (pod addresses change, so this is a known limit on Kubernetes). Node names come from the service and pod names |
 | AWS RDS/Aurora, Azure, Google Cloud SQL | Detection logic only. Not tested on real services; their node lists live in the cloud API, not in PostgreSQL |
 
 ## Cluster Support Levels
 
 | Level | Meaning | Clusters |
 | :--- | :--- | :--- |
-| **Supported** | Run live against a real test cluster from one address: nodes, roles, cluster type and health are right. | Patroni, plain streaming replication, repmgr, Stolon, pg_auto_failover, Citus, multi-master (native logical replication), CloudNativePG, pgpool-II (streaming replication mode) |
+| **Supported** | Run live against a real test cluster, with the addresses the setup table asks for: nodes, roles, cluster type and health are right. | Patroni, plain streaming replication, repmgr, Stolon, pg_auto_failover, Citus, multi-master (native logical replication), CloudNativePG, pgpool-II (streaming replication mode) |
 | **Detected only** | The cluster type is recognised and labelled from catalog evidence, but the plugin was never run against a real cluster of that kind. Monitoring probably works if you list the nodes. | Multi-master through the `pglogical` or `bdr` extensions |
 | **Not supported** | The plugin cannot do it with a plain PostgreSQL login, or it is outside what this plugin is for. | See the list below |
 
@@ -185,7 +186,7 @@ Follow these steps in order. A cluster type only moves to **Supported** in the t
 
 ## Known Limitations
 
-- Discovery from the replication topology only sees a standby's IP, so the primary's port is assumed for it. Use Patroni or repmgr (exact lists) or list such nodes explicitly if they use another port.
+- One address is enough only where the cluster gives an exact node list: Patroni, repmgr, Citus, pgpool-II and the multi-master mesh. For Stolon, CloudNativePG, pg_auto_failover and plain streaming the plugin follows each node's upstream but not its downstream standbys (their port is unknown), so list every node; a standby you do not list, and that nothing you listed points to, is not monitored.
 - Discovered addresses must be reachable from the agent. Names that only resolve inside a container network show as offline nodes.
 - repmgr: the monitoring user needs `USAGE` on schema `repmgr` and `SELECT` on its tables to read the catalog (`GRANT USAGE ON SCHEMA repmgr TO site24x7; GRANT SELECT ON ALL TABLES IN SCHEMA repmgr TO site24x7;`). The plugin dynamically searches `pg_database` for the database housing the `repmgr` catalog. Tested live: automatic failover with `repmgrd`, primary down, standby down, and witness node tracking. Untested limitations: cascading standbys and manual CLI `repmgr standby switchover` were not evaluated in the automated test harness.
 - A node that is removed from the cluster stops being listed, but Site24x7 keeps the old row in the child tables.
@@ -266,7 +267,7 @@ The folder name, the `.py` name, the `.cfg` name and the section name inside the
 
 ### Step 3: tell it where the cluster is
 
-Edit `postgres_cluster.cfg` in the plugin folder. **You only need the address of one node**; the plugin finds the others (see "Node Discovery").
+Edit `postgres_cluster.cfg` in the plugin folder. **For Patroni, repmgr, Citus, pgpool-II and multi-master one address is enough**; the plugin finds the others (see "Node Discovery"). For Stolon, CloudNativePG, pg_auto_failover and plain streaming, list the address of every node.
 
 ```ini
 [global_configurations]
@@ -285,9 +286,10 @@ cluster_type="auto"
 | Your cluster | What to put in `nodes=` |
 | :--- | :--- |
 | Patroni | `host:5432:8008` (any member; the last number is the Patroni REST port) |
-| repmgr, Stolon, CloudNativePG, plain streaming, multi-master | `host:5432:none` (any node; `none` because there is no Patroni port) |
+| repmgr, multi-master (native logical) | `host:5432:none` (any one node; `none` because there is no Patroni port) |
+| Stolon, CloudNativePG, plain streaming | every node: `host1:5432:none,host2:5432:none,host3:5432:none` |
 | Citus | the coordinator, `host:5432:none` |
-| pg_auto_failover | a data node or the monitor, `host:5432:none` |
+| pg_auto_failover | both data nodes, `host1:5432:none,host2:5432:none` |
 | pgpool-II | the pgpool address, usually `host:9999:none` |
 
 Good to know:

@@ -1140,6 +1140,22 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         rep.check(pg_mod.detect_cluster_type(dict(pg_ev, pgpool=True, patroni={"is_patroni": True, "scope": "x"}))[0] == "Patroni",
                   "pgpool-II in front of Patroni is reported as Patroni")
         rep.check("pgpool-II" in pg_mod.SUPPORTED_CLUSTER_TYPES, "pgpool-II is on the supported cluster types list")
+        for name in ("Patroni", "repmgr", "Stolon", "Citus Distributed", "pg_auto_failover", "CloudNative-PG", "pgpool-II", "Multi-Master (native logical)"):
+            rep.check(name in pg_mod.SUPPORTED_CLUSTER_TYPES, f"{name} is on the supported cluster types list")
+        # every type the detection can name for a live-tested cluster must be accepted, or the monitor would go Down
+        got = pg_mod.detect_cluster_type(dict(pg_ev, extensions=["citus"], primary_count=3))[0]
+        rep.check(got == "Citus Distributed", f"Citus with three writable nodes is Citus, not a conflict ({got})")
+        for label, kw in (("Stolon", dict(slot_names=["stolon_keeper1"])), ("pg_auto_failover", dict(slot_names=["pgautofailover_standby_2"])),
+                          ("CloudNative-PG", dict(slot_names=["_cnpg_cluster_2"])), ("Citus Distributed", dict(extensions=["citus"]))):
+            got = pg_mod.detect_cluster_type(dict(pg_ev, **kw))[0]
+            rep.check(got == label and got in pg_mod.SUPPORTED_CLUSTER_TYPES, f"{label} fixture is detected as {got} and accepted")
+
+        # Every node on its own host with the same port 5432 (real clusters): the seed must not take another node's name
+        pg_mod.discover_cluster_members = fake([m("n1", "h1"), m("n2", "h2"), m("n3", "h3"), m("w1", "h4")])
+        cfg_same = "h2:5432:none"
+        nd = collector(cfg_same)._apply_discovery(collector(cfg_same)._parse_nodes())
+        rep.check(sorted(d[0] for d in nd) == ["n1", "n2", "n3", "w1"] and len(nd) == 4,
+                  f"Four hosts that all use port 5432 are all kept, none lost to a port-only name match ({sorted(d[0] for d in nd)})")
 
         # Switch off
         names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]

@@ -137,6 +137,10 @@ SUPPORTED_CLUSTER_TYPES = {
     "Multi-Master (native logical)",
     "Multi-Master (pglogical)",
     "pgpool-II",
+    "Stolon",
+    "Citus Distributed",
+    "pg_auto_failover",
+    "CloudNative-PG",
 }
 
 def parse_address_map(raw_map):
@@ -711,7 +715,8 @@ def detect_cluster_type(evidence):
     elif "pglogical" in exts and primary_count >= 2:
         managers.append("Multi-Master (pglogical)")
         manager_evidences.append(f"pglogical active-active mesh ({primary_count} writable nodes)")
-    elif primary_count >= 2:
+    elif primary_count >= 2 and "citus" not in exts:
+        #Citus workers are all writable on purpose, so several primaries are not a split brain there
         has_logical_slots = any(t == "logical" for t in slot_types) or any("logical" in str(s).lower() for s in slot_types)
         subscriptions_count = evidence.get("subscriptions_count", 0)
         logical_count = evidence.get("logical_replication_count", 0)
@@ -1859,7 +1864,9 @@ class PostgresClusterCollector:
                     if isinstance(k, tuple):
                         h, p = k
                         endpoints[f"{h}:{p}"] = str(v)
-                        endpoints[str(p)] = str(v)
+                        pk = str(p)
+                        #the same port on different hosts is ambiguous: keep only the host:port key for it
+                        endpoints[pk] = "" if (pk in endpoints and endpoints[pk] != str(v)) else str(v)
                     else:
                         endpoints[str(k)] = str(v)
             data = {
@@ -2026,22 +2033,19 @@ class PostgresClusterCollector:
             mname = seed_names.get((_norm_host(h), p_int)) or seed_names.get(p_int)
             if not mname and pat_str and pat_str != "none":
                 mname = seed_names.get((h_norm, pat_str)) or seed_names.get(pat_str)
+            #A port alone names a node only when no other node uses that port (on real clusters every node has port 5432)
             if not mname:
-                for m in members:
-                    if int(m.get("port", 0)) == p_int:
-                        mname = safe_name(m.get("alias") or m.get("name"))
-                        break
-                    if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str:
-                        mname = safe_name(m.get("alias") or m.get("name"))
-                        break
+                by_port = [m for m in members if int(m.get("port", 0)) == p_int]
+                by_pat = [m for m in members if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str]
+                pick = by_port[0] if len(by_port) == 1 else (by_pat[0] if len(by_pat) == 1 else None)
+                if pick:
+                    mname = safe_name(pick.get("alias") or pick.get("name"))
             if not mname and cache and "members" in cache:
-                for m in cache["members"]:
-                    if int(m.get("port", 0)) == p_int:
-                        mname = safe_name(m.get("name"))
-                        break
-                    if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str:
-                        mname = safe_name(m.get("name"))
-                        break
+                c_port = [m for m in cache["members"] if int(m.get("port", 0)) == p_int]
+                c_pat = [m for m in cache["members"] if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str]
+                pick = c_port[0] if len(c_port) == 1 else (c_pat[0] if len(c_pat) == 1 else None)
+                if pick:
+                    mname = safe_name(pick.get("name"))
             if mname:
                 known_member.add(mname.lower())
                 if not a:

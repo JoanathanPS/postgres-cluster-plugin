@@ -40,14 +40,14 @@ def dotenv(name):
 BEDS = [
     ("patroni (seed = one member)", "patroni-cluster_default", "patroni-pg-node1", "pg-node1:5432:8008", "site24x7", lambda: "site24x7", "appdb", 3, 1, "Patroni"),
     ("plain streaming (seed = standby)", "pg-cluster-site24x7_default", "pg-cluster-site24x7-pg-replica-1", "pg-replica:5432:none", "site24x7", lambda: dotenv("MONITOR_PASSWORD"), "postgres", 2, 1, "streaming"),
-    ("plain streaming (seed = primary)", "pg-cluster-site24x7_default", "pg-cluster-site24x7-pg-primary-1", "pg-primary:5432:none", "site24x7", lambda: dotenv("MONITOR_PASSWORD"), "postgres", 2, 1, "streaming"),
-    ("repmgr (seed = standby)", "tb-repmgr_default", "tb-repmgr-repmgr-node2-1", "repmgr-node2:5432:none", "site24x7", lambda: "site24x7", "postgres", 3, 1, "repmgr"),
+    ("plain streaming (both addresses listed)", "pg-cluster-site24x7_default", "pg-cluster-site24x7-pg-primary-1", "pg-primary:5432:none,pg-replica:5432:none", "site24x7", lambda: dotenv("MONITOR_PASSWORD"), "postgres", 2, 1, "streaming"),
+    ("repmgr (seed = standby; primary, 2 standbys and a witness)", "tb-repmgr_default", "repmgr-node2", "repmgr-node2:5432:none", "site24x7", lambda: "site24x7", "postgres", 4, 1, "repmgr"),
     ("multi-master logical mesh", "pg-multimaster_default", "pg-mm1", "pg-mm1:5432:none", "site24x7", lambda: env_password("pg-mm1"), "postgres", 3, 3, "Multi-Master"),
-    ("pg_auto_failover (seed = data node)", "tb-pgaf_default", "tb-pgaf-pgaf-node1-1", "pgaf-node1:5432:none", "docker", lambda: "", "postgres", 2, 1, "pg_auto_failover"),
-    ("stolon (seed = keeper)", "tb-stolon_default", "tb-stolon-stolon-keeper1-1", "stolon-keeper1:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 1, "Stolon"),
+    ("pg_auto_failover (both data nodes listed)", "tb-pgaf_default", "tb-pgaf-pgaf-node1-1", "pgaf-node1:5432:none,pgaf-node2:5432:none", "docker", lambda: "", "postgres", 2, 1, "pg_auto_failover"),
+    ("stolon (all three keepers listed)", "tb-stolon_default", "tb-stolon-stolon-keeper1-1", "stolon-keeper1:5432:none,stolon-keeper2:5432:none,stolon-keeper3:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 1, "Stolon"),
     ("citus (seed = coordinator)", "tb-citus_default", "tb-citus-citus-coordinator-1", "citus-coordinator:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 3, "Citus"),
     ("pgpool-II (seed = the pgpool address)", "tb-pgpool_default", "tb-pgpool-pgpool-1", "pgpool:9999:none", "site24x7", lambda: "", "postgres", 3, 1, "pgpool"),
-    ("cloudnativepg", "kind", "cnpg-test-control-plane", "cnpg-test-ro:5432:none", "postgres", lambda: "", "postgres", 3, 1, "CloudNative"),
+    ("cloudnativepg", "kind", "cnpg-test-control-plane", "cnpg-test-ro:5432:none", "postgres", lambda: "", "postgres", 2, 1, "CloudNative"),
 ]
 
 
