@@ -1,34 +1,50 @@
 {
-  "timestamp": 1793868779,
-  "source": "Patroni REST API",
+  "timestamp": 1793952647,
+  "source": "repmgr.nodes",
   "endpoints": {
-    "127.0.0.1:5442": "pgnode2",
-    "5442": "pgnode2",
     "127.0.0.1:5441": "pgnode1",
     "5441": "pgnode1",
+    "127.0.0.1:5442": "pgnode2",
+    "5442": "pgnode2",
     "127.0.0.1:5443": "pgnode3",
     "5443": "pgnode3",
-    "127.0.0.1:5499": "pgnode1",
-    "5499": "pgnode1"
+    "127.0.0.1:5499": "pgnode2",
+    "5499": "pgnode2",
+    "127.0.0.1:5491": "pgnode1",
+    "5491": "pgnode1",
+    "127.0.0.1:5492": "pgnode2",
+    "5492": "pgnode2",
+    "127.0.0.1:5493": "pgnode3",
+    "5493": "pgnode3"
   },
   "members": [
     {
-      "name": "pgnode1",
-      "host": "pg-node1",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "repmgrnode1",
+      "host": "127.0.0.1",
+      "port": 5461,
+      "patroni_port": "none",
+      "role": "standby"
     },
     {
-      "name": "pgnode2",
-      "host": "pg-node2",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "repmgrnode2",
+      "host": "127.0.0.1",
+      "port": 5462,
+      "patroni_port": "none",
+      "role": "primary"
     },
     {
-      "name": "pgnode3",
-      "host": "pg-node3",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "repmgrnode3",
+      "host": "127.0.0.1",
+      "port": 5463,
+      "patroni_port": "none",
+      "role": "standby"
+    },
+    {
+      "name": "repmgrwitness",
+      "host": "127.0.0.1",
+      "port": 5464,
+      "patroni_port": "none",
+      "role": "witness"
     }
   ]
 }

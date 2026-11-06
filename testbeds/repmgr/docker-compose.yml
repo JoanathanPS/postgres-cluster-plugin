@@ -1,4 +1,4 @@
-# repmgr test bed: 1 primary + 2 standbys, metadata in database "repmgr".
+# repmgr test bed: 1 primary + 2 standbys + 1 witness, metadata in database "repmgr".
 name: tb-repmgr
 x-node: &node
   build: .
@@ -9,12 +9,28 @@ x-node: &node
 services:
   repmgr-node1:
     <<: *node
+    container_name: repmgr-node1
     environment: { NODE_ID: "1", NODE_NAME: repmgr-node1 }
+    ports:
+      - "5461:5432"
   repmgr-node2:
     <<: *node
+    container_name: repmgr-node2
     environment: { NODE_ID: "2", NODE_NAME: repmgr-node2, PRIMARY_HOST: repmgr-node1 }
     depends_on: { repmgr-node1: { condition: service_healthy } }
+    ports:
+      - "5462:5432"
   repmgr-node3:
     <<: *node
+    container_name: repmgr-node3
     environment: { NODE_ID: "3", NODE_NAME: repmgr-node3, PRIMARY_HOST: repmgr-node1 }
     depends_on: { repmgr-node1: { condition: service_healthy } }
+    ports:
+      - "5463:5432"
+  repmgr-witness:
+    <<: *node
+    container_name: repmgr-witness
+    environment: { NODE_ID: "4", NODE_NAME: repmgr-witness, NODE_TYPE: witness, PRIMARY_HOST: repmgr-node1 }
+    depends_on: { repmgr-node1: { condition: service_healthy } }
+    ports:
+      - "5464:5432"

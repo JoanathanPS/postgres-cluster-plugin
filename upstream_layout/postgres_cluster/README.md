@@ -11,8 +11,8 @@ In Site24x7, numeric metrics that do not belong to any tab's `tablist` are autom
 | OG Standalone Tab / Section | Dev Cluster Tab / Section | Description & Included Metrics | Child Tables |
 | :--- | :--- | :--- | :--- |
 | **Summary (Untabbed)** | **Summary (Untabbed)** | 14 OG charts + 2 cluster summary metrics + the OG textual `Server Version`: `Active Connections`, `Active Queries`, `Active Waiting Queries`, `Cache Hit Ratio`, `Database Count`, `Heap Blocks Hit`, `Heap Blocks Read`, `Index Rows Fetched`, `Index Rows Read`, `Index Scans`, `Locks Count`, `Max Connections`, `Table Count`, `Uptime`, `Cluster Health`, `Nodes Up`, `Server Version`. | *None (Charts only)* |
-| *New Cluster Section* | **Cluster** (Order 1) | Cluster topology & health charts: `Nodes Total`, `Primary Count`, `Primary Timeline`, `No Primary Flag`, `Split Brain Flag`, `Timeline Mismatch Flag`, `Server PID` (*needs TL approval*). | `Cluster_Info` (1 row metadata: type, evidence, version, primary, health reason), `Cluster_Nodes` (Per-node role, timeline, latency, connections, backlog). |
-| *Replication Section* | **Replication** (Order 2) | Standby replication & slot tracking: `Standbys Expected`, `Standbys Streaming`, `Standby Disconnect Flag`, `Sync Standby Count`, `Cascading Standby Count`, `Max Replay Backlog`, `Max Replay Delay`, `Replication Slots Total/Active/Inactive`, `Max Slot Lag Bytes`, `Logical Replication In Use`. | `Replication_Standbys` (Live streaming standbys & byte/sec lags), `Replication_Slots` (Replication slots & retained WAL). |
+| *New Cluster Section* | **Cluster** (Order 1) | Cluster topology & health charts: `Nodes Total`, `Primary Count`, `Primary Timeline`, `No Primary Flag`, `Split Brain Flag`, `Timeline Mismatch Flag`, `Server PID` (*needs TL approval*), `Seconds Since Last Failover`, `Failovers Last 24h`, `Last Failover To`, `Last Failover Timeline`. | `Cluster_Info` (1 row metadata: type, evidence, version, primary, health reason), `Cluster_Nodes` (Per-node role, timeline, latency, connections, backlog). |
+| *Replication Section* | **Replication** (Order 2) | Standby replication & slot tracking: `Standbys Expected`, `Standbys Streaming`, `Standby Disconnect Flag`, `Sync Standby Count`, `Cascading Standby Count`, `Max Replay Backlog`, `Max Replay Delay`, `Replication Slots Total/Active/Inactive`, `Max Slot Lag Bytes`, `Slot Wal Status Risk`, `Logical Replication In Use`. | `Replication_Standbys` (Live streaming standbys & byte/sec lags), `Replication_Slots` (Replication slots & retained WAL). |
 | **DB and IO / BG Writer** | **Node Performance** (Order 3) | Primary and per-node I/O, tuples, buffers, checkpoints: `Total Rows Inserted/Updated/Deleted/Fetched/Returned`, `Total Block Reads/Hits`, `Buffers Alloc/Checkpoint/Clean/Backend/Backend Fsync`, `Checkpoint Sync/Write Time`, `Checkpoints Req/Timed`, `Maxwritten Clean`, `Dead Tuples`. | `Node_IO` (Per-node DML & cache hits), `Node_Checkpoints` (Per-node checkpoints & buffers), `Stats_per_DB` (Discovered databases on primary). |
 | **Sessions and Transactions** | **Transactions and Sessions** (Order 4) | Transaction states, lock contention, sessions: `Total Commits`, `Total Rollbacks`, `Total Conflicts`, `Total Sessions`, `Total Sessions Abandoned/Fatal/Killed`, `Transactions Idle In Transaction`, `Transactions Open`, `Connection Utilization Percent`, `Oldest Transaction ID Age`, `Oldest Running Transaction Age`. | `Node_Activity` (Per-node active queries & locks), `Node_Transactions` (Per-node commits & rollbacks), `Tranasctions_and_Session_per_Database` (Discovered databases session lifecycle). |
 | *New WAL Section* | **WAL and Recovery** (Order 5) | Write-ahead logging, archive telemetry, standby conflict sums: `WAL Write Position`, `WAL Insert Position`, `WAL Flush Position`, `WAL Files Count`, `WAL Total Size`, `Archive Mode`, `Archive Status Success`, `Archive Status Failed`, `Archive Ready Files Count`, `Last Archived WAL File`, `Recovery Conflicts Total`, `Conflicts Tablespace`, `Conflicts Lock`, `Conflicts Snapshot`, `Conflicts Buffer Pin`, `Conflicts Deadlock`. | *None (Charts only)* |
@@ -43,6 +43,8 @@ In Site24x7, numeric metrics that do not belong to any tab's `tablist` are autom
 The plugin computes `Cluster Health` as an integer status code (`0` = Healthy, `1` = Degraded, `2` = Critical) alongside a human-readable `health_reason` string in `Cluster_Info` (< 100 characters). The rules evaluate top-down, returning the first matching rule:
 
 ### 1. Critical (`Cluster Health = 2`)
+- **Critical Replication Slot Retained WAL**: An inactive replication slot exceeds `slot_critical_bytes` (default 10 GB) or reports `wal_status == lost`.
+  - *Reason*: `Critical: Slot <name> retains <N> GB WAL`
 - **No Primary**: Zero reachable nodes report read-write primary status (`Primary Count == 0`).
   - *Reason*: `Critical: No active primary node detected`
 - **Split Brain**: Multiple nodes simultaneously report read-write primary status (`Primary Count > 1`), except in Multi-Master / Active-Active architectures where multiple primaries are expected.
@@ -59,8 +61,12 @@ The plugin computes `Cluster Health` as an integer status code (`0` = Healthy, `
   - *Reason*: `Degraded: Replay delay X.Xs exceeds threshold (60s)`
 - **Replay Backlog Over Threshold**: Standby replication byte backlog exceeds 100 MB (`Max Replay Backlog > 104,857,600 bytes`).
   - *Reason*: `Degraded: Replay backlog X.XMB exceeds threshold (100MB)`
+- **Replication Slot Retained WAL Over Warning Threshold**: An inactive replication slot exceeds `slot_warn_bytes` (default 1 GB).
+  - *Reason*: `Degraded: Slot <name> retains <N> GB WAL`
 - **Inactive Replication Slot**: One or more replication slots are inactive, risking disk fill (`Replication Slots Inactive > 0`).
   - *Reason*: `Degraded: N inactive replication slot(s) found`
+- **Recent Failover Window**: A failover occurred recently within `failover_warn_seconds` (default 900s, 0 disables).
+  - *Reason*: `Failover <N> min ago: primary now <node> (timeline X to Y)`
 - **Timeline Mismatch**: Any active node's timeline diverges from the primary's timeline (`Timeline Mismatch Flag == 1`).
   - *Reason*: `Degraded: Timeline mismatch detected across cluster nodes`
 
@@ -133,7 +139,7 @@ db=postgres
 | :--- | :--- |
 | Patroni (3 nodes, etcd, HAProxy, PostgreSQL 17.2) | Live: all 3 nodes and roles from one member; healthy, node stopped, primary stopped and promoted, node rejoining; Site24x7 console verified |
 | Plain streaming replication (2 nodes) | Live: all nodes from either the standby or the primary |
-| repmgr (1 primary + 2 standbys, PostgreSQL 16) | Live: type `repmgr`, 3 nodes |
+| repmgr (1 primary + 2 standbys + 1 witness node, PostgreSQL 17, repmgr 5.5.0) | Live: automatic failover via repmgrd, node down, standby down, witness role detection (excluded from Standbys Expected, no false split brain), failover history via repmgr.events |
 | Stolon (etcd, 3 keepers, PostgreSQL 15) | Live: type `Stolon`, 3 nodes, roles after Stolon's own election |
 | pg_auto_failover (monitor + 2 nodes, PostgreSQL 11 demo image) | Live from a data node: type `pg_auto_failover`, 2 nodes |
 | Citus (coordinator + 2 workers) | Live: type `Citus Distributed`, 3 nodes, no false split brain |
@@ -154,7 +160,8 @@ db=postgres
 | Cluster or setup | Why |
 | :--- | :--- |
 | AWS RDS and Aurora, Azure Database for PostgreSQL, Google Cloud SQL | Their node lists and failover state live in the cloud provider's API, not in PostgreSQL, and a Multi-AZ standby is usually not reachable by clients. The plugin can label them from catalog roles, but it cannot find or monitor their standbys. |
-| A load balancer, proxy or virtual IP given as a node (HAProxy, PgBouncer, a floating IP) | It is one address that hides the real nodes, so the plugin sees a single node and reports `standalone`. Give the addresses of the real nodes. |
+| Connection Poolers (PgBouncer, pgpool in pool-mode) | If a pooler is provided as the seed, the plugin triggers an immediate Pooler Guard error (`ConfigError: Seed looks like a connection pooler: point nodes at a PostgreSQL node`). Monitor the PostgreSQL nodes directly, not the pooler. |
+| A load balancer, proxy or virtual IP given as a node (HAProxy, floating VIP) | It is one address that hides the real nodes, so the plugin sees a single node and reports `standalone`. Give the addresses of the real nodes. |
 | Databases that only speak the PostgreSQL protocol (CockroachDB, YugabyteDB and similar) | They do not use PostgreSQL's replication views, so roles, lag and slots cannot be read. |
 | Pacemaker/Corosync (PAF), pgpool-II watchdog, Postgres-XL and other products not listed above | Never tried. A cluster that uses plain streaming replication will probably work by listing its nodes, but nothing has been verified, so it is not claimed. |
 | PostgreSQL versions older than 17, and the Linux agent | The code has separate queries for older versions and a Linux installer, but neither has been run (see "Known Limitations"). |
@@ -178,7 +185,7 @@ Follow these steps in order. A cluster type only moves to **Supported** in the t
 
 - Discovery from the replication topology only sees a standby's IP, so the primary's port is assumed for it. Use Patroni or repmgr (exact lists) or list such nodes explicitly if they use another port.
 - Discovered addresses must be reachable from the agent. Names that only resolve inside a container network show as offline nodes.
-- repmgr: the monitoring user needs `USAGE` on schema `repmgr` and `SELECT` on its tables to read the catalog; without it the replication topology is walked instead.
+- repmgr: the monitoring user needs `USAGE` on schema `repmgr` and `SELECT` on its tables to read the catalog (`GRANT USAGE ON SCHEMA repmgr TO site24x7; GRANT SELECT ON ALL TABLES IN SCHEMA repmgr TO site24x7;`). The plugin dynamically searches `pg_database` for the database housing the `repmgr` catalog. Tested live: automatic failover with `repmgrd`, primary down, standby down, and witness node tracking. Untested limitations: cascading standbys and manual CLI `repmgr standby switchover` were not evaluated in the automated test harness.
 - A node that is removed from the cluster stops being listed, but Site24x7 keeps the old row in the child tables.
 - Citus: workers are separate primaries, so several primaries are not reported as split brain.
 - Multi-master topologies with several primaries look like split brain unless the type is detected as multi-master.

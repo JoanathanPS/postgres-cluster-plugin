@@ -1193,6 +1193,60 @@ def test_parts_abc_unit(rep):
     rep.check(h6 == 0, f"Failover past window gives Healthy: {r6}")
 
 
+def test_repmgr_live(plugin_py, rep):
+    print("\n=== Test: repmgr Live Integration (Witness, Standbys, Failover History) ===")
+    import socket
+    s = socket.socket()
+    s.settimeout(1.0)
+    try:
+        s.connect(('127.0.0.1', 5462))
+        s.close()
+        is_live = True
+    except Exception:
+        is_live = False
+
+    if not is_live:
+        print("  [SKIP] repmgr cluster on 127.0.0.1:5462 not reachable; skipping live test")
+        return
+
+    cmd = [
+        sys.executable, plugin_py,
+        "--nodes", "127.0.0.1:5462:none",
+        "--username", "site24x7",
+        "--password", "site24x7",
+        "--db", "postgres",
+        "--address_map", "repmgr-node1=127.0.0.1:5461,repmgr-node2=127.0.0.1:5462,repmgr-node3=127.0.0.1:5463,repmgr-witness=127.0.0.1:5464",
+        "--failover_warn_seconds", "0"
+    ]
+    t0 = time.time()
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+    elapsed = time.time() - t0
+    rep.check(res.returncode == 0, f"repmgr run exit code 0 (elapsed: {elapsed:.2f}s)")
+    try:
+        data = json.loads(res.stdout)
+        rep.ok("Valid JSON returned for repmgr cluster")
+        c_type = data.get("Cluster_Info", [{}])[0].get("cluster_type")
+        rep.check(c_type == "repmgr", f"Cluster Type is repmgr ({c_type})")
+        rep.check(data.get("Nodes Total") == 4, f"Nodes Total is 4 ({data.get('Nodes Total')})")
+        rep.check(data.get("Nodes Up") == 4, f"Nodes Up is 4 ({data.get('Nodes Up')})")
+        rep.check(data.get("Primary Count") == 1, f"Primary Count is 1 ({data.get('Primary Count')})")
+        rep.check(data.get("Standbys Expected") == 2, f"Standbys Expected is 2 (witness excluded) ({data.get('Standbys Expected')})")
+        rep.check(data.get("Standbys Streaming") == 2, f"Standbys Streaming is 2 ({data.get('Standbys Streaming')})")
+        rep.check(data.get("Standby Disconnect Flag") == 0, "Standby Disconnect Flag is 0")
+        rep.check(data.get("Cluster Health") == 0, f"Cluster Health is 0 healthy ({data.get('Cluster Health')})")
+        rep.check(data.get("Seconds Since Last Failover") is not None, f"Seconds Since Last Failover present ({data.get('Seconds Since Last Failover')})")
+        rep.check(data.get("Failovers Last 24h") >= 1, f"Failovers Last 24h >= 1 ({data.get('Failovers Last 24h')})")
+        rep.check(data.get("Last Failover To") == "repmgrnode2", f"Last Failover To is repmgrnode2 ({data.get('Last Failover To')})")
+
+        nodes = data.get("Cluster_Nodes", [])
+        witness_nodes = [n for n in nodes if n.get("role") == "witness"]
+        rep.check(len(witness_nodes) == 1, f"Exactly 1 witness node found with role witness (found {len(witness_nodes)})")
+        if witness_nodes:
+            rep.check(witness_nodes[0].get("is_primary") == 0, "Witness node is_primary is 0")
+    except Exception as e:
+        rep.fail(f"Failed to parse repmgr output: {e}\n{res.stdout}\n{res.stderr}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="PostgreSQL Cluster Plugin Test Suite")
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
@@ -1289,6 +1343,7 @@ def main():
     test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep)
     test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep)
     test_parts_abc_unit(rep)
+    test_repmgr_live(plugin_py, rep)
 
     # Test 10: Dynamic Failover Assertion
     if args.failover:

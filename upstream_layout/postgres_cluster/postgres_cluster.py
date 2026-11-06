@@ -105,6 +105,7 @@ def classify(e):
 
 SUPPORTED_CLUSTER_TYPES = {
     "Patroni",
+    "repmgr",
     "streaming replication (no HA manager detected)",
     "standalone",
     "Multi-Master (native logical)",
@@ -198,11 +199,11 @@ PATRONI_PORT = ''
 ADDRESS_MAP = ''                                                         # optional: internal_host:port=reachable_host:port, comma separated (for Docker/NAT)                                                        # Patroni REST API port; leave empty if the cluster is not Patroni
 CLUSTER_TYPE = 'auto'                                                    # 'auto' or explicit override
 DISCOVER = 'auto'                                                        # 'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes
-DISCOVERY_DEADLINE_S = 2.5                                               # Max seconds spent discovering cluster members
+DISCOVERY_DEADLINE_S = 2.0                                               # Max seconds spent discovering cluster members
 MAX_NODES = 25                                                           # Site24x7 allows at most 25 rows per table
 CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
 STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
-NODE_COLLECT_DEADLINE_S = 6                                              # Maximum seconds allowed for all nodes collection
+NODE_COLLECT_DEADLINE_S = 5.0                                              # Maximum seconds allowed for all nodes collection
 
 FAILOVER_WARN_SECONDS = 900
 SLOT_WARN_BYTES = 1073741824
@@ -739,7 +740,7 @@ class PostgresNodeClient:
     Encapsulates all node-specific connection state, version detection, query preparation,
     evidence, and per-node table collection without any module-level global variables.
     """
-    def __init__(self, name, host, port, username, password, db, patroni_port=None, has_explicit_alias=False):
+    def __init__(self, name, host, port, username, password, db, patroni_port=None, has_explicit_alias=False, discovered_role=None):
         self.name = name                               # Display name / alias in tables
         self.has_explicit_alias = has_explicit_alias
         self.raw_host = host
@@ -749,6 +750,8 @@ class PostgresNodeClient:
         self.password = password
         self.db = db
         self.patroni_port = patroni_port
+        self.discovered_role = str(discovered_role).strip().lower() if discovered_role else None
+        self.is_witness = (self.discovered_role == "witness")
         self.endpoint_str = f"{host}:{port}"
         if patroni_port and patroni_port != "none":
             self.endpoint_str += f":{patroni_port}"
@@ -864,7 +867,22 @@ class PostgresNodeClient:
                 in_rec = cur.fetchone()[0]
                 self.is_primary = not in_rec
 
-                if self.is_primary:
+                if self.is_witness or self.discovered_role == "witness":
+                    self.is_primary = False
+                    self.is_witness = True
+                elif self.is_primary:
+                    try:
+                        cur.execute("SELECT type FROM repmgr.nodes WHERE node_name = %s OR conninfo LIKE %s LIMIT 1;", (self.name, f"%host={self.hostname}%"))
+                        r = cur.fetchone()
+                        if r and str(r[0]).strip().lower() == "witness":
+                            self.is_primary = False
+                            self.is_witness = True
+                    except Exception:
+                        pass
+
+                if self.is_witness:
+                    self.timeline = 0
+                elif self.is_primary:
                     try:
                         cur.execute("SELECT ('x' || substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8))::bit(32)::int;")
                         r = cur.fetchone()
@@ -1162,9 +1180,20 @@ class PostgresNodeClient:
                     if r and r[0]:
                         evidence["repmgr_table"] = True
                     else:
-                        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'repmgr';")
-                        if cur.fetchone() and _repmgr_via_database(self.hostname, self.port, self.username, self.password):
-                            evidence["repmgr_table"] = True
+                        cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
+                        for db_cand in [row[0] for row in cur.fetchall()]:
+                            try:
+                                c = _pg_connect(self.hostname, self.port, self.username, self.password, db_cand)
+                                with c.cursor() as c_cur:
+                                    c_cur.execute("SELECT to_regclass('repmgr.nodes');")
+                                    cr = c_cur.fetchone()
+                                    if cr and cr[0]:
+                                        evidence["repmgr_table"] = True
+                                c.close()
+                                if evidence.get("repmgr_table"):
+                                    break
+                            except Exception:
+                                continue
                 except Exception:
                     pass
 
@@ -1404,27 +1433,76 @@ def _alias_for(host, port, app, taken):
     return name
 
 
-def _repmgr_via_database(host, port, user, pw):
-    """repmgr keeps its catalog in a separate database (default name 'repmgr'). Returns its node list."""
-    out = []
-    try:
-        conn = _pg_connect(host, port, user, pw, "repmgr")
-    except Exception:
-        return out
+def _discover_repmgr_members(conn, host, port, user, pw, address_map=None):
+    """
+    Dynamically finds the database containing the repmgr schema by searching pg_database
+    (to_regnamespace or catalog query per database), never by a hard-coded name.
+    Reads repmgr.nodes (node_name, type, conninfo, active) safely without printing/leaking passwords.
+    """
+    repmgr_conn = None
+    close_needed = False
+
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT node_name, conninfo FROM repmgr.nodes ORDER BY node_id;")
-            for name, conninfo in cur.fetchall():
-                h, p = _conninfo_hostport(conninfo)
+            cur.execute("SELECT to_regclass('repmgr.nodes') IS NOT NULL;")
+            r = cur.fetchone()
+            if r and r[0]:
+                repmgr_conn = conn
+    except Exception:
+        pass
+
+    if not repmgr_conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
+                candidates = [row[0] for row in cur.fetchall()]
+            for db_cand in candidates:
+                try:
+                    c = _pg_connect(host, port, user, pw, db_cand)
+                    with c.cursor() as cur:
+                        cur.execute("SELECT to_regclass('repmgr.nodes') IS NOT NULL;")
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            repmgr_conn = c
+                            close_needed = True
+                            break
+                    c.close()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if not repmgr_conn:
+        return []
+
+    out = []
+    try:
+        with repmgr_conn.cursor() as cur:
+            cur.execute("SELECT node_id, node_name, type, conninfo, active FROM repmgr.nodes ORDER BY node_id;")
+            for _nid, name, ntype, conninfo, active in cur.fetchall():
+                h, p = parse_conninfo_hostport(conninfo)
+                p = p or port
                 if h:
-                    out.append({"alias": safe_name(name), "member": str(name), "host": h, "port": p, "patroni_port": "none", "source": "repmgr.nodes"})
+                    mph, mpp = map_address(h, p, address_map)
+                    role = str(ntype).strip().lower()
+                    out.append({
+                        "alias": safe_name(name),
+                        "member": str(name),
+                        "host": mph,
+                        "port": int(mpp),
+                        "patroni_port": "none",
+                        "role": role,
+                        "active": bool(active),
+                        "source": "repmgr.nodes"
+                    })
     except Exception:
         pass
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if close_needed and repmgr_conn:
+            try:
+                repmgr_conn.close()
+            except Exception:
+                pass
     return out
 
 
@@ -1490,14 +1568,9 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
             continue
         try:
             with conn.cursor() as cur:
-                managed = _managed_members(cur, port)
+                managed = _discover_repmgr_members(conn, host, port, user, pw, address_map=address_map)
                 if not managed:
-                    try:
-                        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'repmgr';")
-                        if cur.fetchone():
-                            managed = _repmgr_via_database(host, port, user, pw)
-                    except Exception:
-                        pass
+                    managed = _managed_members(cur, port)
                 if managed:
                     return managed, managed[0]["source"]
 
@@ -1678,7 +1751,8 @@ class PostgresClusterCollector:
                         "name": str(m.get("alias") or m.get("member") or m.get("name")),
                         "host": str(m.get("host")),
                         "port": int(m.get("port")),
-                        "patroni_port": str(m.get("patroni_port", "none"))
+                        "patroni_port": str(m.get("patroni_port", "none")),
+                        "role": str(m.get("role", ""))
                     }
                     for m in members if (m.get("alias") or m.get("member") or m.get("name"))
                 ]
@@ -1778,24 +1852,38 @@ class PostgresClusterCollector:
                 if (m_h, m_p) not in known_seeds:
                     cached_extra.append((m_h, m_p, m_pat))
 
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(seeds + cached_extra) * 2 + 1))
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(len(seeds), len(cached_extra)) * 2 + 1))
+        t0_disc = time.monotonic()
         try:
-            fut = ex.submit(discover_cluster_members, seeds + cached_extra, self.username, self.password, self.db, DISCOVERY_DEADLINE_S, address_map=self.address_map)
-            members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S + 1)
+            fut = ex.submit(discover_cluster_members, seeds, self.username, self.password, self.db, DISCOVERY_DEADLINE_S, address_map=self.address_map)
+            members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S)
         except Exception:
             members, source, seed_names = [], "", {}
+        rem_disc = DISCOVERY_DEADLINE_S - (time.monotonic() - t0_disc)
+        if not members and cached_extra and rem_disc > 0.5:
+            try:
+                fut = ex.submit(discover_cluster_members, cached_extra, self.username, self.password, self.db, rem_disc, address_map=self.address_map)
+                members, source, seed_names = fut.result(timeout=rem_disc)
+            except Exception:
+                pass
         ex.shutdown(wait=False, cancel_futures=True)
 
         if not members and cache and "members" in cache:
             ts_str = time.strftime('%Y-%m-%d %H:%M:%S GMT', time.gmtime(cache.get('timestamp', time.time())))
             self._add_note(f"seed unreachable, members from {ts_str}")
             members = [
-                {"alias": m["name"], "member": m["name"], "host": m["host"], "port": m["port"], "patroni_port": m.get("patroni_port", "none"), "source": "topology cache"}
+                {"alias": m["name"], "member": m["name"], "host": m["host"], "port": m["port"], "patroni_port": m.get("patroni_port", "none"), "role": m.get("role", ""), "source": "topology cache"}
                 for m in cache["members"]
             ]
             source = "topology cache"
         elif members:
             self._save_cache(members, source, seed_names=seed_names)
+
+        self.role_map = {}
+        for m in members:
+            alias = safe_name(m.get("alias") or m.get("member") or m.get("name"))
+            if alias and m.get("role"):
+                self.role_map[alias.lower()] = str(m.get("role")).strip().lower()
 
         if not members:
             return node_defs
@@ -1942,8 +2030,10 @@ class PostgresClusterCollector:
             return results
 
         clients = []
+        role_map = getattr(self, "role_map", {})
         for dname, h, p, pat, has_alias in node_defs:
-            clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat, has_explicit_alias=has_alias))
+            d_role = role_map.get(dname.lower())
+            clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat, has_explicit_alias=has_alias, discovered_role=d_role))
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, nodes_total))
         future_to_client = {executor.submit(cli.collect_full): cli for cli in clients}
@@ -1981,7 +2071,7 @@ class PostgresClusterCollector:
         timeline_mismatch_flag = 0
         if primary_timeline > 0:
             for c in clients:
-                if c.is_up and c.timeline is not None and c.timeline != primary_timeline:
+                if c.is_up and not getattr(c, 'is_witness', False) and getattr(c, 'discovered_role', '') != 'witness' and c.timeline is not None and c.timeline != primary_timeline:
                     timeline_mismatch_flag = 1
                     self._add_note(f"Timeline mismatch: node {c.name} (TL {c.timeline}) != primary (TL {primary_timeline})")
                     break
@@ -2054,7 +2144,9 @@ class PostgresClusterCollector:
         is_mm = ("multi-master" in str(detected_type).lower())
         for c in clients:
             role_str = "offline"
-            if c.is_up:
+            if getattr(c, 'is_witness', False) or getattr(c, 'discovered_role', '') == "witness":
+                role_str = "witness" if c.is_up else "witness (offline)"
+            elif c.is_up:
                 if is_mm:
                     role_str = "master"
                 else:
@@ -2067,7 +2159,7 @@ class PostgresClusterCollector:
             node_row = {
                 "name": c.name,
                 "role": role_str,
-                "is_primary": 1 if (c.is_up and (c.is_primary or is_mm)) else 0,
+                "is_primary": 1 if (c.is_up and (c.is_primary or is_mm) and not getattr(c, 'is_witness', False)) else 0,
                 "status": 1 if c.is_up else 0,
                 "timeline": int(c.timeline) if c.timeline is not None else 0,
                 "connections": int(c.connections) if c.connections is not None else 0,
@@ -2644,12 +2736,10 @@ class PostgresClusterCollector:
 
         else:
             self._add_note("Cluster alert: No reachable primary node detected")
-        # Close all client connections
-        for cli in clients:
-            cli.close()
 
         # Standbys counts
-        standbys_expected = max(0, nodes_total - primary_count) if not is_mm else 0
+        witness_count = sum(1 for c in clients if getattr(c, 'is_witness', False) or getattr(c, 'discovered_role', '') == "witness")
+        standbys_expected = max(0, nodes_total - primary_count - witness_count) if not is_mm else 0
         standbys_streaming = (len(replication_links) + cascading_standbys_count) if not is_mm else 0
         standby_disconnect_flag = 1 if standbys_expected > standbys_streaming else 0
 
@@ -2708,6 +2798,95 @@ class PostgresClusterCollector:
                                     break
                             last_failover_to = matched_alias or safe_name(last_leader) or "none"
                         break
+        elif "repmgr" in str(detected_type).lower() or agg_evidence.get("repmgr_table"):
+            # Query repmgr.events for promote / failover history
+            repmgr_conn = None
+            close_rc = False
+            probe_clients = [c for c in clients if c.is_up and c.is_primary] + [c for c in clients if c.is_up and not c.is_primary]
+            for pc in probe_clients:
+                try:
+                    with pc.conn.cursor() as cur:
+                        cur.execute("SELECT to_regclass('repmgr.events') IS NOT NULL;")
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            repmgr_conn = pc.conn
+                            break
+                except Exception:
+                    pass
+                if not repmgr_conn:
+                    try:
+                        with pc.conn.cursor() as cur:
+                            cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
+                            cands = [row[0] for row in cur.fetchall()]
+                        for cand in cands:
+                            try:
+                                c = _pg_connect(pc.hostname, pc.port, self.username, self.password, cand)
+                                with c.cursor() as cur:
+                                    cur.execute("SELECT to_regclass('repmgr.events') IS NOT NULL;")
+                                    r = cur.fetchone()
+                                    if r and r[0]:
+                                        repmgr_conn = c
+                                        close_rc = True
+                                        break
+                                c.close()
+                            except Exception:
+                                continue
+                        if repmgr_conn:
+                            break
+                    except Exception:
+                        pass
+
+            if repmgr_conn:
+                try:
+                    with repmgr_conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT e.node_id, e.event, e.successful, e.event_timestamp, e.details, n.node_name
+                            FROM repmgr.events e
+                            LEFT JOIN repmgr.nodes n ON e.node_id = n.node_id
+                            WHERE e.event IN ('repmgrd_failover_promote', 'standby_promote', 'standby_switchover')
+                              AND e.successful = true
+                            ORDER BY e.event_timestamp DESC;
+                        """)
+                        ev_rows = cur.fetchall()
+                        if ev_rows:
+                            from datetime import datetime, timezone
+                            now = datetime.now(timezone.utc)
+                            last_ts = ev_rows[0][3]
+                            last_leader = ev_rows[0][5]
+                            if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo:
+                                dt = last_ts.astimezone(timezone.utc)
+                            else:
+                                dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+                            seconds_since_last_failover = max(0, int((now - dt).total_seconds()))
+                            last_failover_timeline = int(primary_timeline) if primary_timeline else 1
+
+                            for er in ev_rows:
+                                ets = er[3]
+                                if hasattr(ets, 'tzinfo') and ets.tzinfo:
+                                    edt = ets.astimezone(timezone.utc)
+                                else:
+                                    edt = datetime.fromisoformat(str(ets).replace("Z", "+00:00"))
+                                if (now - edt).total_seconds() <= 86400:
+                                    failovers_last_24h += 1
+
+                            matched_alias = None
+                            for nd in node_defs:
+                                if nd[0].lower() == str(last_leader).lower() or safe_name(last_leader).lower() == nd[0].lower():
+                                    matched_alias = nd[0]
+                                    break
+                            last_failover_to = matched_alias or safe_name(last_leader) or "none"
+                except Exception as e:
+                    self._add_note(f"repmgr.events failover history query: {e}")
+                finally:
+                    if close_rc and repmgr_conn:
+                        try:
+                            repmgr_conn.close()
+                        except Exception:
+                            pass
+
+        # Close all client connections after all probes and failover queries complete
+        for cli in clients:
+            cli.close()
 
         # Health Evaluation
         health_code, health_reason = evaluate_cluster_health(

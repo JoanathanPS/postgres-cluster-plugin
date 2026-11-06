@@ -1,6 +1,6 @@
 {
-  "timestamp": 1793868779,
-  "source": "Patroni REST API",
+  "timestamp": 1793952431,
+  "source": "streaming replication topology",
   "endpoints": {
     "127.0.0.1:5442": "pgnode2",
     "5442": "pgnode2",
@@ -13,22 +13,32 @@
   },
   "members": [
     {
-      "name": "pgnode1",
-      "host": "pg-node1",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "1270015461",
+      "host": "127.0.0.1",
+      "port": 5461,
+      "patroni_port": "none",
+      "role": ""
     },
     {
-      "name": "pgnode2",
-      "host": "pg-node2",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "1270015462",
+      "host": "127.0.0.1",
+      "port": 5462,
+      "patroni_port": "none",
+      "role": ""
     },
     {
-      "name": "pgnode3",
-      "host": "pg-node3",
-      "port": 5432,
-      "patroni_port": "8008"
+      "name": "1270015463",
+      "host": "127.0.0.1",
+      "port": 5463,
+      "patroni_port": "none",
+      "role": ""
+    },
+    {
+      "name": "1270015464",
+      "host": "127.0.0.1",
+      "port": 5464,
+      "patroni_port": "none",
+      "role": ""
     }
   ]
 }
