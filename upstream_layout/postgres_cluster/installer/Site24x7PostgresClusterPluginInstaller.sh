@@ -86,29 +86,30 @@ check_python() {
 
 get_plugin_data() {
     echo
-    echo "Enter PostgreSQL Cluster configuration details:"
+    echo "Enter PostgreSQL Cluster configuration details (there are no built-in defaults):"
     if [ -t 0 ] && [ -z "$NON_INTERACTIVE" ]; then
-        read -p "Enter cluster nodes (comma-separated host:port or name=host:port) [localhost:5441,localhost:5442,localhost:5443]: " input_nodes
-        nodes="${input_nodes:-localhost:5441,localhost:5442,localhost:5443}"
-
-        read -p "Enter monitoring username [site24x7]: " input_user
-        username="${input_user:-site24x7}"
-
-        read -s -p "Enter monitoring password [site24x7]: " input_pass
+        read -p "Enter the address of one cluster node, host:port[:patroni_port] (comma-separated for several): " nodes
+        read -p "Enter monitoring username: " username
+        read -s -p "Enter monitoring password: " password
         echo
-        password="${input_pass:-site24x7}"
-
-        read -p "Enter database name [postgres]: " input_db
-        db="${input_db:-postgres}"
-
-        read -p "Enter Patroni REST port (press Enter to skip) [8008]: " input_patroni
-        patroni_port="${input_patroni:-8008}"
+        read -p "Enter database name: " db
+        read -p "Enter Patroni REST port (leave empty if not Patroni): " patroni_port
     else
-        nodes="${PG_NODES:-localhost:5441,localhost:5442,localhost:5443}"
-        username="${MONITOR_USER:-site24x7}"
-        password="${MONITOR_PASSWORD:-site24x7}"
-        db="${MONITOR_DB:-postgres}"
-        patroni_port="${PATRONI_PORT:-8008}"
+        # Non-interactive: everything must be passed as environment variables
+        nodes="$PG_NODES"
+        username="$MONITOR_USER"
+        password="$MONITOR_PASSWORD"
+        db="$MONITOR_DB"
+        patroni_port="$PATRONI_PORT"
+    fi
+
+    missing=""
+    [ -z "$nodes" ] && missing="$missing nodes(PG_NODES)"
+    [ -z "$username" ] && missing="$missing username(MONITOR_USER)"
+    [ -z "$password" ] && missing="$missing password(MONITOR_PASSWORD)"
+    [ -z "$db" ] && missing="$missing database(MONITOR_DB)"
+    if [ -n "$missing" ]; then
+        error_handler 1 "Missing required setting(s):$missing. Enter them when asked, or export the variables in brackets for a non-interactive install."
     fi
 }
 

@@ -249,7 +249,9 @@ The installer finds Python, installs `psycopg2-binary` if it is missing, copies 
 sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
 ```
 
-Answer the prompts (nodes, username, password, database, Patroni port). The installer copies the plugin into the agent's plugin folder, writes the config, tests one run and shows the result.
+For an unattended install set `NON_INTERACTIVE=1` and export `PG_NODES`, `MONITOR_USER`, `MONITOR_PASSWORD` and `MONITOR_DB` (and `PATRONI_PORT` for Patroni) before running it.
+
+Answer the prompts (nodes, username, password, database, Patroni port). There are no built-in defaults: the nodes, username, password and database are all required, and the installer stops with a message naming whatever is missing. The installer copies the plugin into the agent's plugin folder, writes the config, tests one run and shows the result.
 
 **Manual install** (instead of the installer): create a folder named `postgres_cluster` inside the agent's plugin directory and put `postgres_cluster.py` and `postgres_cluster.cfg` in it.
 

@@ -8,15 +8,16 @@
     - Deploys postgres_cluster.py and postgres_cluster.cfg with redirect_output=1 under [global_configurations].
     - Verifies plugin output and JSON schema prior to completing installation.
 .PARAMETER Nodes
-    Comma-separated list of cluster nodes (default: "127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443")
+    REQUIRED. Address of one cluster node, or several comma separated: host:port[:patroni_port]
+    (the plugin finds the other nodes itself). There is no default.
 .PARAMETER Username
-    PostgreSQL monitoring username (default: "site24x7")
+    REQUIRED. PostgreSQL monitoring username. There is no default.
 .PARAMETER Password
-    PostgreSQL monitoring password
+    REQUIRED. PostgreSQL monitoring password. There is no default.
 .PARAMETER Database
-    Target database name (default: "postgres")
+    REQUIRED. Database the plugin connects to. There is no default.
 .PARAMETER PatroniPort
-    Patroni REST API port or mapping (default: "8008")
+    Patroni REST API port. Leave empty if the cluster is not Patroni.
 .PARAMETER AgentDir
     Site24x7 Windows Agent directory (default: "C:\Program Files (x86)\Site24x7\WinAgent")
 .PARAMETER PluginFolderName
@@ -28,18 +29,18 @@
 .PARAMETER DryRun
     Validates environment and runs plugin without modifying the Agent directory
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1 -NonInteractive
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "10.0.0.5:5432:8008" -Username "site24x7" -Password "<password>" -Database "postgres" -NonInteractive
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_dev" -NonInteractive
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_dev" -Nodes "10.0.0.5:5432:none" -Username "site24x7" -Password "<password>" -Database "postgres" -NonInteractive
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Nodes = "127.0.0.1:5441,127.0.0.1:5442,127.0.0.1:5443",
-    [string]$Username = "site24x7",
+    [string]$Nodes = "",
+    [string]$Username = "",
     [string]$Password = "",
-    [string]$Database = "postgres",
-    [string]$PatroniPort = "8008",
+    [string]$Database = "",
+    [string]$PatroniPort = "",
     [string]$AddressMap = "",
     [string]$AgentDir = "C:\Program Files (x86)\Site24x7\WinAgent",
     [string]$PluginFolderName = "postgres_cluster",
@@ -197,26 +198,26 @@ if ($machinePath -and $machinePath -notmatch [regex]::Escape($pyFolder)) {
 # ==============================================================================
 Write-Step "3/5 Configuration Parameters"
 
+# There are no built-in defaults: every required value is asked for, or must be passed as a parameter.
 if (-not $NonInteractive) {
-    $inputNodes = Read-Host "PostgreSQL Cluster Nodes [$Nodes]"
-    if ($inputNodes -ne "") { $Nodes = $inputNodes }
-
-    $inputUser = Read-Host "Monitoring Username [$Username]"
-    if ($inputUser -ne "") { $Username = $inputUser }
-
+    if ($Nodes -eq "") { $Nodes = Read-Host "PostgreSQL cluster node address, host:port[:patroni_port] (comma separated for several)" }
+    if ($Username -eq "") { $Username = Read-Host "Monitoring username" }
     if ($Password -eq "") {
-        $secPass = Read-Host -Prompt "Monitoring Password [site24x7]" -AsSecureString
-        $plainPass = [System.Net.NetworkCredential]::new("", $secPass).Password
-        if ($plainPass -ne "") { $Password = $plainPass } else { $Password = "site24x7" }
+        $secPass = Read-Host -Prompt "Monitoring password" -AsSecureString
+        $Password = [System.Net.NetworkCredential]::new("", $secPass).Password
     }
+    if ($Database -eq "") { $Database = Read-Host "Database name" }
+    if ($PatroniPort -eq "") { $PatroniPort = Read-Host "Patroni REST port (leave empty if not Patroni)" }
+}
 
-    $inputDb = Read-Host "Database Name [$Database]"
-    if ($inputDb -ne "") { $Database = $inputDb }
-
-    $inputPatroni = Read-Host "Patroni REST Port [$PatroniPort]"
-    if ($inputPatroni -ne "") { $PatroniPort = $inputPatroni }
-} else {
-    if ($Password -eq "") { $Password = "site24x7" }
+$missingSettings = @()
+if ($Nodes -eq "")    { $missingSettings += "Nodes" }
+if ($Username -eq "") { $missingSettings += "Username" }
+if ($Password -eq "") { $missingSettings += "Password" }
+if ($Database -eq "") { $missingSettings += "Database" }
+if ($missingSettings.Count -gt 0) {
+    Write-ErrorMsg ("Missing required setting(s): " + ($missingSettings -join ", ") + ". Pass them as parameters (for example -Nodes, -Username, -Password, -Database) or enter them when asked.")
+    exit 1
 }
 
 Write-Host "Config summary:"
@@ -235,6 +236,9 @@ $targetPluginsDir = Join-Path $AgentDir "monitoring\Plugins\$PluginFolderName"
 
 if ($DryRun) {
     Write-Success "[DRY RUN] Would deploy to: $targetPluginsDir"
+    # The verification step runs the collector from where it is, so the source path is needed in a dry run too.
+    $sourcePy = Join-Path $ScriptDir "postgres_cluster.py"
+    if (-not (Test-Path $sourcePy)) { $sourcePy = Join-Path (Split-Path -Parent $ScriptDir) "postgres_cluster.py" }
 } else {
     if (-not (Test-Path $AgentDir)) {
         Write-WarningMsg "Site24x7 Agent directory not found at '$AgentDir'."

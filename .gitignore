@@ -25,3 +25,6 @@ __pycache__/
 
 # legacy task folders
 ScheduledTask/
+
+# runtime files the plugin writes next to itself
+topology_cache.json
