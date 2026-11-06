@@ -1,12 +1,10 @@
 #!/usr/bin/python3
 
 ### This plugin is used for monitoring PostgreSQL Cluster
-### Monitors multiple nodes, detects primary/standby roles, health, replication lag,
-### replication slots, cluster manager type, per-node activity/throughput/checkpoints,
-### and collects PostgreSQL performance metrics across all nodes.
+### For monitoring the health, replication and performance metrics of all the nodes of your PostgreSQL cluster using Site24x7 Server Monitoring Plugins.
 ###
 ### Language : Python
-### Compatible with Site24x7 Linux and Windows Agents.
+### Tested with Patroni, repmgr, Stolon, Citus, pg_auto_failover, CloudNativePG and multi-master clusters (Windows agent verified with Patroni)
 
 import os
 import sys
@@ -54,11 +52,39 @@ class MetricUnavailable(PluginError):
     """Specific metric query failed due to permissions or missing views."""
     pass
 
+def _table_readable(cur, qualified):
+    """True only if the table exists and the current user may read it, so querying it can never raise a server-side error."""
+    try:
+        cur.execute("SELECT CASE WHEN to_regclass(%s) IS NULL THEN false ELSE has_table_privilege(to_regclass(%s), 'SELECT') END;", (qualified, qualified))
+        r = cur.fetchone()
+        return bool(r and r[0])
+    except Exception:
+        return False
+
+
+def _column_readable(cur, qualified, column):
+    """Same as _table_readable for one column (pg_subscription.subconninfo is readable by superusers or after a GRANT only)."""
+    try:
+        cur.execute("SELECT CASE WHEN to_regclass(%s) IS NULL THEN false ELSE has_column_privilege(to_regclass(%s), %s, 'SELECT') END;", (qualified, qualified, column))
+        r = cur.fetchone()
+        return bool(r and r[0])
+    except Exception:
+        return False
+
+
 def check_for_pooler(conn):
     """Detects if the endpoint is a connection pooler like PgBouncer.
     Raises ConfigError if a pooler is detected."""
     try:
         with conn.cursor() as cur:
+            #A real PostgreSQL answers this, so we stop here and no failing command is written to its log
+            try:
+                cur.execute("SELECT current_setting('server_version_num');")
+                r0 = cur.fetchone()
+                if r0 and str(r0[0]).strip().isdigit():
+                    return
+            except Exception:
+                pass
             try:
                 cur.execute("SHOW VERSION;")
                 row = cur.fetchone()
@@ -189,30 +215,35 @@ def parse_conninfo_hostport(conninfo):
     return host, port
 
 
-# There are NO built-in defaults for the cluster, login or database: they must come from postgres_cluster.cfg
-# (or the command line). A missing required setting is reported in the monitor's message and the monitor stays Down.
-NODES = ''                                                               # required: host:port[:patroni_port], or alias=host:port[:patroni_port], comma separated
-USERNAME = ''                                                            # required: monitoring user
-PASSWORD = ''                                                            # monitoring password (may be empty only if the server trusts the user)
-DB = ''                                                                  # required: database to connect to
-PATRONI_PORT = ''
-ADDRESS_MAP = ''                                                         # optional: internal_host:port=reachable_host:port, comma separated (for Docker/NAT)                                                        # Patroni REST API port; leave empty if the cluster is not Patroni
-CLUSTER_TYPE = 'auto'                                                    # 'auto' or explicit override
-DISCOVER = 'auto'                                                        # 'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes
-DISCOVERY_DEADLINE_S = 2.0                                               # Max seconds spent discovering cluster members
-MAX_NODES = 25                                                           # Site24x7 allows at most 25 rows per table
-CONNECT_TIMEOUT = 2                                                      # Timeout for connecting to each node (seconds)
-STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
-NODE_COLLECT_DEADLINE_S = 5.0                                              # Maximum seconds allowed for all nodes collection
+#These settings come from postgres_cluster.cfg. There are no built-in defaults for the first four.
+NODES = ''                        #Change the node address here: host:port[:patroni_port], one address is enough
+USERNAME = ''                     #Change the username here
+PASSWORD = ''                     #Change the authentication method
+DB = ''                           #Change the DB name here
+PATRONI_PORT = ''                 #Change the Patroni REST port here (leave empty if it is not a Patroni cluster)
+ADDRESS_MAP = ''                  #Optional, for Docker/NAT: internal_host:port=reachable_host:port, comma separated
+CLUSTER_TYPE = 'auto'             #auto detects the cluster type, or write the type here
+DISCOVER = 'auto'                 #auto finds the other nodes from the address above, off monitors only the nodes listed
 
-FAILOVER_WARN_SECONDS = 900
-SLOT_WARN_BYTES = 1073741824
-SLOT_CRITICAL_BYTES = 10737418240
+#Limits of this plugin, change them only if you know why
+DISCOVERY_DEADLINE_S = 2.0        #Seconds allowed for finding the nodes of the cluster
+MAX_NODES = 25                    #Site24x7 allows at most 25 rows in a table
+CONNECT_TIMEOUT = 2               #Seconds to wait when connecting to a node
+STATEMENT_TIMEOUT_MS = 3000       #Milliseconds a single query may run
+NODE_COLLECT_DEADLINE_S = 5.0     #Seconds allowed for collecting from all the nodes
 
+#Alert levels used in the health reason
+FAILOVER_WARN_SECONDS = 900       #A failover newer than this many seconds is reported
+SLOT_WARN_BYTES = 1073741824      #Replication slot retaining more WAL than this is a warning
+SLOT_CRITICAL_BYTES = 10737418240 #Replication slot retaining more WAL than this is critical
+
+#if any impacting changes to this plugin kindly increment the plugin version here.
 PLUGIN_VERSION = 2
+
+#Setting this to true will alert you when there is a communication problem while posting plugin data to server
 HEARTBEAT = True
 
-# Standard 5-Tab Layout for Site24x7 Console
+#Tabs shown in the console. A numeric metric that is in no tab is charted on the Summary page
 tabs = {
     "tabs": {
         "Cluster": {"order": "1", "tablist": [
@@ -246,6 +277,7 @@ tabs = {
             "Conflicts Deadlock"]}
     }
 }
+#Units of the metrics and of the table columns
 units = {
     # Cluster tab
     "Cluster Health": "status",
@@ -435,6 +467,7 @@ def get_standalone_queries(major_version, middle_version=0):
     Returns the exact SQL queries used by standalone postgres.py for parameter parity.
     Matches postgres.py query definitions character-for-character.
     """
+    #Add your queries here
     queries = {
         'table_count': "SELECT COUNT(*) AS table_count FROM pg_stat_all_tables;",
         'transactions_open': "SELECT count(*) as transactions_open FROM pg_stat_activity WHERE xact_start IS NOT NULL;",
@@ -472,6 +505,7 @@ def get_standalone_queries(major_version, middle_version=0):
     if major_version >= 14:
         queries['session'] = "SELECT SUM(sessions) as total_sessions, SUM(sessions_abandoned) as total_sessions_abandoned, SUM(sessions_fatal) as total_sessions_fatal, SUM(sessions_killed) as total_sessions_killed FROM pg_stat_database;"
 
+    #Please add any new query designed above to this dictionary also with an appropriate key name
     return queries
 
 
@@ -872,11 +906,12 @@ class PostgresNodeClient:
                     self.is_witness = True
                 elif self.is_primary:
                     try:
-                        cur.execute("SELECT type FROM repmgr.nodes WHERE node_name = %s OR conninfo LIKE %s LIMIT 1;", (self.name, f"%host={self.hostname}%"))
-                        r = cur.fetchone()
-                        if r and str(r[0]).strip().lower() == "witness":
-                            self.is_primary = False
-                            self.is_witness = True
+                        if _table_readable(cur, 'repmgr.nodes'):
+                            cur.execute("SELECT type FROM repmgr.nodes WHERE node_name = %s OR conninfo LIKE %s LIMIT 1;", (self.name, f"%host={self.hostname}%"))
+                            r = cur.fetchone()
+                            if r and str(r[0]).strip().lower() == "witness":
+                                self.is_primary = False
+                                self.is_witness = True
                     except Exception:
                         pass
 
@@ -1418,14 +1453,57 @@ def _conninfo_hostport(conninfo, default_port=None):
     return (h.group(1) if h else None), port_val
 
 
-def _alias_for(host, port, app, taken):
+def _default_node_name(host, port):
+    """Name for a node that has no alias: its host name (pg-mm1 gives pgmm1), or host and port when it is an IP address."""
+    h = str(host).strip()
+    try:
+        import ipaddress
+        ipaddress.ip_address(h.strip("[]"))
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if not is_ip and h.lower() != "localhost":
+        name = safe_name(h.split(".")[0])
+        if name:
+            return name
+    return safe_name(f"{h}_{port}")
+
+
+def _name_from_address_map(host, port, address_map):
+    """If this reachable address is the target of an address_map entry, name the node after that entry's own host
+    (pg-mm1:5432=127.0.0.1:5451 gives pgmm1)."""
+    if not address_map:
+        return None
+    try:
+        h, p = str(host).strip().lower(), int(port)
+    except (TypeError, ValueError):
+        return None
+    for key, target in address_map.items():
+        if not isinstance(key, tuple):
+            continue
+        th, _, tp = str(target).partition(":")
+        try:
+            tp_i = int(tp) if tp.strip() else int(key[1])
+        except ValueError:
+            continue
+        if th.strip().lower() == h and tp_i == p:
+            name = safe_name(str(key[0]).split(".")[0])
+            if name:
+                return name
+    return None
+
+
+def _alias_for(host, port, app, taken, address_map=None):
     """Readable alphanumeric name for a node found without an explicit name."""
     host = str(host)
     app_str = str(app or "").strip()
-    if app_str and app_str not in ("walreceiver", "") and not app_str.startswith("sub_") and safe_name(app_str):
+    mapped = _name_from_address_map(host, port, address_map)
+    if mapped:
+        base = mapped
+    elif app_str and app_str not in ("walreceiver", "") and not app_str.startswith("sub_") and safe_name(app_str):
         base = safe_name(app_str)
     else:
-        base = safe_name(f"{host}_{port}")
+        base = _default_node_name(host, port)
     name, k = base, 2
     while name.lower() in taken:
         name, k = f"{base}{k}", k + 1
@@ -1563,7 +1641,7 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
         except ConfigError:
             raise
         except Exception:
-            alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()})
+            alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()}, address_map)
             found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
             continue
         try:
@@ -1583,7 +1661,7 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
                 if canon in visited_canon:
                     continue
                 visited_canon.add(canon)
-                alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()})
+                alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()}, address_map)
                 found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
 
                 try:
@@ -1601,25 +1679,27 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
 
                 # Native logical replication subscriptions discovery
                 try:
-                    cur.execute("SELECT subname, subconninfo FROM pg_subscription WHERE subconninfo IS NOT NULL;")
-                    for subname, conninfo in cur.fetchall():
-                        is_logical = True
-                        ph, pp = parse_conninfo_hostport(conninfo)
-                        if ph:
-                            mph, mpp = map_address(ph, pp or port, address_map)
-                            queue.append((mph, mpp, subname))
+                    if _column_readable(cur, 'pg_catalog.pg_subscription', 'subconninfo'):
+                        cur.execute("SELECT subname, subconninfo FROM pg_subscription WHERE subconninfo IS NOT NULL;")
+                        for subname, conninfo in cur.fetchall():
+                            is_logical = True
+                            ph, pp = parse_conninfo_hostport(conninfo)
+                            if ph:
+                                mph, mpp = map_address(ph, pp or port, address_map)
+                                queue.append((mph, mpp, subname))
                 except Exception:
                     pass
 
                 # pglogical topology discovery
                 try:
-                    cur.execute("SELECT if_name, if_dsn FROM pglogical.node_interface;")
-                    for if_name, dsn in cur.fetchall():
-                        is_pglogical = True
-                        ph, pp = parse_conninfo_hostport(dsn)
-                        if ph:
-                            mph, mpp = map_address(ph, pp or port, address_map)
-                            queue.append((mph, mpp, if_name))
+                    if _table_readable(cur, 'pglogical.node_interface'):
+                        cur.execute("SELECT if_name, if_dsn FROM pglogical.node_interface;")
+                        for if_name, dsn in cur.fetchall():
+                            is_pglogical = True
+                            ph, pp = parse_conninfo_hostport(dsn)
+                            if ph:
+                                mph, mpp = map_address(ph, pp or port, address_map)
+                                queue.append((mph, mpp, if_name))
                 except Exception:
                     pass
         finally:
@@ -1810,6 +1890,8 @@ class PostgresClusterCollector:
 
             if alias:
                 display_name = safe_name(alias)
+            elif _name_from_address_map(h, p, self.address_map):
+                display_name = _name_from_address_map(h, p, self.address_map)
             elif cached_endpoints.get(ep_key):
                 display_name = safe_name(cached_endpoints[ep_key])
             elif ep_pat_key and cached_endpoints.get(ep_pat_key):
@@ -1825,7 +1907,7 @@ class PostgresClusterCollector:
             elif pat_str and pat_str in cached_map:
                 display_name = cached_map[pat_str]
             else:
-                display_name = safe_name(f"{h}_{p}")
+                display_name = _default_node_name(h, p)
 
             base_name, dup = display_name, 2
             while any(p_[0] == display_name for p_ in parsed):
@@ -1941,7 +2023,7 @@ class PostgresClusterCollector:
             if len(node_defs) >= MAX_NODES:
                 self._add_note(f"Cluster has more than {MAX_NODES} nodes; extra nodes are not shown")
                 break
-            name, k = m["alias"] or safe_name(f"{m['host']}_{m['port']}"), 2
+            name, k = m["alias"] or _name_from_address_map(m["host"], m["port"], self.address_map) or _default_node_name(m['host'], m['port']), 2
             while name.lower() in known_alias:
                 name = f"{m['alias']}{k}"
                 k += 1

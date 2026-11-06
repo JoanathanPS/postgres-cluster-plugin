@@ -272,12 +272,12 @@ use_agent_python=0
 redirect_output=1
 
 [postgres_cluster]
-nodes=10.0.0.5:5432:8008
-username=site24x7
-password=<password>
-db=postgres
-patroni_port=8008
-cluster_type=auto
+nodes="10.0.0.5:5432:8008"
+username="site24x7"
+password="<password>"
+db="postgres"
+patroni_port="8008"
+cluster_type="auto"
 ```
 
 | Your cluster | What to put in `nodes=` |

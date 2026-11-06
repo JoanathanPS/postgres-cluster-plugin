@@ -42,7 +42,7 @@ BEDS = [
     ("plain streaming (seed = standby)", "pg-cluster-site24x7_default", "pg-cluster-site24x7-pg-replica-1", "pg-replica:5432:none", "site24x7", lambda: dotenv("MONITOR_PASSWORD"), "postgres", 2, 1, "streaming"),
     ("plain streaming (seed = primary)", "pg-cluster-site24x7_default", "pg-cluster-site24x7-pg-primary-1", "pg-primary:5432:none", "site24x7", lambda: dotenv("MONITOR_PASSWORD"), "postgres", 2, 1, "streaming"),
     ("repmgr (seed = standby)", "tb-repmgr_default", "tb-repmgr-repmgr-node2-1", "repmgr-node2:5432:none", "site24x7", lambda: "site24x7", "postgres", 3, 1, "repmgr"),
-    ("multi-master logical mesh", "pg-multimaster_default", "pg-mm1", "pg-mm1:5432:none", "site24x7", lambda: env_password("pg-mm1"), "postgres", 2, 2, "Multi-Master"),
+    ("multi-master logical mesh", "pg-multimaster_default", "pg-mm1", "pg-mm1:5432:none", "site24x7", lambda: env_password("pg-mm1"), "postgres", 3, 3, "Multi-Master"),
     ("pg_auto_failover (seed = data node)", "tb-pgaf_default", "tb-pgaf-pgaf-node1-1", "pgaf-node1:5432:none", "docker", lambda: "", "postgres", 2, 1, "pg_auto_failover"),
     ("stolon (seed = keeper)", "tb-stolon_default", "tb-stolon-stolon-keeper1-1", "stolon-keeper1:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 1, "Stolon"),
     ("citus (seed = coordinator)", "tb-citus_default", "tb-citus-citus-coordinator-1", "citus-coordinator:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 3, "Citus"),
