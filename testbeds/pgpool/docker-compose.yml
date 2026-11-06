@@ -1,0 +1,27 @@
+# pgpool-II test bed: 1 primary + 2 standbys behind a pgpool-II proxy (port 9999). Trust authentication, test only.
+name: tb-pgpool
+x-pg: &pg
+  image: postgres:16
+  environment: { POSTGRES_USER: site24x7, POSTGRES_PASSWORD: site24x7, POSTGRES_DB: postgres, POSTGRES_HOST_AUTH_METHOD: trust }
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U site24x7 -d postgres"]
+    interval: 3s
+    retries: 40
+services:
+  pgp-pg1:
+    <<: *pg
+    command: postgres -c wal_level=replica -c max_wal_senders=10 -c max_replication_slots=10 -c hot_standby=on
+    volumes: ["./initdb:/docker-entrypoint-initdb.d:ro"]
+  pgp-pg2:
+    <<: *pg
+    entrypoint: ["/standby.sh"]
+    volumes: ["./standby.sh:/standby.sh:ro"]
+    depends_on: { pgp-pg1: { condition: service_healthy } }
+  pgp-pg3:
+    <<: *pg
+    entrypoint: ["/standby.sh"]
+    volumes: ["./standby.sh:/standby.sh:ro"]
+    depends_on: { pgp-pg1: { condition: service_healthy } }
+  pgpool:
+    build: ./pgpool
+    depends_on: { pgp-pg2: { condition: service_healthy }, pgp-pg3: { condition: service_healthy } }

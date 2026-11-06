@@ -1117,6 +1117,30 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         names = [d[0] for d in collector(cfg3)._apply_discovery(collector(cfg3)._parse_nodes())]
         rep.check(names == ["a", "b", "c"], f"A complete explicit list gets no phantom nodes ({names})")
 
+        # pgpool-II: the backends come from SHOW POOL_NODES and the proxy address itself is not monitored
+        class PoolCur:
+            description = [("node_id",), ("hostname",), ("port",), ("status",), ("role",)]
+            def execute(self, q): pass
+            def fetchall(self): return [(0, "db-a", 5432, "up", "primary"), (1, "db-b", 5432, "up", "standby"), (2, "/tmp", 5433, "down", "standby")]
+        pm = pg_mod._discover_pgpool_members(PoolCur(), "proxy.example", 9999)
+        rep.check([(x["host"], int(x["port"])) for x in pm] == [("db-a", 5432), ("db-b", 5432), ("proxy.example", 5433)],
+                  f"pgpool-II backends are read from SHOW POOL_NODES ({[(x['host'], x['port']) for x in pm]})")
+        class PlainCur:
+            description = None
+            def execute(self, q): raise RuntimeError('unrecognized configuration parameter "pool_nodes"')
+        rep.check(pg_mod._discover_pgpool_members(PlainCur(), "h", 5432) == [], "A server that is not pgpool-II gives no pgpool members")
+        pg_mod.discover_cluster_members = fake(pm)
+        nd = collector("proxy.example:9999:none")._apply_discovery(collector("proxy.example:9999:none")._parse_nodes())
+        rep.check(len(nd) == 3 and not any(d[1] == "proxy.example" and int(d[2]) == 9999 for d in nd),
+                  f"The pgpool-II address is replaced by its backends ({[(d[0], d[1], d[2]) for d in nd]})")
+        pg_ev = dict(extensions=[], repmgr_table=False, managed_roles=[], aurora_version=False, slot_names=[], slot_types=[],
+                     logical_replication_count=0, primary_count=1, app_names=[], total_nodes=3, is_in_recovery=True,
+                     has_standbys=True, has_replication_slots=True, standby_count=2)
+        rep.check(pg_mod.detect_cluster_type(dict(pg_ev, pgpool=True))[0] == "pgpool-II", "pgpool-II is named when no cluster manager is found")
+        rep.check(pg_mod.detect_cluster_type(dict(pg_ev, pgpool=True, patroni={"is_patroni": True, "scope": "x"}))[0] == "Patroni",
+                  "pgpool-II in front of Patroni is reported as Patroni")
+        rep.check("pgpool-II" in pg_mod.SUPPORTED_CLUSTER_TYPES, "pgpool-II is on the supported cluster types list")
+
         # Switch off
         names = [d[0] for d in collector(base, "off")._apply_discovery(collector(base, "off")._parse_nodes())]
         rep.check(names == ["a"], f"discover=off monitors only the listed nodes ({names})")

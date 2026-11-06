@@ -46,6 +46,7 @@ BEDS = [
     ("pg_auto_failover (seed = data node)", "tb-pgaf_default", "tb-pgaf-pgaf-node1-1", "pgaf-node1:5432:none", "docker", lambda: "", "postgres", 2, 1, "pg_auto_failover"),
     ("stolon (seed = keeper)", "tb-stolon_default", "tb-stolon-stolon-keeper1-1", "stolon-keeper1:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 1, "Stolon"),
     ("citus (seed = coordinator)", "tb-citus_default", "tb-citus-citus-coordinator-1", "citus-coordinator:5432:none", "postgres", lambda: "pgpass", "postgres", 3, 3, "Citus"),
+    ("pgpool-II (seed = the pgpool address)", "tb-pgpool_default", "tb-pgpool-pgpool-1", "pgpool:9999:none", "site24x7", lambda: "", "postgres", 3, 1, "pgpool"),
     ("cloudnativepg", "kind", "cnpg-test-control-plane", "cnpg-test-ro:5432:none", "postgres", lambda: "", "postgres", 3, 1, "CloudNative"),
 ]
 

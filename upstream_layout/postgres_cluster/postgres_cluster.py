@@ -136,6 +136,7 @@ SUPPORTED_CLUSTER_TYPES = {
     "standalone",
     "Multi-Master (native logical)",
     "Multi-Master (pglogical)",
+    "pgpool-II",
 }
 
 def parse_address_map(raw_map):
@@ -228,6 +229,7 @@ DISCOVER = 'auto'                 #auto finds the other nodes from the address a
 #Limits of this plugin, change them only if you know why
 DISCOVERY_DEADLINE_S = 2.0        #Seconds allowed for finding the nodes of the cluster
 MAX_NODES = 25                    #Site24x7 allows at most 25 rows in a table
+PGPOOL_DEFAULT_PORT = 9999        #pgpool-II listens on this port by default, so an address on it is asked for its backends
 CONNECT_TIMEOUT = 2               #Seconds to wait when connecting to a node
 STATEMENT_TIMEOUT_MS = 3000       #Milliseconds a single query may run
 NODE_COLLECT_DEADLINE_S = 5.0     #Seconds allowed for collecting from all the nodes
@@ -735,6 +737,11 @@ def detect_cluster_type(evidence):
     elif "cloudsqlsuperuser" in evidence.get("managed_roles", []):
         managers.append("GCP Cloud SQL")
         manager_evidences.append("cloudsqlsuperuser role detected")
+
+    # pgpool-II is a proxy in front of the real cluster: it only names the type when no cluster manager was found
+    if evidence.get("pgpool") and not managers:
+        managers.append("pgpool-II")
+        manager_evidences.append("pgpool-II SHOW POOL_NODES lists the backends")
 
     if sorted(managers) == ["Citus Distributed", "Patroni"]:
         return ("Patroni + Citus", "Patroni REST API plus citus extension installed")
@@ -1622,7 +1629,35 @@ def _managed_members(cur, port):
     return out
 
 
-def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
+def _discover_pgpool_members(cur, host, port, address_map=None):
+    """pgpool-II: SHOW POOL_NODES lists every backend it manages. Returns [] when the endpoint is not a pgpool-II."""
+    try:
+        cur.execute("SHOW POOL_NODES;")
+        cols = [str(d[0]).lower() for d in cur.description]
+        rows = cur.fetchall()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        row = dict(zip(cols, r))
+        h = str(row.get("hostname") or "").strip()
+        try:
+            p = int(row.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if not h:
+            continue
+        if h.startswith("/"):
+            # a backend reached over a unix socket runs on the same machine as pgpool-II
+            h = str(host)
+        mh, mp = map_address(h, p, address_map)
+        alias = _name_from_address_map(mh, mp, address_map) or _default_node_name(h, p)
+        out.append({"alias": alias, "member": alias, "host": mh, "port": mp, "patroni_port": "none",
+                    "source": "pgpool-II SHOW POOL_NODES", "via_proxy": (str(host), int(port))})
+    return out
+
+
+def discover_via_sql(seeds, user, pw, db, deadline, address_map=None, pgpool_hint=False):
     """Walks the replication topology from the seeds. Returns (members, source)."""
     queue = [(h, int(p), None) for h, p in seeds]
     visited, visited_canon, found = set(), set(), OrderedDict()
@@ -1646,6 +1681,11 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
             continue
         try:
             with conn.cursor() as cur:
+                #pgpool-II is only asked on its own port (or when cluster_type is pgpool), so other servers never see the command
+                if pgpool_hint or int(port) == PGPOOL_DEFAULT_PORT:
+                    pool_members = _discover_pgpool_members(cur, host, port, address_map)
+                    if pool_members:
+                        return pool_members, pool_members[0]["source"]
                 managed = _discover_repmgr_members(conn, host, port, user, pw, address_map=address_map)
                 if not managed:
                     managed = _managed_members(cur, port)
@@ -1718,7 +1758,7 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
     return list(found.values()), source
 
 
-def discover_cluster_members(seeds, user, pw, db, deadline_s, address_map=None):
+def discover_cluster_members(seeds, user, pw, db, deadline_s, address_map=None, pgpool_hint=False):
     """seeds: list of (host, pg_port, patroni_port). Returns (members, source, seed_names).
     seed_names maps (host, pg_port) of each Patroni seed to its Patroni member alias."""
     deadline = time.time() + deadline_s
@@ -1746,7 +1786,7 @@ def discover_cluster_members(seeds, user, pw, db, deadline_s, address_map=None):
         ex.shutdown(wait=False, cancel_futures=True)
         if found:
             return found, "Patroni REST API", seed_names
-    members, source = discover_via_sql([(h, p) for h, p, _ in seeds], user, pw, db, deadline, address_map=address_map)
+    members, source = discover_via_sql([(h, p) for h, p, _ in seeds], user, pw, db, deadline, address_map=address_map, pgpool_hint=pgpool_hint)
     return members, source, seed_names
 
 
@@ -1937,14 +1977,14 @@ class PostgresClusterCollector:
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(len(seeds), len(cached_extra)) * 2 + 1))
         t0_disc = time.monotonic()
         try:
-            fut = ex.submit(discover_cluster_members, seeds, self.username, self.password, self.db, DISCOVERY_DEADLINE_S, address_map=self.address_map)
+            fut = ex.submit(discover_cluster_members, seeds, self.username, self.password, self.db, DISCOVERY_DEADLINE_S, address_map=self.address_map, pgpool_hint=('pgpool' in str(self.cluster_type_override).lower()))
             members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S)
         except Exception:
             members, source, seed_names = [], "", {}
         rem_disc = DISCOVERY_DEADLINE_S - (time.monotonic() - t0_disc)
         if not members and cached_extra and rem_disc > 0.5:
             try:
-                fut = ex.submit(discover_cluster_members, cached_extra, self.username, self.password, self.db, rem_disc, address_map=self.address_map)
+                fut = ex.submit(discover_cluster_members, cached_extra, self.username, self.password, self.db, rem_disc, address_map=self.address_map, pgpool_hint=('pgpool' in str(self.cluster_type_override).lower()))
                 members, source, seed_names = fut.result(timeout=rem_disc)
             except Exception:
                 pass
@@ -1969,6 +2009,11 @@ class PostgresClusterCollector:
 
         if not members:
             return node_defs
+
+        #A pgpool-II address only forwards to its backends: monitor the backends, not the proxy in front of them
+        proxies = {(_norm_host(m["via_proxy"][0]), int(m["via_proxy"][1])) for m in members if m.get("via_proxy")}
+        if proxies:
+            node_defs[:] = [d for d in node_defs if (_norm_host(d[1]), int(d[2])) not in proxies]
 
         known_addr = {(_norm_host(h), int(p)) for (_n, h, p, _pat, _a) in node_defs}
         known_alias = {n.lower() for (n, *_rest) in node_defs}
@@ -2211,6 +2256,7 @@ class PostgresClusterCollector:
             detected_type = self.cluster_type_override
             detected_evidence = f"Explicit override via cluster_type parameter ({self.cluster_type_override})"
         else:
+            agg_evidence["pgpool"] = "pgpool" in str(self.discovery_source or "").lower()
             detected_type, detected_evidence = detect_cluster_type(agg_evidence)
 
         if detected_type not in SUPPORTED_CLUSTER_TYPES:

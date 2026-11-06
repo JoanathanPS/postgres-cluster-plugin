@@ -117,6 +117,7 @@ Give the plugin the address of one node and it finds the others on every poll (`
 | repmgr | `repmgr.nodes` (in the `repmgr` database or the current one) |
 | Citus | `pg_dist_node` |
 | pg_auto_failover | `pgautofailover.node` when you point at the monitor; from a data node the replication topology is walked |
+| pgpool-II | `SHOW POOL_NODES` on the pgpool address (port 9999 is recognised automatically, or set `cluster_type` to `pgpool`). The pgpool address is replaced by its backends, which are monitored directly. |
 | Stolon, CloudNativePG, plain streaming, multi-master logical replication | The replication topology is walked: `pg_stat_wal_receiver` (upstream) and `pg_stat_replication` (downstream), from every node reached |
 
 Configuration for a cluster you want to add nodes to later:
@@ -143,6 +144,7 @@ db=postgres
 | Stolon (etcd, 3 keepers, PostgreSQL 15) | Live: type `Stolon`, 3 nodes, roles after Stolon's own election |
 | pg_auto_failover (monitor + 2 nodes, PostgreSQL 11 demo image) | Live from a data node: type `pg_auto_failover`, 2 nodes |
 | Citus (coordinator + 2 workers) | Live: type `Citus Distributed`, 3 nodes, no false split brain |
+| pgpool-II 4.3 (3 PostgreSQL 16 backends, streaming replication) | Live, from only the pgpool address: type `pgpool-II`, 3 backends, roles right, the proxy itself not listed |
 | Multi-master (native logical replication, 2 nodes, PostgreSQL 16) | Live: type `Multi-Master (Active-Active)`, 2 primaries, no false split brain |
 | CloudNativePG (kind, operator 1.24.1, 3 instances, PostgreSQL 16) | Live, plugin run as a pod: type `CloudNative-PG`, all 3 instances found from the read-only service. Node names come from the service and pod names |
 | AWS RDS/Aurora, Azure, Google Cloud SQL | Detection logic only. Not tested on real services; their node lists live in the cloud API, not in PostgreSQL |
@@ -151,7 +153,7 @@ db=postgres
 
 | Level | Meaning | Clusters |
 | :--- | :--- | :--- |
-| **Supported** | Run live against a real test cluster from one address: nodes, roles, cluster type and health are right. | Patroni, plain streaming replication, repmgr, Stolon, pg_auto_failover, Citus, multi-master (native logical replication), CloudNativePG |
+| **Supported** | Run live against a real test cluster from one address: nodes, roles, cluster type and health are right. | Patroni, plain streaming replication, repmgr, Stolon, pg_auto_failover, Citus, multi-master (native logical replication), CloudNativePG, pgpool-II (streaming replication mode) |
 | **Detected only** | The cluster type is recognised and labelled from catalog evidence, but the plugin was never run against a real cluster of that kind. Monitoring probably works if you list the nodes. | Multi-master through the `pglogical` or `bdr` extensions |
 | **Not supported** | The plugin cannot do it with a plain PostgreSQL login, or it is outside what this plugin is for. | See the list below |
 
@@ -160,10 +162,10 @@ db=postgres
 | Cluster or setup | Why |
 | :--- | :--- |
 | AWS RDS and Aurora, Azure Database for PostgreSQL, Google Cloud SQL | Their node lists and failover state live in the cloud provider's API, not in PostgreSQL, and a Multi-AZ standby is usually not reachable by clients. The plugin can label them from catalog roles, but it cannot find or monitor their standbys. |
-| Connection Poolers (PgBouncer, pgpool in pool-mode) | If a pooler is provided as the seed, the plugin triggers an immediate Pooler Guard error (`ConfigError: Seed looks like a connection pooler: point nodes at a PostgreSQL node`). Monitor the PostgreSQL nodes directly, not the pooler. |
+| Connection poolers such as PgBouncer (pgpool-II in streaming replication mode is supported, see above) | If a pooler is provided as the seed, the plugin triggers an immediate Pooler Guard error (`ConfigError: Seed looks like a connection pooler: point nodes at a PostgreSQL node`). Monitor the PostgreSQL nodes directly, not the pooler. |
 | A load balancer, proxy or virtual IP given as a node (HAProxy, floating VIP) | It is one address that hides the real nodes, so the plugin sees a single node and reports `standalone`. Give the addresses of the real nodes. |
 | Databases that only speak the PostgreSQL protocol (CockroachDB, YugabyteDB and similar) | They do not use PostgreSQL's replication views, so roles, lag and slots cannot be read. |
-| Pacemaker/Corosync (PAF), pgpool-II watchdog, Postgres-XL and other products not listed above | Never tried. A cluster that uses plain streaming replication will probably work by listing its nodes, but nothing has been verified, so it is not claimed. |
+| Pacemaker/Corosync (PAF), Postgres-XL and other products not listed above | Never tried. A cluster that uses plain streaming replication will probably work by listing its nodes, but nothing has been verified, so it is not claimed. |
 | PostgreSQL versions older than 17, and the Linux agent | The code has separate queries for older versions and a Linux installer, but neither has been run (see "Known Limitations"). |
 
 ## Adding Support for a New Cluster Type
@@ -286,6 +288,7 @@ cluster_type="auto"
 | repmgr, Stolon, CloudNativePG, plain streaming, multi-master | `host:5432:none` (any node; `none` because there is no Patroni port) |
 | Citus | the coordinator, `host:5432:none` |
 | pg_auto_failover | a data node or the monitor, `host:5432:none` |
+| pgpool-II | the pgpool address, usually `host:9999:none` |
 
 Good to know:
 - You may list two or three addresses, comma separated. If the first is down, the next is used. You never need to update the list when nodes are added or removed.
