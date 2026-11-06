@@ -54,6 +54,34 @@ class MetricUnavailable(PluginError):
     """Specific metric query failed due to permissions or missing views."""
     pass
 
+def check_for_pooler(conn):
+    """Detects if the endpoint is a connection pooler like PgBouncer.
+    Raises ConfigError if a pooler is detected."""
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SHOW VERSION;")
+                row = cur.fetchone()
+                if row and "pgbouncer" in str(row[0]).lower():
+                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
+            except ConfigError:
+                raise
+            except Exception as e:
+                err_str = str(e).lower()
+                if "show help" in err_str or "pgbouncer" in err_str:
+                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
+
+            try:
+                cur.execute("SELECT pg_is_in_recovery();")
+            except Exception as e:
+                err_str = str(e).lower()
+                if "show help" in err_str or "invalid command" in err_str:
+                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
+    except ConfigError:
+        raise
+    except Exception:
+        pass
+
 def classify(e):
     """Classifies an exception into typed PluginError hierarchy."""
     try:
@@ -176,7 +204,11 @@ CONNECT_TIMEOUT = 2                                                      # Timeo
 STATEMENT_TIMEOUT_MS = 3000                                              # Per-query statement timeout in PostgreSQL (ms)
 NODE_COLLECT_DEADLINE_S = 6                                              # Maximum seconds allowed for all nodes collection
 
-PLUGIN_VERSION = 1
+FAILOVER_WARN_SECONDS = 900
+SLOT_WARN_BYTES = 1073741824
+SLOT_CRITICAL_BYTES = 10737418240
+
+PLUGIN_VERSION = 2
 HEARTBEAT = True
 
 # Standard 5-Tab Layout for Site24x7 Console
@@ -184,12 +216,14 @@ tabs = {
     "tabs": {
         "Cluster": {"order": "1", "tablist": [
             "Cluster_Info", "Cluster_Nodes", "Nodes Total", "Primary Count", "Primary Timeline",
-            "No Primary Flag", "Split Brain Flag", "Timeline Mismatch Flag", "Server PID"]},
+            "No Primary Flag", "Split Brain Flag", "Timeline Mismatch Flag", "Server PID",
+            "Seconds Since Last Failover", "Failovers Last 24h", "Last Failover To", "Last Failover Timeline"]},
         "Replication": {"order": "2", "tablist": [
             "Replication_Links", "Replication_Slots", "Standbys Expected", "Standbys Streaming",
             "Standby Disconnect Flag", "Sync Standby Count", "Cascading Standby Count",
             "Max Replay Backlog", "Max Replay Delay", "Replication Slots Total",
             "Replication Slots Active", "Replication Slots Inactive", "Max Slot Lag Bytes",
+            "Slot Wal Status Risk",
             "Logical Replication In Use", "Mesh Links Declared", "Mesh Links Active", "Mesh Disconnect Flag", "Max Logical Lag Bytes", "Max Logical Lag Seconds", "Subscription Apply Errors", "Subscription Conflicts"]},
         "Node Performance": {"order": "3", "tablist": [
             "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Total Rows Inserted", "Total Rows Updated",
@@ -222,6 +256,9 @@ units = {
     "Split Brain Flag": "flag",
     "Primary Timeline": "timeline",
     "Timeline Mismatch Flag": "flag",
+    "Seconds Since Last Failover": "s",
+    "Failovers Last 24h": "failovers",
+    "Last Failover Timeline": "timeline",
 
     # Replication tab
     "Standbys Expected": "standbys",
@@ -235,6 +272,7 @@ units = {
     "Replication Slots Active": "slots",
     "Replication Slots Inactive": "slots",
     "Max Slot Lag Bytes": "bytes",
+    "Slot Wal Status Risk": "risk",
     "Logical Replication In Use": "flag",
     "Mesh Links Declared": "links",
     "Mesh Links Active": "links",
@@ -440,7 +478,9 @@ def evaluate_cluster_health(
     nodes_total, nodes_up, primary_count, no_primary_flag, split_brain_flag,
     standbys_expected, standbys_streaming, max_replay_delay_s, max_replay_backlog,
     slots_inactive, timeline_mismatch_flag, delay_threshold_s=60.0, backlog_threshold_bytes=104857600,
-    cluster_type=None, mesh_disconnect_flag=0, subscription_apply_errors=0
+    cluster_type=None, mesh_disconnect_flag=0, subscription_apply_errors=0,
+    slots_info=None, slot_warn_bytes=1073741824, slot_critical_bytes=10737418240,
+    seconds_since_last_failover=None, last_failover_to=None, last_failover_timeline=None, failover_warn_seconds=900
 ):
     """
     Pure health evaluation function for unit testing and live monitoring.
@@ -449,8 +489,10 @@ def evaluate_cluster_health(
       1 = degraded
       2 = critical
     Rule precedence:
-      Critical: No primary, split-brain (except multi-master), or zero streaming standbys when expected.
-      Degraded: Node down, standby disconnected, lag over threshold, inactive slot, timeline mismatch.
+      Critical: No primary, split-brain (except multi-master), zero streaming standbys,
+                inactive slot > slot_critical_bytes or wal_status lost.
+      Degraded: Node down, standby disconnected, lag over threshold, inactive slot,
+                slot > slot_warn_bytes, timeline mismatch, recent failover within window.
       Healthy: All criteria satisfied.
     """
     is_multimaster = False
@@ -463,12 +505,32 @@ def evaluate_cluster_health(
     if is_multimaster:
         if nodes_up == 0:
             return 2, "Critical: No active master nodes reachable"
+        # Check slot critical in multi-master
+        if slots_info:
+            for s in slots_info:
+                if not s.get("active"):
+                    ret = s.get("wal_retained_bytes", 0) or 0
+                    w_st = str(s.get("wal_status") or "").lower()
+                    sn = s.get("name", "unknown")
+                    if ret > slot_critical_bytes or w_st == "lost":
+                        gb = round(ret / (1024**3), 1)
+                        return 2, f"Critical: Slot {sn} retains {gb:.1f} GB WAL"
         if nodes_up < nodes_total:
             return 1, f"Degraded: {nodes_total - nodes_up} of {nodes_total} master(s) offline"
         if mesh_disconnect_flag == 1:
             return 1, "Degraded: Multi-master mesh disconnected (one or more links inactive)"
         if subscription_apply_errors > 0:
             return 1, f"Degraded: {subscription_apply_errors} subscription apply error(s) detected"
+        # Check slot warn in multi-master
+        if slots_info:
+            for s in slots_info:
+                if not s.get("active"):
+                    ret = s.get("wal_retained_bytes", 0) or 0
+                    w_st = str(s.get("wal_status") or "").lower()
+                    sn = s.get("name", "unknown")
+                    if ret > slot_warn_bytes or w_st == "unreserved":
+                        gb = round(ret / (1024**3), 1)
+                        return 1, f"Degraded: Slot {sn} retains {gb:.1f} GB WAL"
         if slots_inactive > 0:
             return 1, f"Degraded: {slots_inactive} inactive replication slot(s) found"
         return 0, f"Multi-master cluster healthy: {nodes_up}/{nodes_total} active master nodes replicating"
@@ -482,6 +544,17 @@ def evaluate_cluster_health(
     if standbys_expected > 0 and standbys_streaming == 0:
         return 2, f"Critical: No streaming standbys connected ({standbys_expected} expected)"
 
+    # Critical slot severity: inactive slot retaining > slot_critical_bytes or wal_status == 'lost'
+    if slots_info:
+        for s in slots_info:
+            if not s.get("active"):
+                ret = s.get("wal_retained_bytes", 0) or 0
+                w_st = str(s.get("wal_status") or "").lower()
+                sn = s.get("name", "unknown")
+                if ret > slot_critical_bytes or w_st == "lost":
+                    gb = round(ret / (1024**3), 1)
+                    return 2, f"Critical: Slot {sn} retains {gb:.1f} GB WAL"
+
     # 2. Degraded rules
     if nodes_up < nodes_total:
         return 1, f"Degraded: {nodes_total - nodes_up} of {nodes_total} node(s) offline"
@@ -493,10 +566,34 @@ def evaluate_cluster_health(
         mb = max_replay_backlog / (1024 * 1024)
         thresh_mb = backlog_threshold_bytes / (1024 * 1024)
         return 1, f"Degraded: Replay backlog {mb:.1f}MB exceeds threshold ({thresh_mb:.0f}MB)"
+
+    # Slot warn severity: inactive slot retaining > slot_warn_bytes or wal_status == 'unreserved'
+    slot_warn_found = None
+    if slots_info:
+        for s in slots_info:
+            if not s.get("active"):
+                ret = s.get("wal_retained_bytes", 0) or 0
+                w_st = str(s.get("wal_status") or "").lower()
+                sn = s.get("name", "unknown")
+                if ret > slot_warn_bytes or w_st == "unreserved":
+                    gb = round(ret / (1024**3), 1)
+                    slot_warn_found = f"Degraded: Slot {sn} retains {gb:.1f} GB WAL"
+                    break
+    if slot_warn_found:
+        return 1, slot_warn_found
     if slots_inactive > 0:
         return 1, f"Degraded: {slots_inactive} inactive replication slot(s) found"
+
     if timeline_mismatch_flag == 1:
         return 1, "Degraded: Timeline mismatch detected across cluster nodes"
+
+    # Failover warning check: recent failover within failover_warn_seconds
+    if failover_warn_seconds > 0 and seconds_since_last_failover is not None and seconds_since_last_failover <= failover_warn_seconds:
+        mins = max(1, seconds_since_last_failover // 60)
+        to_node = last_failover_to or "primary"
+        tl = last_failover_timeline or 1
+        prev_tl = tl - 1 if tl > 1 else 1
+        return 1, f"Failover {mins} min ago: primary now {to_node} (timeline {prev_tl} to {tl})"
 
     # 3. Healthy rule
     return 0, f"Cluster healthy: {nodes_up}/{nodes_total} nodes active, {primary_count} primary, {standbys_streaming} standbys streaming"
@@ -706,8 +803,15 @@ class PostgresNodeClient:
         self.is_up = True
         self.server_version_num = self.conn.server_version
         with self.conn.cursor() as cur:
-            cur.execute("SHOW server_version;")
-            self.server_version_str = cur.fetchone()[0]
+            try:
+                cur.execute("SHOW server_version;")
+                self.server_version_str = cur.fetchone()[0]
+            except Exception as e:
+                err_str = str(e).lower()
+                if "show help" in err_str or "pgbouncer" in err_str or "invalid command" in err_str:
+                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
+                raise
+        check_for_pooler(self.conn)
 
     def close(self):
         if self.conn:
@@ -1377,6 +1481,9 @@ def discover_via_sql(seeds, user, pw, db, deadline, address_map=None):
         visited.add(key)
         try:
             conn = _pg_connect(host, port, user, pw, db)
+            check_for_pooler(conn)
+        except ConfigError:
+            raise
         except Exception:
             alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()})
             found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
@@ -1509,7 +1616,7 @@ class PostgresClusterCollector:
     Main collector coordinating concurrent node probes, cluster-level metrics,
     per-node tables, cluster type detection, and Site24x7 JSON packaging.
     """
-    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP):
+    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP, failover_warn_seconds=FAILOVER_WARN_SECONDS, slot_warn_bytes=SLOT_WARN_BYTES, slot_critical_bytes=SLOT_CRITICAL_BYTES):
         self.nodes_str = nodes_str
         self.username = username
         self.password = password
@@ -1519,6 +1626,9 @@ class PostgresClusterCollector:
         self.discover = discover
         self.address_map_str = address_map
         self.address_map = parse_address_map(address_map)
+        self.failover_warn_seconds = int(failover_warn_seconds) if failover_warn_seconds is not None else FAILOVER_WARN_SECONDS
+        self.slot_warn_bytes = int(slot_warn_bytes) if slot_warn_bytes is not None else SLOT_WARN_BYTES
+        self.slot_critical_bytes = int(slot_critical_bytes) if slot_critical_bytes is not None else SLOT_CRITICAL_BYTES
         self.discovery_added = 0
         self.discovery_source = ""
         self.msg_notes = []
@@ -1763,6 +1873,22 @@ class PostgresClusterCollector:
 
         try:
             return self._collect_internal(results)
+        except ConfigError as e:
+            results["status"] = 0
+            results["msg"] = str(e)
+            results["Cluster_Info"] = []
+            results["Cluster_Nodes"] = []
+            results["Replication_Links"] = []
+            results["Replication_Slots"] = []
+            results["Node_IO"] = []
+            results["Node_Checkpoints"] = []
+            results["Node_Activity"] = []
+            results["Node_Transactions"] = []
+            if "tabs" not in results:
+                results.update(copy.deepcopy(tabs))
+            if "units" not in results:
+                results["units"] = units
+            return results
         except UnsupportedClusterError as e:
             results["status"] = 0
             results["msg"] = f"Detected {e.cluster_type}: not supported by this plugin version"
@@ -1961,7 +2087,6 @@ class PostgresClusterCollector:
         node_checkpoints_table = [c.checkpoints_row for c in clients if c.checkpoints_row is not None]
         node_activity_table = [c.activity_row for c in clients if c.activity_row is not None]
         node_transactions_table = [c.transactions_row for c in clients if c.transactions_row is not None]
-        standby_conflicts_table = [c.conflicts_row for c in clients if c.conflicts_row is not None]
 
         # Replication links and slots
         replication_links = []
@@ -1974,6 +2099,8 @@ class PostgresClusterCollector:
         slots_active = 0
         slots_inactive = 0
         max_slot_lag_bytes = 0
+        max_wal_status_risk = 0
+        has_wal_status = False
 
         # Multi-master top-level metrics
         mesh_links_declared = 0
@@ -2126,14 +2253,31 @@ class PostgresClusterCollector:
             # 2. Replication slots on primary
             try:
                 with active_primary.conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT slot_name,
-                               COALESCE(plugin, 'none'),
-                               COALESCE(slot_type, 'physical'),
-                               CASE WHEN active = true THEN 1 ELSE 0 END,
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0)
-                        FROM pg_replication_slots;
-                    """)
+                    try:
+                        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'pg_replication_slots' AND column_name = 'wal_status';")
+                        has_wal_status = bool(cur.fetchone())
+                    except Exception:
+                        has_wal_status = False
+
+                    if has_wal_status:
+                        cur.execute("""
+                            SELECT slot_name,
+                                   COALESCE(plugin, 'none'),
+                                   COALESCE(slot_type, 'physical'),
+                                   CASE WHEN active = true THEN 1 ELSE 0 END,
+                                   ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0),
+                                   COALESCE(wal_status, 'none')
+                            FROM pg_replication_slots;
+                        """)
+                    else:
+                        cur.execute("""
+                            SELECT slot_name,
+                                   COALESCE(plugin, 'none'),
+                                   COALESCE(slot_type, 'physical'),
+                                   CASE WHEN active = true THEN 1 ELSE 0 END,
+                                   ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0)
+                            FROM pg_replication_slots;
+                        """)
                     for r in cur.fetchall():
                         slots_total += 1
                         is_act = int(r[3] or 0)
@@ -2145,14 +2289,26 @@ class PostgresClusterCollector:
                         if retained > max_slot_lag_bytes:
                             max_slot_lag_bytes = retained
 
-                        replication_slots.append({
+                        slot_row = {
                             "name": safe_name(str(r[0])) or str(r[0]),
                             "plugin": str(r[1]),
                             "slot_type": str(r[2]),
                             "active": is_act,
                             "wal_retained_bytes": retained,
-                            "status": 1
-                        })
+                            "status": is_act
+                        }
+                        if has_wal_status and len(r) > 5:
+                            w_st = str(r[5]).lower()
+                            slot_row["wal_status"] = w_st
+                            risk = 0
+                            if w_st == "lost":
+                                risk = 2
+                            elif w_st == "unreserved":
+                                risk = 1
+                            if risk > max_wal_status_risk:
+                                max_wal_status_risk = risk
+
+                        replication_slots.append(slot_row)
                 agg_evidence["has_replication_slots"] = slots_total > 0
             except Exception as e:
                 self._add_note(f"Slots query error: {e}")
@@ -2512,6 +2668,47 @@ class PostgresClusterCollector:
         if nodes_up == 0:
             results["status"] = 0
 
+        # Failover History (Part A)
+        seconds_since_last_failover = None
+        failovers_last_24h = 0
+        last_failover_to = "none"
+        last_failover_timeline = None
+
+        if agg_evidence.get("patroni", {}).get("is_patroni"):
+            for c in clients:
+                if c.is_up and c.patroni_port and str(c.patroni_port) != "none":
+                    hist_data = _http_json(f"http://{c.hostname}:{c.patroni_port}/history", timeout=1.5)
+                    if isinstance(hist_data, list) and hist_data:
+                        entries = [e for e in hist_data if isinstance(e, list) and len(e) >= 5]
+                        if entries:
+                            entries.sort(key=lambda x: int(x[0]))
+                            last_tl, last_lsn, last_reason, last_ts, last_leader = entries[-1]
+                            try:
+                                from datetime import datetime, timezone
+                                ts_clean = str(last_ts).replace("Z", "+00:00")
+                                dt = datetime.fromisoformat(ts_clean)
+                                now = datetime.now(timezone.utc)
+                                seconds_since_last_failover = max(0, int((now - dt).total_seconds()))
+                                last_failover_timeline = int(last_tl)
+
+                                for e in entries:
+                                    try:
+                                        e_dt = datetime.fromisoformat(str(e[3]).replace("Z", "+00:00"))
+                                        if (now - e_dt).total_seconds() <= 86400:
+                                            failovers_last_24h += 1
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+
+                            matched_alias = None
+                            for nd in node_defs:
+                                if nd[0].lower() == str(last_leader).lower() or safe_name(last_leader).lower() == nd[0].lower():
+                                    matched_alias = nd[0]
+                                    break
+                            last_failover_to = matched_alias or safe_name(last_leader) or "none"
+                        break
+
         # Health Evaluation
         health_code, health_reason = evaluate_cluster_health(
             nodes_total=nodes_total,
@@ -2527,7 +2724,14 @@ class PostgresClusterCollector:
             timeline_mismatch_flag=timeline_mismatch_flag,
             cluster_type=detected_type,
             mesh_disconnect_flag=mesh_disconnect_flag,
-            subscription_apply_errors=subscription_apply_errors
+            subscription_apply_errors=subscription_apply_errors,
+            slots_info=replication_slots,
+            slot_warn_bytes=self.slot_warn_bytes,
+            slot_critical_bytes=self.slot_critical_bytes,
+            seconds_since_last_failover=seconds_since_last_failover,
+            last_failover_to=last_failover_to,
+            last_failover_timeline=last_failover_timeline,
+            failover_warn_seconds=self.failover_warn_seconds
         )
         results["Cluster Health"] = int(health_code)
 
@@ -2551,6 +2755,14 @@ class PostgresClusterCollector:
         results["Replication Slots Active"] = int(slots_active)
         results["Replication Slots Inactive"] = int(slots_inactive)
         results["Max Slot Lag Bytes"] = int(max_slot_lag_bytes)
+        if has_wal_status:
+            results["Slot Wal Status Risk"] = int(max_wal_status_risk)
+
+        if seconds_since_last_failover is not None:
+            results["Seconds Since Last Failover"] = int(seconds_since_last_failover)
+            results["Last Failover Timeline"] = int(last_failover_timeline)
+        results["Failovers Last 24h"] = int(failovers_last_24h)
+        results["Last Failover To"] = str(last_failover_to)
 
         # Multi-master metrics
         results["Mesh Links Declared"] = int(mesh_links_declared)
@@ -2612,6 +2824,9 @@ def run(param):
         cluster_type = param.get("cluster_type") or CLUSTER_TYPE
         discover = param.get("discover") or DISCOVER
         address_map = str(param.get("address_map") or ADDRESS_MAP).strip()
+        failover_warn_seconds = int(param.get("failover_warn_seconds") if param.get("failover_warn_seconds") is not None else FAILOVER_WARN_SECONDS)
+        slot_warn_bytes = int(param.get("slot_warn_bytes") if param.get("slot_warn_bytes") is not None else SLOT_WARN_BYTES)
+        slot_critical_bytes = int(param.get("slot_critical_bytes") if param.get("slot_critical_bytes") is not None else SLOT_CRITICAL_BYTES)
 
         missing = [k for k, v in (("nodes", nodes), ("username", username), ("db", db)) if not v]
         if missing:
@@ -2622,8 +2837,15 @@ def run(param):
                 "msg": "Missing required setting(s): " + ", ".join(missing) + ". Set them in postgres_cluster.cfg."
             }
 
-        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover, address_map=address_map)
+        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover, address_map=address_map, failover_warn_seconds=failover_warn_seconds, slot_warn_bytes=slot_warn_bytes, slot_critical_bytes=slot_critical_bytes)
         return collector.collect()
+    except ConfigError as e:
+        return {
+            "plugin_version": PLUGIN_VERSION,
+            "heartbeat_required": HEARTBEAT,
+            "status": 0,
+            "msg": str(e)
+        }
     except Exception as e:
         return {
             "plugin_version": PLUGIN_VERSION,
@@ -2644,6 +2866,9 @@ if __name__ == '__main__':
     parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=CLUSTER_TYPE)
     parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=DISCOVER)
     parser.add_argument('--address_map', help='Optional internal host:port=reachable host:port mappings for Docker/NAT', default=ADDRESS_MAP)
+    parser.add_argument('--failover_warn_seconds', help='Failover warning window in seconds', type=int, default=FAILOVER_WARN_SECONDS)
+    parser.add_argument('--slot_warn_bytes', help='Inactive slot warning threshold in bytes', type=int, default=SLOT_WARN_BYTES)
+    parser.add_argument('--slot_critical_bytes', help='Inactive slot critical threshold in bytes', type=int, default=SLOT_CRITICAL_BYTES)
     args = parser.parse_args()
 
     param = {
@@ -2654,7 +2879,10 @@ if __name__ == '__main__':
         "patroni_port": args.patroni_port,
         "cluster_type": args.cluster_type,
         "discover": args.discover,
-        "address_map": args.address_map
+        "address_map": args.address_map,
+        "failover_warn_seconds": args.failover_warn_seconds,
+        "slot_warn_bytes": args.slot_warn_bytes,
+        "slot_critical_bytes": args.slot_critical_bytes
     }
 
     try:

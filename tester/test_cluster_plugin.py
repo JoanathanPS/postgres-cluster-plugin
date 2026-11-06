@@ -114,7 +114,7 @@ def validate_schema(data, rep):
     # String top-level metrics
     # String top-level metrics
     allowed_string_metrics = {
-        "Last Archived WAL File", "Archive Mode", "Server Version", "msg"
+        "Last Archived WAL File", "Archive Mode", "Server Version", "msg", "Last Failover To"
     }
     for sm in ["Archive Mode", "Last Archived WAL File", "Server Version"]:
         if sm in data:
@@ -1146,6 +1146,53 @@ def test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep):
         rep.fail(f"Live Patroni discovery test failed: {type(e).__name__}: {e}")
 
 
+def test_parts_abc_unit(rep):
+    print("\n=== Test: Parts A, B, C (Failover History, Slot Severity, Pooler Guard) ===")
+    from postgres_cluster import evaluate_cluster_health, check_for_pooler, ConfigError
+    from unittest.mock import MagicMock
+
+    # Part C: Pooler Guard
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_cur.fetchone.return_value = ("PgBouncer 1.26.1",)
+    try:
+        check_for_pooler(mock_conn)
+        rep.check(False, "Pooler guard raised ConfigError on PgBouncer")
+    except ConfigError as e:
+        rep.check(True, f"Pooler guard raised ConfigError on PgBouncer: {e}")
+
+    # Part B: Slot Severity
+    # Normal slot under 1GB -> Degraded note (1)
+    slots_normal = [{"name": "slot1", "active": 0, "wal_retained_bytes": 100000, "wal_status": "reserved"}]
+    h1, r1 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 1, 0, slots_info=slots_normal)
+    rep.check(h1 == 1, f"Slot under warn threshold gives Degraded: {r1}")
+
+    # Slot over warn bytes (1 GB) -> Degraded with retains X GB WAL
+    slots_warn = [{"name": "slot_warn", "active": 0, "wal_retained_bytes": 2 * 1024**3, "wal_status": "reserved"}]
+    h2, r2 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 1, 0, slots_info=slots_warn)
+    rep.check(h2 == 1 and "2.0 GB WAL" in r2, f"Slot over warn threshold gives Degraded retains GB: {r2}")
+
+    # Slot over critical bytes (10 GB) -> Critical (2)
+    slots_crit = [{"name": "slot_crit", "active": 0, "wal_retained_bytes": 12 * 1024**3, "wal_status": "reserved"}]
+    h3, r3 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 1, 0, slots_info=slots_crit)
+    rep.check(h3 == 2 and "Critical:" in r3, f"Slot over critical threshold gives Critical: {r3}")
+
+    # Slot with wal_status == 'lost' -> Critical (2)
+    slots_lost = [{"name": "slot_lost", "active": 0, "wal_retained_bytes": 1000, "wal_status": "lost"}]
+    h4, r4 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 1, 0, slots_info=slots_lost)
+    rep.check(h4 == 2 and "Critical:" in r4, f"Slot with wal_status lost gives Critical: {r4}")
+
+    # Part A: Failover History
+    # Recent failover (300s <= 900s) -> Degraded (1) with Failover X min ago
+    h5, r5 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 0, 0, seconds_since_last_failover=300, last_failover_to="pgnode2", last_failover_timeline=35, failover_warn_seconds=900)
+    rep.check(h5 == 1 and "Failover 5 min ago: primary now pgnode2" in r5, f"Recent failover within window gives Degraded: {r5}")
+
+    # Failover past window (1200s > 900s) -> Healthy (0)
+    h6, r6 = evaluate_cluster_health(3, 3, 1, 0, 0, 2, 2, 0.0, 0, 0, 0, seconds_since_last_failover=1200, last_failover_to="pgnode2", last_failover_timeline=35, failover_warn_seconds=900)
+    rep.check(h6 == 0, f"Failover past window gives Healthy: {r6}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="PostgreSQL Cluster Plugin Test Suite")
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
@@ -1241,6 +1288,7 @@ def main():
     # Test: audit regressions and OG parity
     test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep)
     test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep)
+    test_parts_abc_unit(rep)
 
     # Test 10: Dynamic Failover Assertion
     if args.failover:
