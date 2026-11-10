@@ -98,13 +98,19 @@ Assert-Check "Bash installer uses standardized [postgres_cluster] section" {
 Write-Host "`n--- Step 4: Live Execution Smoke Test ---" -ForegroundColor Yellow
 
 Assert-Check "Plugin runs cleanly against active cluster with valid JSON output" {
-    $output = & $pyExe $pyPath --nodes "localhost:5441,localhost:5442,localhost:5443" --username "site24x7" --password "site24x7" --db "appdb" 2>$null
+    $previousPgpw = $env:PGPASSWORD
+    $env:PGPASSWORD = "site24x7"
+    try {
+        $output = & $pyExe $pyPath --nodes "localhost:5441,localhost:5442,localhost:5443" --username "site24x7" --db "appdb" 2>$null
+    } finally {
+        $env:PGPASSWORD = $previousPgpw
+    }
     if ($LASTEXITCODE -ne 0) { return $false }
     $json = $output | ConvertFrom-Json
     if (-not $json) { return $false }
     if ($json.plugin_version -lt 1) { return $false }
     if (-not $json.Cluster_Nodes) { return $false }
-    if (-not ($json.Replication_Links -or $json.Replication_Standbys)) { return $false }
+    if (-not $json.Replication_Links) { return $false }
     if (-not $json.tabs.Cluster) { return $false }
     return $true
 }
@@ -112,10 +118,25 @@ Assert-Check "Plugin runs cleanly against active cluster with valid JSON output"
 Write-Host "`n--- Step 5: Parity with Working Collector ---" -ForegroundColor Yellow
 
 $workingPy = Join-Path $scriptDir "postgres_cluster\postgres_cluster.py"
-Assert-Check "upstream_layout collector matches working collector logic" {
-    $h1 = (Get-FileHash $pyPath -Algorithm SHA256).Hash
-    $h2 = (Get-FileHash $workingPy -Algorithm SHA256).Hash
-    $h1 -eq $h2
+Assert-Check "canonical plugin files match their working mirrors" {
+    $mirrorPairs = @(
+        [pscustomobject]@{ Canonical = $pyPath; Mirror = $workingPy },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "README.md"); Mirror = (Join-Path $scriptDir "postgres_cluster\README.md") },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.ps1"); Mirror = (Join-Path $scriptDir "postgres_cluster\Site24x7PostgresClusterPluginInstaller.ps1") },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.sh"); Mirror = (Join-Path $scriptDir "postgres_cluster\Site24x7PostgresClusterPluginInstaller.sh") },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "prerequisites\create_user.sql"); Mirror = (Join-Path $scriptDir "postgres_cluster\create_user.sql") },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "prerequisites\create_user.sh"); Mirror = (Join-Path $scriptDir "postgres_cluster\create_user.sh") },
+        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "postgres_cluster.cfg"); Mirror = (Join-Path $scriptDir "postgres_cluster\postgres_cluster.cfg.example") }
+    )
+    foreach ($pair in $mirrorPairs) {
+        if (-not (Test-Path $pair.Canonical) -or -not (Test-Path $pair.Mirror)) { return $false }
+        $canonicalHash = (Get-FileHash $pair.Canonical -Algorithm SHA256).Hash
+        $mirrorHash = (Get-FileHash $pair.Mirror -Algorithm SHA256).Hash
+        if ($canonicalHash -ne $mirrorHash) { return $false }
+    }
+    $canonicalVersion = [regex]::Match((Get-Content $pyPath -Raw), 'PLUGIN_VERSION\s*=\s*(\d+)').Groups[1].Value
+    $mirrorVersion = [regex]::Match((Get-Content $workingPy -Raw), 'PLUGIN_VERSION\s*=\s*(\d+)').Groups[1].Value
+    return ($canonicalVersion -ne '') -and ($canonicalVersion -eq $mirrorVersion)
 }
 
 Write-Host "`n=================================================================" -ForegroundColor Cyan

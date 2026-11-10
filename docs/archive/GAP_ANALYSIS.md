@@ -1,4 +1,6 @@
-# Comparative Technical Analysis: Site24x7 PostgreSQL Cluster Monitoring
+# Historical: Comparative Technical Analysis of PostgreSQL Cluster Monitoring
+
+> This is an archived comparison from an earlier implementation. Its tab/table names and feature claims do not describe the current v4 collector. See `upstream_layout/postgres_cluster/README.md` for current behavior.
 
 **Reference:** [PR #442 (site24x7/plugins)](https://github.com/site24x7/plugins/pull/442)  
 **Status of PR #442:** Merged into `site24x7/plugins` (October 22, 2026)  

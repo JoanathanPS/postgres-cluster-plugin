@@ -162,11 +162,10 @@
   {
     "old_item": "Server Version",
     "source": "standalone_postgres",
-    "type": "column",
-    "v2_item": "server_version",
+    "type": "metric",
+    "v2_item": "Server Version",
     "tab": "Cluster",
-    "notes": "Emitted as Cluster_Info table column (string) to prevent untabbed metric pollution and maintain clean 5 custom tabs",
-    "v2_table": "Cluster_Info"
+    "notes": "Retained as a top-level string metric; omitted from Cluster_Info to stay within Site24x7 string-column limits"
   },
   {
     "old_item": "Stats_per_DB",
@@ -300,17 +299,26 @@
     "old_item": "Tranasctions_and_Session_per_Database",
     "source": "standalone_postgres",
     "type": "table",
-    "v2_item": "Tranasctions_and_Session_per_Database",
+    "v2_item": "Transactions_Per_Database",
     "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "notes": "Renamed in v4 to meet Site24x7 attribute-name limits; OG standalone retains this name."
   },
   {
     "old_item": "Transactions Idle In Transaction",
     "source": "standalone_postgres",
     "type": "metric",
-    "v2_item": "Transactions Idle In Transaction",
+    "v2_item": "Idle Transactions",
     "tab": "Transactions and Sessions",
-    "notes": "Direct 1:1 mapping from official postgres.py"
+    "notes": "Renamed in v4 to meet Site24x7 attribute-name limits; OG standalone retains this name."
+  },
+  {
+    "old_item": "session_idle_in_transaction_time",
+    "source": "standalone_postgres",
+    "type": "column",
+    "v2_item": "idle_in_txn_time",
+    "tab": "Transactions and Sessions",
+    "notes": "Renamed in v4 to meet Site24x7 attribute-name limits; unit remains milliseconds.",
+    "v2_table": "Transactions_Per_Database"
   },
   {
     "old_item": "Transactions Open",
@@ -342,7 +350,7 @@
     "type": "metric",
     "v2_item": "Replication Slots Active",
     "tab": "Replication",
-    "notes": "Standardized v2 name"
+    "notes": "Shortened to fit Site24x7 attribute-name length guidance"
   },
   {
     "old_item": "Archive Ready Files Count",
@@ -510,9 +518,9 @@
     "old_item": "Connection Utilization Percent",
     "source": "pr442",
     "type": "metric",
-    "v2_item": "Connection Utilization Percent",
+    "v2_item": "Connection Usage Percent",
     "tab": "Transactions and Sessions",
-    "notes": "Same metric name"
+    "notes": "Shortened to fit Site24x7 attribute-name length guidance"
   },
   {
     "old_item": "Current WAL LSN",
@@ -528,16 +536,16 @@
     "type": "column",
     "v2_item": "flush_lag_bytes",
     "tab": "Replication",
-    "notes": "Tracked per standby in Replication_Standbys table and top-level",
+    "notes": "Tracked per standby in Replication_Links table and top-level",
     "v2_table": "Replication_Links"
   },
   {
     "old_item": "Inactive Replication Slots",
     "source": "pr442",
     "type": "metric",
-    "v2_item": "Replication Slots Inactive",
+    "v2_item": "Inactive Slots Count",
     "tab": "Replication",
-    "notes": "Standardized v2 name"
+    "notes": "Shortened to fit Site24x7 attribute-name length guidance"
   },
   {
     "old_item": "Is In Recovery",
@@ -610,9 +618,9 @@
     "old_item": "Oldest Running Transaction Age",
     "source": "pr442",
     "type": "metric",
-    "v2_item": "Oldest Running Transaction Age",
+    "v2_item": "Oldest Running Txn Age",
     "tab": "Transactions and Sessions",
-    "notes": "Same metric name"
+    "notes": "Shortened to fit Site24x7 attribute-name length guidance"
   },
   {
     "old_item": "Physical Slots",
@@ -626,11 +634,10 @@
   {
     "old_item": "PostgreSQL Version",
     "source": "pr442",
-    "type": "column",
-    "v2_item": "server_version",
+    "type": "metric",
+    "v2_item": "Server Version",
     "tab": "Cluster",
-    "notes": "Emitted as Cluster_Info table column (string) to prevent untabbed metric pollution and maintain clean 5 custom tabs",
-    "v2_table": "Cluster_Info"
+    "notes": "Retained as a top-level string metric; omitted from Cluster_Info to stay within Site24x7 string-column limits"
   },
   {
     "old_item": "Receive Apply Lag",
@@ -694,7 +701,7 @@
     "type": "column",
     "v2_item": "state",
     "tab": "Replication",
-    "notes": "Per-standby streaming state in Replication_Standbys table",
+    "notes": "Per-standby streaming state in Replication_Links table",
     "v2_table": "Replication_Links"
   },
   {
@@ -733,9 +740,9 @@
     "old_item": "Sync State",
     "source": "pr442",
     "type": "column",
-    "v2_item": "sync_state",
+    "v2_item": "is_sync",
     "tab": "Replication",
-    "notes": "Per-standby sync state and Sync Standby Count metric",
+    "notes": "Numeric per-link sync flag; detailed sync-state text is omitted to meet Site24x7 table string limits",
     "v2_table": "Replication_Links"
   },
   {
@@ -792,7 +799,7 @@
     "type": "column",
     "v2_item": "write_lag_bytes",
     "tab": "Replication",
-    "notes": "Tracked per standby in Replication_Standbys table",
+    "notes": "Tracked per standby in Replication_Links table",
     "v2_table": "Replication_Links"
   }
 ]

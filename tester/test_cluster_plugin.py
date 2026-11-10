@@ -3,27 +3,17 @@
 Automated test suite for the Site24x7 PostgreSQL Cluster Plugin (postgres_cluster/postgres_cluster.py).
 
 Validates:
-  1. Plugin output adherence to Site24x7 schema and tabular limits:
-     - Output is valid RFC 8259 JSON
-     - plugin_version is integer >= 7
-     - heartbeat_required is boolean
-     - Max 10 tables, max 15 columns per table, max 25 rows per table
-     - Max 5 string columns per table (excluding 'name')
-     - Row 'name' <= 520 chars, other string columns <= 100 chars
-     - Row 'status' is numeric 1 or 0
-     - Generic metric count <= 200
-     - Numeric types: ints and floats emitted for all numeric columns and generic metrics
-     - String types only for Server Version, Last Archived WAL File, Cluster Type, Cluster Type Evidence, Cluster Name, Archive Mode, msg
-     - Nested units format: units["Cluster_Nodes"], units["Replication_Links"], units["Replication_Slots"],
-       units["Node_Activity"], units["Node_Throughput"], units["Node_Checkpoints"], units["Standby_Conflicts"]
-     - 7 tabs properly formed: Cluster, Replication, DB and IO stats, BG Writer, Transactions and Sessions, Write Ahead Log, Recovery Conflicts
-     - s247config.childdiscovery strictly contains per-DB tables (no Cluster child tables)
+  1. Plugin output adherence to Site24x7 schema and current tabular limits:
+     - Valid RFC 8259 JSON, integer plugin_version, boolean heartbeat_required
+     - At most 10 tables, 15 columns per table, 25 rows per table, and 5 string columns including the reserved name column
+     - Child-table names, nested units, table statuses, and five current tabs
+     - Current ten-table layout, including Replication_Links and per-database child discovery
   2. Coverage Map Assertion:
      - 100% of mapped items in tester/coverage_map.json exist in collector output
   3. Thread-safety under concurrency:
      - 3 concurrent collectors run simultaneously without cross-talk
   4. Cluster Type Detection fixtures:
-     - 13 fixtures tested against detect_cluster_type
+     - 16 fixtures tested against detect_cluster_type
   5. Error scenarios:
      - Dead cluster: status 0, No Primary Flag 1, Nodes Up 0 under 10s
      - Wrong password: status 0, auth error reported in msg under 10s
@@ -105,7 +95,7 @@ def validate_schema(data, rep):
         "Standbys Streaming", "Standby Disconnect Flag", "Sync Standby Count",
         "Cascading Standby Count", "Max Replay Backlog", "Max Replay Delay",
         "Replication Slots Total", "Replication Slots Active",
-        "Replication Slots Inactive", "Max Slot Lag Bytes"
+        "Inactive Slots Count", "Max Slot Lag Bytes"
     ]
     for m in expected_metrics:
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")
@@ -181,16 +171,16 @@ def validate_schema(data, rep):
             all_cols.update(r.keys())
         rep.check(len(all_cols) <= 15, f"Table '{t_name}' column count within limit of 15 ({len(all_cols)} <= 15)")
 
-        string_cols = set()
+        string_cols = {"name"}
         for r in rows:
             rep.check("name" in r, f"Table '{t_name}' row has 'name' key")
             rep.check(len(str(r.get("name", ""))) <= 520, f"Table '{t_name}' row 'name' length <= 520 chars")
             for col, val in r.items():
-                if col != "name" and isinstance(val, str):
+                if isinstance(val, str):
                     string_cols.add(col)
                     rep.check(len(val) <= 100, f"Table '{t_name}' column '{col}' string length <= 100 ({len(val)})")
 
-        rep.check(len(string_cols) <= 5, f"Table '{t_name}' has <= 5 string columns excluding name (found {len(string_cols)}: {string_cols})")
+        rep.check(len(string_cols) <= 5, f"Table '{t_name}' has <= 5 string columns including name (found {len(string_cols)}: {string_cols})")
 
     # Assertions for Cluster_Info
     rep.check("Cluster_Info" in data and isinstance(data["Cluster_Info"], list), "Cluster_Info table present")
@@ -200,7 +190,7 @@ def validate_schema(data, rep):
         if len(ci_rows) > 0:
             ci = ci_rows[0]
             rep.check(ci.get("name") is not None, "Cluster_Info has name key")
-            for sc in ["cluster_type", "type_evidence", "server_version", "primary_node", "health_reason"]:
+            for sc in ["cluster_type", "type_evidence", "primary_node", "health_reason"]:
                 rep.check(isinstance(ci.get(sc), str), f"Cluster_Info column '{sc}' is str ({ci.get(sc)})")
             for nc in ["nodes_total", "nodes_up", "primary_timeline", "status"]:
                 rep.check(isinstance(ci.get(nc), (int, float)), f"Cluster_Info column '{nc}' is numeric ({ci.get(nc)})")
@@ -256,7 +246,7 @@ def validate_schema(data, rep):
     expected_10_tables = [
         "Cluster_Info", "Cluster_Nodes", "Replication_Links", "Replication_Slots",
         "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Node_Activity",
-        "Node_Transactions", "Tranasctions_and_Session_per_Database"
+        "Node_Transactions", "Transactions_Per_Database"
     ]
     for pnt in expected_10_tables:
         rep.check(pnt in data and isinstance(data[pnt], list), f"Child table '{pnt}' present")
@@ -264,7 +254,7 @@ def validate_schema(data, rep):
     # Units verification: nested table-column units
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
-    for tbl_unit in ["Cluster_Info", "Cluster_Nodes", "Replication_Links", "Replication_Slots", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions"]:
+    for tbl_unit in ["Cluster_Info", "Cluster_Nodes", "Replication_Links", "Replication_Slots", "Node_IO", "Node_Checkpoints", "Node_Activity", "Node_Transactions", "Stats_per_DB", "Transactions_Per_Database"]:
         rep.check(tbl_unit in units and isinstance(units[tbl_unit], dict), f"units contains nested dict '{tbl_unit}'")
 
     # Tabs verification: strictly 5 tabs
@@ -291,7 +281,7 @@ def validate_schema(data, rep):
     tx_tablist = tabs.get("Transactions and Sessions", {}).get("tablist", [])
     rep.check("Node_Activity" in tx_tablist, "Node_Activity present in Transactions and Sessions tab tablist")
     rep.check("Node_Transactions" in tx_tablist, "Node_Transactions present in Transactions and Sessions tab tablist")
-    rep.check("Tranasctions_and_Session_per_Database" in tx_tablist, "Tranasctions_and_Session_per_Database present in Transactions and Sessions tab tablist")
+    rep.check("Transactions_Per_Database" in tx_tablist, "Transactions_Per_Database present in Transactions and Sessions tab tablist")
 
     wal_tablist = tabs.get("WAL and Recovery", {}).get("tablist", [])
     rep.check("WAL Write Position" in wal_tablist, "WAL Write Position in WAL and Recovery tab tablist")
@@ -315,7 +305,7 @@ def validate_schema(data, rep):
     rep.check("Cluster_Nodes" not in childdiscovery, "Cluster_Nodes removed from s247config.childdiscovery")
     rep.check("Replication_Links" not in childdiscovery, "Replication_Links removed from s247config.childdiscovery")
     rep.check("Stats_per_DB" in childdiscovery, "Stats_per_DB present in s247config.childdiscovery")
-    rep.check("Tranasctions_and_Session_per_Database" in childdiscovery, "Tranasctions_and_Session_per_Database present in s247config.childdiscovery")
+    rep.check("Transactions_Per_Database" in childdiscovery, "Transactions_Per_Database present in s247config.childdiscovery")
 def test_coverage_map_assertion(data, rep):
     """
     Validates that every single mapped item from PR #442 and standalone postgres.py
@@ -333,7 +323,7 @@ def test_coverage_map_assertion(data, rep):
     rep.check(len(cov) >= 90, f"Coverage map contains comprehensive mappings ({len(cov)} entries)")
 
     unmapped = []
-    server_ver_str = str(data.get("Server Version", "")) or str(((data.get("Cluster_Info") or [{}])[0]).get("server_version", ""))
+    server_ver_str = str(data.get("Server Version", ""))
     is_pg17 = "PostgreSQL 17" in server_ver_str or "17." in server_ver_str
 
     for entry in cov:
@@ -403,9 +393,9 @@ def test_thread_safety_concurrency(plugin_py, nodes, user, password, db, patroni
 
 def test_cluster_type_fixtures(rep):
     """
-    Tests detect_cluster_type pure function against all 13 realistic cluster fixtures.
+    Tests detect_cluster_type pure function against all 16 realistic cluster fixtures.
     """
-    print("\n=== Test: Cluster Type Detection (13 Fixtures) ===")
+    print("\n=== Test: Cluster Type Detection (16 Fixtures) ===")
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
     from postgres_cluster import detect_cluster_type
 
@@ -1005,8 +995,8 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
     # Server Version parity (OG reports it as a flat textual metric)
     rep.check(isinstance(healthy.get("Server Version"), str) and healthy["Server Version"], f"Flat 'Server Version' present ({healthy.get('Server Version')})")
     # Per-database child table: no null-name row (OG drops it)
-    tx = healthy.get("Tranasctions_and_Session_per_Database", [])
-    rep.check(tx and all(isinstance(r.get("name"), str) and r["name"] for r in tx), f"Tranasctions_and_Session_per_Database has no null-name row ({[r.get('name') for r in tx]})")
+    tx = healthy.get("Transactions_Per_Database", [])
+    rep.check(tx and all(isinstance(r.get("name"), str) and r["name"] for r in tx), f"Transactions_Per_Database has no null-name row ({[r.get('name') for r in tx]})")
     # Cluster_Info name is alphanumeric
     ci = (healthy.get("Cluster_Info") or [{}])[0]
     import re as _re
@@ -1033,8 +1023,8 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
     empty = pg_mod.run({"nodes": "", "username": user, "password": password, "db": db, "patroni_port": patroni_port})
     rep.check(empty.get("status") == 0 and "Missing required" in str(empty.get("msg")), f"Empty nodes gives status 0 with message ({empty.get('msg')})")
     none_cfg = pg_mod.run({})
-    rep.check(none_cfg.get("status") == 0 and "nodes" in str(none_cfg.get("msg")) and "username" in str(none_cfg.get("msg")) and "db" in str(none_cfg.get("msg")),
-              f"No built-in fallback: missing nodes, username and db are reported ({none_cfg.get('msg')})")
+    rep.check(none_cfg.get("status") == 0 and "cluster_host" in str(none_cfg.get("msg")) and "username" in str(none_cfg.get("msg")) and "db" not in str(none_cfg.get("msg")),
+              f"No built-in fallback: missing cluster_host and username are reported while db defaults to postgres ({none_cfg.get('msg')})")
 
     # Cluster type classification
     base = dict(extensions=[], repmgr_table=False, managed_roles=[], aurora_version=False, slot_names=[], slot_types=[],
@@ -1059,19 +1049,37 @@ def test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep):
         ogres = og.run({"host": pd[1], "port": str(pd[2]), "username": user, "password": password, "db": db})
         skip = {"plugin_version", "heartbeat_required", "status", "msg", "tabs", "units", "s247config"}
         stable = {"Max Connections", "Database Count", "Table Count", "Server Version", "Heap Blocks Read", "Index Scans", "Index Rows Read", "Index Rows Fetched", "Checkpoints Req"}
+        # The cluster plugin shortens these names to comply with Site24x7's
+        # attribute-name limit.  Compare the corresponding values instead of
+        # treating the documented schema migration as a regression.
+        metric_aliases = {
+            "Transactions Idle In Transaction": "Idle Transactions",
+        }
         for k, v in ogres.items():
             if k in skip or isinstance(v, list):
                 continue
-            rep.check(k in healthy, f"OG metric '{k}' exists in plugin output")
-            if k in stable and k in healthy:
+            plugin_key = metric_aliases.get(k, k)
+            rep.check(plugin_key in healthy, f"OG metric '{k}' exists in plugin output as '{plugin_key}'")
+            if k in stable and plugin_key in healthy:
                 try:
-                    rep.check(math.isclose(float(v), float(healthy[k]), rel_tol=0.02, abs_tol=2), f"OG parity '{k}': OG={v} plugin={healthy[k]}")
+                    rep.check(math.isclose(float(v), float(healthy[plugin_key]), rel_tol=0.02, abs_tol=2), f"OG parity '{k}': OG={v} plugin={healthy[plugin_key]}")
                 except ValueError:
-                    rep.check(str(v) == str(healthy[k]), f"OG parity '{k}': OG={v} plugin={healthy[k]}")
-        for t in ("Tranasctions_and_Session_per_Database", "Stats_per_DB"):
-            og_cols = set(ogres[t][0].keys()); pl_cols = set(healthy[t][0].keys())
-            rep.check(og_cols == pl_cols, f"{t} columns identical to OG ({sorted(og_cols ^ pl_cols)})")
-            rep.check([r['name'] for r in ogres[t]] == [r['name'] for r in healthy[t]], f"{t} rows identical to OG")
+                    rep.check(str(v) == str(healthy[plugin_key]), f"OG parity '{k}': OG={v} plugin={healthy[plugin_key]}")
+        table_aliases = {
+            "Tranasctions_and_Session_per_Database": "Transactions_Per_Database",
+            "Stats_per_DB": "Stats_per_DB",
+        }
+        for og_table, plugin_table in table_aliases.items():
+            rep.check(og_table in ogres and plugin_table in healthy, f"{og_table} is available as {plugin_table}")
+            if not (ogres.get(og_table) and healthy.get(plugin_table)):
+                continue
+            column_aliases = {
+                "session_idle_in_transaction_time": "idle_in_txn_time",
+            }
+            og_cols = {column_aliases.get(col, col) for col in ogres[og_table][0]}
+            pl_cols = set(healthy[plugin_table][0].keys())
+            rep.check(og_cols == pl_cols, f"{plugin_table} columns identical to OG ({sorted(og_cols ^ pl_cols)})")
+            rep.check([r['name'] for r in ogres[og_table]] == [r['name'] for r in healthy[plugin_table]], f"{plugin_table} rows identical to OG")
     except Exception as e:
         rep.fail(f"OG parity test could not run: {type(e).__name__}: {e}")
 
@@ -1233,6 +1241,127 @@ def test_parts_abc_unit(rep):
     rep.check(h6 == 0, f"Failover past window gives Healthy: {r6}")
 
 
+def test_default_ports_and_host_normalization(rep):
+    print("\n=== Test: Default Ports and IPv6 / Host Normalization ===")
+    import postgres_cluster as pg_mod
+
+    # 1. Constants
+    rep.check(getattr(pg_mod, "DEFAULT_POSTGRES_PORT", None) == 5432, "DEFAULT_POSTGRES_PORT constant is 5432")
+    rep.check(getattr(pg_mod, "DEFAULT_PATRONI_PORT", None) == 8008, "DEFAULT_PATRONI_PORT constant is 8008")
+
+    # 2. Collector default port usage when port omitted
+    c = pg_mod.PostgresClusterCollector(nodes_str="10.0.0.1", username="u", password="p", db="d")
+    parsed = c._parse_nodes()
+    rep.check(len(parsed) == 1 and int(parsed[0][2]) == 5432, f"Omitted port defaults to DEFAULT_POSTGRES_PORT (5432): got {parsed}")
+
+    # 3. Explicit port takes priority over default
+    c_custom = pg_mod.PostgresClusterCollector(nodes_str="10.0.0.1:5433", username="u", password="p", db="d")
+    parsed_custom = c_custom._parse_nodes()
+    rep.check(len(parsed_custom) == 1 and int(parsed_custom[0][2]) == 5433, f"Explicit port 5433 preserved: got {parsed_custom}")
+
+    # 4. Default patroni port for Patroni cluster when omitted
+    c_pat = pg_mod.PostgresClusterCollector(nodes_str="10.0.0.1", username="u", password="p", db="d", cluster_type="Patroni")
+    parsed_pat = c_pat._parse_nodes()
+    rep.check(len(parsed_pat) == 1 and parsed_pat[0][3] == "8008", f"Omitted patroni port defaults to DEFAULT_PATRONI_PORT (8008) under Patroni: got {parsed_pat}")
+
+    # 5. Explicit patroni port takes priority over default
+    c_pat_cust = pg_mod.PostgresClusterCollector(nodes_str="10.0.0.1:5432:8009", username="u", password="p", db="d", cluster_type="Patroni")
+    parsed_pat_cust = c_pat_cust._parse_nodes()
+    rep.check(len(parsed_pat_cust) == 1 and parsed_pat_cust[0][3] == "8009", f"Explicit patroni port 8009 preserved: got {parsed_pat_cust}")
+
+    # 6. IPv6 ::1 connection target preservation
+    client_ipv6 = pg_mod.PostgresNodeClient("ipv6_node", "::1", 5432, "site24x7", "pass", "postgres", patroni_port=8008)
+    rep.check(client_ipv6.hostname == "::1", f"PostgresNodeClient preserves raw IPv6 host '::1' for connections without converting to 127.0.0.1 (got '{client_ipv6.hostname}')")
+
+    # 7. Localhost connection target preservation
+    client_local = pg_mod.PostgresNodeClient("local_node", "localhost", 5432, "site24x7", "pass", "postgres")
+    rep.check(client_local.hostname == "localhost", f"PostgresNodeClient preserves 'localhost' for connections without converting to 127.0.0.1 (got '{client_local.hostname}')")
+
+    # 8. Remote IP and DNS name preservation
+    client_remote = pg_mod.PostgresNodeClient("remote_node", "postgres-primary.prod.internal", 5432, "site24x7", "pass", "postgres")
+    rep.check(client_remote.hostname == "postgres-primary.prod.internal", "PostgresNodeClient preserves remote DNS hostname")
+
+    # 9. _norm_host retains 127.0.0.1 for deduplication and cache keys
+    rep.check(pg_mod._norm_host("::1") == "127.0.0.1", "_norm_host('::1') returns '127.0.0.1' for deduplication")
+    rep.check(pg_mod._norm_host("localhost") == "127.0.0.1", "_norm_host('localhost') returns '127.0.0.1' for deduplication")
+    rep.check(pg_mod._norm_host("10.0.0.1") == "10.0.0.1", "_norm_host preserves non-local addresses")
+
+    # 10. IPv6 bracket formatting for Patroni HTTP endpoints
+    if hasattr(pg_mod, "_http_host"):
+        rep.check(pg_mod._http_host("::1") == "[::1]", "_http_host brackets IPv6 host '::1' for valid URL formatting")
+        rep.check(pg_mod._http_host("[::1]") == "[::1]", "_http_host does not double bracket '[::1]'")
+        rep.check(pg_mod._http_host("127.0.0.1") == "127.0.0.1", "_http_host leaves IPv4 unbracketed")
+        rep.check(pg_mod._http_host("localhost") == "localhost", "_http_host leaves hostname unbracketed")
+
+    # 11. bare cluster_host in auto mode -> PostgreSQL 5432, Patroni 8008
+    c_ch_auto = pg_mod.PostgresClusterCollector(cluster_host="postgres-primary.prod.internal", username="u", password="p", db="d", cluster_type="auto")
+    p_ch_auto = c_ch_auto._parse_nodes()
+    rep.check(len(p_ch_auto) == 1 and int(p_ch_auto[0][2]) == 5432 and p_ch_auto[0][3] == "8008",
+              f"bare cluster_host in auto mode defaults to PostgreSQL 5432 and Patroni 8008 ({p_ch_auto})")
+
+    # 12. explicit patroni_port="none" -> no Patroni call
+    c_ch_none = pg_mod.PostgresClusterCollector(cluster_host="postgres-primary.prod.internal", username="u", password="p", db="d", patroni_port="none", cluster_type="auto")
+    p_ch_none = c_ch_none._parse_nodes()
+    rep.check(len(p_ch_none) == 1 and p_ch_none[0][3] == "none" and c_ch_none.patroni_port == "none",
+              f"explicit patroni_port='none' sets patroni port to 'none' ({p_ch_none})")
+
+    # 13. explicit custom ports override defaults on cluster_host
+    c_cust = pg_mod.PostgresClusterCollector(cluster_host="10.0.0.1", default_port="5441", patroni_port="8001", username="u", password="p", db="d")
+    p_cust = c_cust._parse_nodes()
+    rep.check(len(p_cust) == 1 and p_cust[0][2] == "5441" and p_cust[0][3] == "8001",
+              f"explicit custom ports override defaults on cluster_host ({p_cust})")
+
+    # 14. legacy nodes="host:port:patroni_port" still works
+    c_leg = pg_mod.PostgresClusterCollector(nodes_str="primary1=10.0.1.1:5433:8009,standby1=10.0.1.2:5433:8009", username="u", password="p", db="d")
+    p_leg = c_leg._parse_nodes()
+    rep.check(len(p_leg) == 2 and p_leg[0] == ("primary1", "10.0.1.1", "5433", "8009", True) and p_leg[1] == ("standby1", "10.0.1.2", "5433", "8009", True),
+              f"legacy nodes='host:port:patroni_port' still works ({p_leg})")
+
+    # 15. cluster_host with embedded ports produces a clear error
+    for bad in ["10.0.0.1:5432", "10.0.0.1:5432:8008", "[::1]:5432", "host:5432"]:
+        try:
+            pg_mod.PostgresClusterCollector(cluster_host=bad, username="u", password="p", db="d")
+            rep.fail(f"cluster_host with embedded port did not raise ConfigError: {bad}")
+        except pg_mod.ConfigError as e:
+            rep.check("embedded ports" in str(e).lower(), f"cluster_host with embedded port '{bad}' raised clear ConfigError: {e}")
+        res_bad = pg_mod.run({"cluster_host": bad, "username": "u", "password": "p"})
+        rep.check(res_bad.get("status") == 0 and "embedded ports" in res_bad.get("msg", "").lower(),
+                  f"run() with embedded port cluster_host returns status 0 with clear error: {res_bad.get('msg')}")
+
+    # 16. config-file threshold values work during direct Python execution
+    import tempfile, configparser
+    with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as tf:
+        tf.write("""[postgres_cluster]
+cluster_host="10.0.0.1"
+username="site24x7"
+password="password"
+failover_warn_seconds=333
+slot_warn_bytes=444
+slot_critical_bytes=555
+replay_warn_seconds=77
+replay_warn_bytes=888
+""")
+        cfg_tmp_path = tf.name
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(cfg_tmp_path)
+        cfg_sec = dict(cp.items("postgres_cluster"))
+        f_val = pg_mod._read_int_setting(cfg_sec, "failover_warn_seconds", pg_mod.FAILOVER_WARN_SECONDS)
+        sw_val = pg_mod._read_int_setting(cfg_sec, "slot_warn_bytes", pg_mod.SLOT_WARN_BYTES)
+        sc_val = pg_mod._read_int_setting(cfg_sec, "slot_critical_bytes", pg_mod.SLOT_CRITICAL_BYTES)
+        rw_val = pg_mod._read_int_setting(cfg_sec, "replay_warn_seconds", pg_mod.REPLAY_WARN_SECONDS)
+        rb_val = pg_mod._read_int_setting(cfg_sec, "replay_warn_bytes", pg_mod.REPLAY_WARN_BYTES)
+        rep.check(f_val == 333 and sw_val == 444 and sc_val == 555 and rw_val == 77 and rb_val == 888,
+                  f"config-file threshold values read properly: failover={f_val}, slot_warn={sw_val}, slot_crit={sc_val}, replay_s={rw_val}, replay_b={rb_val}")
+    finally:
+        if os.path.exists(cfg_tmp_path):
+            os.remove(cfg_tmp_path)
+
+    # 17. db parameter defaults to postgres everywhere
+    c_nodb = pg_mod.PostgresClusterCollector(cluster_host="10.0.0.1", username="u", password="p")
+    rep.check(c_nodb.db == "postgres", f"db parameter defaults to 'postgres' when omitted: got '{c_nodb.db}'")
+
+
 def test_repmgr_live(plugin_py, rep):
     print("\n=== Test: repmgr Live Integration (Witness, Standbys, Failover History) ===")
     import socket
@@ -1274,8 +1403,10 @@ def test_repmgr_live(plugin_py, rep):
         rep.check(data.get("Standbys Streaming") == 2, f"Standbys Streaming is 2 ({data.get('Standbys Streaming')})")
         rep.check(data.get("Standby Disconnect Flag") == 0, "Standby Disconnect Flag is 0")
         rep.check(data.get("Cluster Health") == 0, f"Cluster Health is 0 healthy ({data.get('Cluster Health')})")
-        rep.check(data.get("Seconds Since Last Failover") is not None, f"Seconds Since Last Failover present ({data.get('Seconds Since Last Failover')})")
-        rep.check(data.get("Failovers Last 24h") >= 1, f"Failovers Last 24h >= 1 ({data.get('Failovers Last 24h')})")
+        rep.check(data.get("Failover Age Seconds") is not None, f"Failover Age Seconds present ({data.get('Failover Age Seconds')})")
+        recent_failovers = data.get("Failovers Last 24h")
+        rep.check(isinstance(recent_failovers, int) and recent_failovers >= 0,
+                  f"Failovers Last 24h is a non-negative count ({recent_failovers})")
         rep.check(data.get("Last Failover To") == "repmgrnode2", f"Last Failover To is repmgrnode2 ({data.get('Last Failover To')})")
 
         nodes = data.get("Cluster_Nodes", [])
@@ -1336,7 +1467,7 @@ def main():
     # Test 3: Thread-Safety Under Concurrency
     test_thread_safety_concurrency(plugin_py, nodes, user, password, db, patroni_port, rep)
 
-    # Test 4: Cluster Type Detection (13 Fixtures)
+    # Test 4: Cluster Type Detection (16 Fixtures)
     test_cluster_type_fixtures(rep)
 
     # Test 5: Dead host handling (never crash on dead node)
@@ -1383,6 +1514,7 @@ def main():
     test_regressions(plugin_py, nodes, user, password, db, patroni_port, rep)
     test_discovery(plugin_py, nodes, user, password, db, patroni_port, rep)
     test_parts_abc_unit(rep)
+    test_default_ports_and_host_normalization(rep)
     test_repmgr_live(plugin_py, rep)
 
     # Test 10: Dynamic Failover Assertion

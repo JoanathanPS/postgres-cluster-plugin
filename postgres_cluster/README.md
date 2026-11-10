@@ -1,227 +1,389 @@
 # Site24x7 PostgreSQL Cluster Monitoring Plugin
 
-The Site24x7 PostgreSQL Cluster Monitoring plugin provides end-to-end cluster-level observability across all primary and standby nodes as a unified cohesive system. It dynamically tracks cluster topology, auto-detects active primaries, monitors failover progression and timeline increments, alerts on split-brain or no-primary conditions, tracks streaming replication lag and slots, audits WAL generation and archiving, surfaces per-node database activity and checkpoints, and tracks standby query recovery conflicts across 4 specialized, easy-to-read dashboard tabs.
+Monitor a PostgreSQL cluster from one Site24x7 plugin monitor. The plugin discovers cluster members where possible and reports node availability, primary/standby roles, replication, WAL, database activity, and performance metrics.
 
----
+For a single PostgreSQL instance, use Site24x7's [PostgreSQL plugin](https://github.com/site24x7/plugins/tree/master/postgres). This plugin adds cluster topology and per-node views while retaining the standalone plugin's core metrics.
 
-## Key Capabilities
+## Quick installation
 
-- **Unified Cluster Topology**: Monitors multiple PostgreSQL endpoints simultaneously under a single Site24x7 monitor instance (eliminating the need to deploy and manage separate monitors per node).
-- **Cluster Manager Auto-Detection**: Dynamically inspects engine catalogs, extensions, endpoints, and environment signatures to identify the underlying HA orchestrator or cloud platform (reporting `Cluster Type` and a concise `Cluster Type Evidence` string < 100 characters).
-- **Dynamic Primary Discovery & Auto-Failover**: Evaluates all configured nodes concurrently in sub-second probes to determine the active primary and standbys. On failover, the plugin automatically follows the newly elected primary and tracks the new WAL timeline without configuration updates.
-- **Hierarchical Cluster Health Evaluation**: Evaluates cluster state dynamically into `Cluster Health` (0: Healthy, 1: Degraded, 2: Critical) and reports an actionable `Cluster Health Reason` (<100 characters).
-- **Dedicated Replication Telemetry**:
-  - `Replication_Standbys` & `Replication_Slots` child tables on the `Replication` tab.
-  - Exact byte lag (`replay_lag_bytes`, `write_lag_bytes`, `flush_lag_bytes`) and time delay (`replay_lag_s`, `Max Replay Delay`).
-  - Active, inactive, physical, and logical replication slot monitoring with retained WAL tracking (`Max Slot Lag Bytes`).
-- **Per-Node Standalone Telemetry**: Standalone metrics from official `postgres.py` are collected across **all** reachable cluster nodes (primary AND standby) via 5 dedicated child tables:
-  - `Node_IO` (insert/update/delete/fetch/return tuples, block reads/hits, heap reads/hits, cache hit ratio, index scans/reads/fetches).
-  - `Node_Checkpoints` (checkpoints timed/requested, write/sync time, buffers written).
-  - `Node_Activity` (active queries, waiting queries, idle transactions, connections, locks, uptime).
-  - `Node_Transactions` (commits, rollbacks, conflicts, sessions abandoned/fatal/killed).
-  - `Standby_Conflicts` (conflicts on locks, snapshots, buffer pins, deadlocks, tablespaces).
-- **4 Intuitive Dashboard Tabs**: Logically partitioned into `Cluster`, `Replication`, `Node Performance`, and `Transactions and Sessions`.
-- **Always-Emitted Archive & WAL Telemetry**: `Archive Mode`, `Archive Status Success`, `Archive Status Failed`, `Archive Ready Files Count`, and `Last Archived WAL File` are always emitted with valid default values (never omitted when archiving is disabled).
+The plugin includes Linux and Windows installers. This v4 review has not run either installer against a live Site24x7 agent; follow the installation steps below and validate the installer in your environment before production use.
 
----
+### Windows
 
-## Cluster Health Rules
+Run PowerShell as Administrator from the plugin directory:
 
-The plugin computes `Cluster Health` as an integer status code (`0` = Healthy, `1` = Degraded, `2` = Critical) alongside a human-readable `Cluster Health Reason` string (< 100 characters). The rules evaluate top-down, returning the first matching rule:
-
-### 1. Critical (`Cluster Health = 2`)
-- **No Primary**: Zero reachable nodes report read-write primary status (`Primary Count == 0`).
-  - *Reason*: `Critical: No primary node detected in cluster`
-- **Split Brain**: Multiple nodes simultaneously report read-write primary status (`Primary Count > 1`).
-  - *Reason*: `Critical: Split brain detected (N primary nodes active)`
-- **All Standbys Disconnected**: Standbys were expected, but zero standbys are streaming (`Standbys Expected > 0` and `Standbys Streaming == 0`).
-  - *Reason*: `Critical: All standbys disconnected (0/N streaming)`
-
-### 2. Degraded (`Cluster Health = 1`)
-- **Node Down**: One or more configured cluster nodes are unreachable (`Nodes Up < Nodes Total`).
-  - *Reason*: `Degraded: N node(s) down (Nodes Up/Total)`
-- **Standby Disconnected**: Fewer standbys are streaming than expected (`Standbys Streaming < Standbys Expected`).
-  - *Reason*: `Degraded: Standby disconnected (Streaming/Expected streaming)`
-- **Replay Delay Over Threshold**: Standby replication replay delay exceeds 30.0 seconds (`Max Replay Delay > 30.0s`).
-  - *Reason*: `Degraded: High replay delay (X.Xs > 30.0s)`
-- **Replay Backlog Over Threshold**: Standby replication byte backlog exceeds 100 MB (`Max Replay Backlog > 104,857,600 bytes`).
-  - *Reason*: `Degraded: High replay backlog (X.X MB > 100.0 MB)`
-- **Inactive Replication Slot**: One or more replication slots are inactive, risking disk fill (`Replication Slots Inactive > 0`).
-  - *Reason*: `Degraded: N inactive replication slot(s) detected`
-- **Timeline Mismatch**: Any active node's timeline diverges from the primary's timeline (`Timeline Mismatch Flag == 1`).
-  - *Reason*: `Degraded: Timeline mismatch detected across active nodes`
-
-### 3. Healthy (`Cluster Health = 0`)
-- When none of the critical or degraded conditions match:
-  - *Reason*: `Cluster healthy: N/N nodes active, 1 primary, M standbys streaming`
-
----
-
-## 4-Tab Dashboard Architecture
-
-The dashboard is structured into exactly 4 specialized tabs, each answering a critical operational question:
-
-```
-+--------------------------------------------------------------------------------------------------------+
-|                                  PostgreSQL Cluster Plugin Dashboard                                   |
-+-----------------------------------+------------------------------------+-------------------------------+
-|  1. Cluster                       |  2. Replication                    |  3. Node Performance          |  4. Transactions & Sessions
-|  "What is cluster topology,       |  "Are standbys caught up, and      |  "How are nodes performing    |  "What is the transactional
-|   manager type, and health?"      |   are WAL/slots stable?"           |   in I/O and checkpoints?"    |   load & connection state?"
-+-----------------------------------+------------------------------------+-------------------------------+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1 `
+  -ClusterHost "postgres-primary.prod.internal" -Username "site24x7"
 ```
 
-### Tab 1: "Cluster"
-- **Question Answered**: *What is the cluster topology, manager type, active primary, timeline, and overall cluster health?*
-- **Flat Metrics (Primary Baseline)**:
-  - `Cluster Type`: Detected orchestrator (`Patroni`, `repmgr`, `streaming replication`, `standalone`, etc.).
-  - `Cluster Health`: Health status code (0: Healthy, 1: Degraded, 2: Critical).
-  - `Cluster Health Reason`: Actionable cause string (< 100 characters).
-  - `Cluster Name`: Discovered cluster scope or configured name.
-  - `Cluster Type Evidence`: Diagnostic evidence snippet (< 100 characters).
-  - `Nodes Total`: Count of all configured endpoints.
-  - `Nodes Up`: Count of currently reachable endpoints.
-  - `Primary Count`: Count of active primary nodes (normally 1).
-  - `No Primary Flag`: 1 if zero primaries active; 0 otherwise.
-  - `Split Brain Flag`: 1 if multiple primaries active; 0 otherwise.
-  - `Primary Timeline`: Active WAL timeline ID of the primary node.
-  - `Timeline Mismatch Flag`: 1 if any standby timeline differs from the primary; 0 otherwise.
-- **Child Table**: `Cluster_Nodes` (Per-node overview across all nodes).
+The interactive installer prompts for the password without echoing it. For unattended installation, set `MONITOR_PASSWORD` in the process environment and add `-NonInteractive`; avoid passing `-Password` on the command line. For a non-Patroni cluster, use `host:port:none` and omit `-PatroniPort`. The installer supports `-DryRun`, `-PluginFolderName`, and threshold parameters `-ReplayWarnSeconds`, `-ReplayWarnBytes`, `-FailoverWarnSeconds`, `-SlotWarnBytes`, and `-SlotCriticalBytes`.
 
-### Tab 2: "Replication"
-- **Question Answered**: *Are standbys replicating properly, are WAL positions progressing, and are replication slots healthy?*
-- **Flat Metrics**:
-  - `Standbys Expected`, `Standbys Streaming`, `Standby Disconnect Flag`.
-  - `Sync Standby Count`, `Cascading Standby Count`.
-  - `Max Replay Backlog` (bytes), `Max Replay Delay` (seconds).
-  - `Replication Slots Total`, `Replication Slots Active`, `Replication Slots Inactive`, `Max Slot Lag Bytes`.
-  - `Logical Replication In Use` (1/0).
-  - `WAL Write Position` (MB), `WAL Insert Position` (MB), `WAL Flush Position` (MB).
-  - `WAL Files Count`, `WAL Total Size` (MB).
-  - `Archive Mode`, `Archive Status Success`, `Archive Status Failed`, `Archive Ready Files Count`, `Last Archived WAL File`.
-  - `Recovery Conflicts Total`, `Conflicts Tablespace`, `Conflicts Lock`, `Conflicts Snapshot`, `Conflicts Buffer Pin`, `Conflicts Deadlock`.
-  - `Oldest Running Transaction Age` (seconds).
-- **Child Tables**:
-  - `Replication_Standbys`: Connected streaming standbys with exact byte and second lags.
-  - `Replication_Slots`: Physical and logical replication slots with active state and retained WAL bytes.
-  - `Standby_Conflicts`: Per-node query conflict breakdown on standby nodes.
+### Linux
 
-### Tab 3: "Node Performance"
-- **Question Answered**: *How are cluster nodes performing in terms of I/O throughput, buffer allocation, cache hits, and checkpoints?*
-- **Flat Metrics (Primary Baseline)**:
-  - `Total Rows Inserted`, `Total Rows Updated`, `Total Rows Deleted`, `Total Rows Fetched`, `Total Rows Returned`.
-  - `Total Block Reads`, `Total Block Hits`.
-  - `Heap Blocks Read`, `Heap Blocks Hit`, `Cache Hit Ratio` (0.0 to 1.0 ratio).
-  - `Index Scans`, `Index Rows Read`, `Index Rows Fetched`.
-  - `Checkpoints Timed`, `Checkpoints Req`, `Checkpoint Write Time` (ms), `Checkpoint Sync Time` (ms).
-  - `Buffers Checkpoint`, `Buffers Clean`, `Maxwritten Clean`, `Buffers Backend`, `Buffers Backend Fsync`, `Buffers Alloc`.
-  - `Dead Tuples`.
-- **Child Tables**:
-  - `Node_IO`: Per-node DML throughput, block reads/hits, heap stats, cache hit ratio, and index usage across every cluster node.
-  - `Node_Checkpoints`: Per-node checkpoint write/sync times and background writer buffer statistics across every cluster node.
-  - `Stats_per_DB`: Database-level throughput, size, block reads, and hits on the primary.
+```bash
+sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
+```
 
-### Tab 4: "Transactions and Sessions"
-- **Question Answered**: *What is the concurrency, connection saturation, lock contention, and transaction throughput across nodes and databases?*
-- **Flat Metrics (Primary Baseline)**:
-  - `Active Connections`, `Max Connections`, `Connection Utilization Percent` (%).
-  - `Active Queries`, `Active Waiting Queries`.
-  - `Locks Count`, `Oldest Transaction ID Age`.
-  - `Total Commits`, `Total Rollbacks`, `Total Conflicts`.
-  - `Transactions Open`, `Transactions Idle In Transaction`.
-  - `Total Sessions`, `Total Sessions Abandoned`, `Total Sessions Fatal`, `Total Sessions Killed`.
-  - `Uptime` (seconds), `Table Count`, `Database Count`, `Server Version`, `Server PID` (*needs TL approval*).
-- **Child Tables**:
-  - `Node_Activity`: Per-node connections, active queries, waiting queries, idle transactions, locks, and uptime across every cluster node.
-  - `Node_Transactions`: Per-node transaction commits, rollbacks, conflicts, and session lifecycle counts across every cluster node.
-  - `Tranasctions_and_Session_per_Database`: Database-level session lifecycle, transaction commits/rollbacks, and active times on the primary.
+For non-interactive installation, export `PG_CLUSTER_HOST`, `MONITOR_USER`, and `MONITOR_PASSWORD` (`MONITOR_DB` defaults to `postgres`, `POSTGRES_PORT` defaults to `5432`, `PATRONI_PORT` defaults to `8008`); `PG_NODES` is supported as a legacy fallback. Optionally set `ADDRESS_MAP`, `REPLAY_WARN_SECONDS`, `REPLAY_WARN_BYTES`, `FAILOVER_WARN_SECONDS`, `SLOT_WARN_BYTES`, and `SLOT_CRITICAL_BYTES`. Install `psycopg2-binary` in the system Python environment used by the Site24x7 agent.
 
----
+## Prerequisites
 
-## Child Tables Specification & Column Dictionary
+- The Site24x7 server monitoring agent on a host that can reach every PostgreSQL node being monitored.
+- A dedicated monitoring role. The provided `prerequisites/create_user.sql` grants `pg_monitor`, `pg_read_all_stats`, and `pg_read_all_settings`; repmgr discovery grants are optional and documented in that SQL file.
+- Python 3.9 or newer and `psycopg2` available to the agent's Python runtime.
+- For Patroni discovery, the Patroni REST API port (normally `8008`) must be reachable from the agent.
 
-The plugin defines exactly **9 child tables** (complying strictly with Site24x7 limits: max 10 tables, max 15 columns, max 25 rows, max 5 string columns per table, nested units dictionary):
+Create the monitoring role on the primary for physical replication clusters. Create it on every node for Citus or multi-master deployments. See [Create the monitoring user](#create-the-monitoring-user).
 
-| Child Table Name | Tab | Columns & Nested Units | String Columns (<=5) | Scope |
-| :--- | :--- | :--- | :--- | :--- |
-| `Cluster_Nodes` | `Cluster` | `name`, `role`, `cluster_type`, `patroni_state`, `upstream`, `is_cascading`, `up` (flag), `is_primary` (flag), `timeline` (timeline), `response_time_ms` (ms), `connections` (connections), `replay_backlog_bytes` (bytes), `replay_delay_s` (s), `status` (status) | 5 (`name`, `role`, `cluster_type`, `patroni_state`, `upstream`) | All configured cluster nodes |
-| `Replication_Standbys` | `Replication` | `name`, `client_addr`, `state`, `sync_state`, `role`, `replay_lag_bytes` (bytes), `write_lag_bytes` (bytes), `flush_lag_bytes` (bytes), `replay_lag_s` (s), `is_sync` (flag), `status` (status) | 5 (`name`, `client_addr`, `state`, `sync_state`, `role`) | Active standbys streaming from primary |
-| `Replication_Slots` | `Replication` | `name`, `plugin`, `slot_type`, `active` (flag), `wal_retained_bytes` (bytes), `status` (status) | 3 (`name`, `plugin`, `slot_type`) | All replication slots on primary |
-| `Standby_Conflicts` | `Replication` | `name`, `confl_tablespace` (conflicts), `confl_lock` (conflicts), `confl_snapshot` (conflicts), `confl_bufferpin` (conflicts), `confl_deadlock` (conflicts), `total_conflicts` (conflicts), `status` (status) | 1 (`name`) | Standby nodes only |
-| `Node_IO` | `Node Performance` | `name`, `rows_inserted` (rows), `rows_updated` (rows), `rows_deleted` (rows), `rows_fetched` (rows), `rows_returned` (rows), `block_reads` (blocks), `block_hits` (blocks), `heap_blocks_read` (blocks), `heap_blocks_hit` (blocks), `cache_hit_ratio` (ratio), `index_scans` (scans), `index_rows_read` (rows), `index_rows_fetched` (rows), `status` (status) | 1 (`name`) | All reachable cluster nodes |
-| `Node_Checkpoints` | `Node Performance` | `name`, `checkpoints_timed` (checkpoints), `checkpoints_req` (checkpoints), `checkpoint_write_time` (ms), `checkpoint_sync_time` (ms), `buffers_checkpoint` (buffers), `buffers_clean` (buffers), `maxwritten_clean` (buffers), `buffers_backend` (buffers), `buffers_backend_fsync` (calls), `buffers_alloc` (buffers), `status` (status) | 1 (`name`) | All reachable cluster nodes |
-| `Node_Activity` | `Transactions and Sessions` | `name`, `active_connections` (connections), `max_connections` (connections), `active_queries` (queries), `active_waiting_queries` (queries), `transactions_open` (transactions), `transactions_idle_in_transaction` (transactions), `locks_count` (locks), `oldest_xact_age_s` (s), `uptime` (s), `status` (status) | 1 (`name`) | All reachable cluster nodes |
-| `Node_Transactions` | `Transactions and Sessions` | `name`, `commits` (transactions), `rollbacks` (transactions), `conflicts` (conflicts), `sessions` (sessions), `sessions_abandoned` (sessions), `sessions_fatal` (sessions), `sessions_killed` (sessions), `status` (status) | 1 (`name`) | All reachable cluster nodes |
-| `Stats_per_DB` | `Node Performance` | `name`, `active_connections`, `size_in_mb`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_fetched`, `rows_returned`, `block_reads`, `block_hits` | 1 (`name`) | Discovered databases on primary |
-| `Tranasctions_and_Session_per_Database` | `Transactions and Sessions` | `name`, `commits`, `rollbacks`, `conflicts`, `sessions`, `sessions_abandoned`, `sessions_fatal`, `sessions_killed`, `session_time`, `sessions_active_time`, `session_idle_in_transaction_time` | 1 (`name`) | Discovered databases on primary |
+## Plugin installation
 
----
+The installer copies the plugin into the Site24x7 agent directory and runs a connectivity check. To install manually:
 
-## Tested Clusters Matrix
+1. Create a `postgres_cluster` directory in the agent's plugin directory.
+2. Copy `postgres_cluster.py` and `postgres_cluster.cfg` into it.
+3. Edit the configuration as shown below.
+4. Run the command in [Verify the installation](#verify-the-installation) and confirm valid JSON.
 
-In accordance with rigorous engineering standards, no unsubstantiated claims are made. Every supported cluster manager and topology is classified by its verified status:
+| Operating system | Plugin directory |
+| --- | --- |
+| Linux | `/opt/site24x7/monagent/plugins/postgres_cluster/` |
+| Windows | `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres_cluster\` |
 
-| Cluster Manager / Architecture | Verification Status | Verification Methodology & Evidence | Evidence Signature (<100 chars) |
-| :--- | :--- | :--- | :--- |
-| **Patroni HA** | **Tested Live** | Verified against live 3-node containerized cluster with DCS (etcd). Tested automatic failover, REST API probes, timeline increment (24 -> 25), and node recovery. | `Patroni REST API response (scope: patroni-cluster, v4.0.4)` |
-| **Streaming Replication (Unmanaged)** | **Tested Live** | Verified against live 2-node PostgreSQL 16 streaming cluster. Validated baseline detection, `pg_promote()` failover, split-brain alert detection (`Split Brain Flag == 1`, Health 2), and teardown. | `PostgreSQL physical streaming replication (1 standbys)` |
-| **Standalone PostgreSQL (14 & 16)** | **Tested Live** | Verified against live containerized PostgreSQL 14 and 16 standalone instances. Verified single-node detection, version extraction, and healthy status code 0. | `Single PostgreSQL instance without active streaming standbys` |
-| **repmgr** | **Fixture Validated** | Verified via test fixture detecting `repmgr` extension and `repmgr.nodes` topology catalog table. | `repmgr extension / repmgr.nodes catalog found` |
-| **pg_auto_failover** | **Fixture Validated** | Verified via test fixture detecting `pgautofailover` extension and `pgautofailover_standby` replication slot. | `pgautofailover extension / standby slot found` |
-| **CloudNativePG (CNPG)** | **Fixture Validated** | Verified via test fixture detecting Kubernetes CNPG operator replication slot pattern `_cnpg_*`. | `CloudNative-PG replication slot pattern _cnpg_* found` |
-| **Stolon** | **Fixture Validated** | Verified via test fixture detecting Stolon keeper slot pattern `stolon_*` and application name signatures. | `Stolon replication slot / app pattern found` |
-| **Citus Distributed** | **Fixture Validated** | Verified via test fixture detecting `citus` distributed coordinator extension. | `citus distributed extension installed` |
-| **AWS Aurora PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting `aurora_version()` engine function. | `aurora_version() function detected` |
-| **AWS RDS PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Amazon RDS administrative role `rds_superuser`. | `rds_superuser role detected` |
-| **Azure Database for PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Azure managed service role `azure_pg_admin`. | `azure_pg_admin role detected` |
-| **GCP Cloud SQL PostgreSQL** | **Fixture Validated** | Verified via test fixture detecting Google Cloud SQL administrative role `cloudsqlsuperuser`. | `cloudsqlsuperuser role detected` |
-| **Mixed / HA Conflict** | **Fixture Validated** | Verified via test fixture detecting contradictory HA orchestrator signatures, safely categorized as `mixed/unknown`. | `Conflicting evidence: Patroni and repmgr detected` |
+The plugin folder, Python file, configuration file, and config section should use the same name: `postgres_cluster`.
 
----
+## Configuration
 
-## Known Limitations
-
-1. **Non-Superuser Permissions**: Non-superuser monitoring users (`site24x7`) require `pg_monitor` grant to inspect `pg_stat_replication`, `pg_stat_database`, and `pg_stat_activity`. Without `pg_monitor`, query text is obscured and lag metrics return 0.
-2. **Cascading Replication Standbys**: Cascading standbys downstream of an intermediate standby cannot be directly queried for primary replication LSNs unless included in the `nodes` configuration string.
-3. **Historical WAL Files**: PostgreSQL engines that keep large WAL retention directories (`wal_keep_size`) will show higher `WAL Files Count` and `WAL Total Size` without impacting real-time throughput.
-4. **Site24x7 Custom Tab Promotion**: Site24x7 promotes the primary landing page based on tab order and first metric. String metrics (`Cluster Type`) render in textual attribute panels and table columns, while numeric metrics populate time-series charts.
-
----
-
-## Installation & Configuration
-
-### Automated Installation (From Cloned Repository)
-
-1. **Clone the repository**:
-   ```bash
-   git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git
-   cd postgres-cluster-plugin/upstream_layout/postgres_cluster
-   ```
-
-2. **Run Installer**:
-   - **Linux**:
-     ```bash
-     sudo bash installer/Site24x7PostgresClusterPluginInstaller.sh
-     ```
-   - **Windows (PowerShell as Administrator)**:
-     ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\Site24x7PostgresClusterPluginInstaller.ps1
-     ```
-
-### Configuration (`postgres_cluster.cfg`)
+Example `postgres_cluster.cfg`:
 
 ```ini
 [global_configurations]
-use_agent_python = 0
-redirect_output = 1
+use_agent_python=0
+redirect_output=1
 
 [postgres_cluster]
-nodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003"
-username = "site24x7"
-password = "your_password"
-db = "postgres"
-patroni_port = "8008"
-cluster_type = "auto"
+# Required: IP address or internal DNS name for a reachable cluster seed
+cluster_host="postgres-primary.prod.internal"
+
+# Optional: default is 5432
+# postgres_port="5432"
+
+# Optional: default is 8008 when Patroni is used (set to "none" to disable)
+# patroni_port="8008"
+
+username="site24x7"
+password="<password>"
+
+# Optional: default is postgres
+# db="postgres"
+
+# Advanced options
+# cluster_type="auto"
+# discover="auto"
+# address_map=""
+# replay_warn_seconds=60
+# replay_warn_bytes=104857600
+# failover_warn_seconds=900
+# slot_warn_bytes=1073741824
+# slot_critical_bytes=10737418240
 ```
 
-> **Note on Windows `redirect_output`**: Setting `redirect_output = 1` in `[global_configurations]` is required on Windows agents. It directs the agent to capture plugin JSON through temporary file redirection instead of anonymous pipes, eliminating pipe buffer deadlock when child table JSON exceeds 4 KB.
+`cluster_host` accepts a single bare IP address or hostname. Ports default to 5432 (`postgres_port`) and 8008 (`patroni_port`). The database in `db` defaults to `postgres`. The legacy `nodes` parameter is still supported for backward compatibility with `host:port[:patroni_port]` entries.
+
+| Cluster type | Seed addresses |
+| --- | --- |
+| Patroni | One member, with its PostgreSQL and Patroni REST ports |
+| repmgr, Citus, pgpool-II, multi-master | One address where the manager exposes a member list |
+| Stolon, CloudNativePG, pg_auto_failover, plain streaming replication | List each node; discovery follows upstream links but cannot always find downstream standbys |
+
+Set `discover="off"` to monitor only listed nodes. If a cluster advertises internal Docker/NAT addresses that the agent cannot reach, use `address_map` to map each reported `host:port` to a reachable address. For Patroni, map both the PostgreSQL and REST API ports. Example:
+
+```ini
+address_map="pg-node1:5432=127.0.0.1:5441,pg-node1:8008=127.0.0.1:8001,pg-node2:5432=127.0.0.1:5442,pg-node2:8008=127.0.0.1:8002"
+```
+
+The plugin stores recent topology and endpoint names in `topology_cache.json` beside the collector. Cached topology is used as a discovery fallback for up to 24 hours when live discovery returns no members; node metrics still require the PostgreSQL endpoints to be reachable. Make sure the Site24x7 agent can write to the plugin directory, and remove this file if you need to discard stale cached topology immediately.
+
+The monitoring password is stored in the plugin configuration file. Restrict access to the plugin directory and use a dedicated monitoring account. On Linux, the installer sets the config file to mode `600`; after manual installation, use `chmod 600 postgres_cluster.cfg` and make sure the agent account can read it. Rotate credentials by changing the monitoring role password and updating this config file. The plugin does not expose libpq `sslmode` as a configuration option. For certificate verification, configure libpq environment variables such as `PGSSLMODE=verify-full` and `PGSSLROOTCERT` for the agent service, then restart the service; otherwise make a code change to expose connection parameters.
+
+## Verify the installation
+
+Run the plugin from its directory without putting the password in the process argument list:
+
+```bash
+PGPASSWORD='<password>' python postgres_cluster.py \
+  --nodes 10.0.0.5:5432:8008 --username site24x7 --db postgres
+```
+
+In PowerShell, set `$env:PGPASSWORD` before running the same command without `--password`.
+
+The command should print one JSON object. Check `status`, `Cluster Health`, `Nodes Up`, and the `msg` field. The agent normally registers the monitor within five minutes. On Windows, `redirect_output=1` is required for large JSON output; restart the agent service after changing its Python runtime or PATH.
+
+## Metrics
+
+### Flat metric reference
+
+The following metrics are emitted at the top level of the plugin JSON. Metrics are grouped by purpose, following the standalone PostgreSQL README's metric-name and description reference.
+
+#### Cluster and failover
+
+| Metric | Unit / type | Description |
+| --- | --- | --- |
+| `Cluster Health` | status | Cluster health code: `0` healthy, `1` degraded, `2` critical. |
+| `Nodes Up` | nodes | Configured or discovered nodes reachable during collection. |
+| `Nodes Configured` | nodes | Seed node addresses supplied in the plugin configuration. |
+| `Nodes Discovered` | nodes | Additional cluster members added through discovery. |
+| `Nodes Omitted` | nodes | Count of known configured or discovered omissions at the 25-node cap; it may overcount nodes present in both sets or undercount when discovery reaches its cap or deadline. |
+| `Nodes Total` | nodes | Nodes included in this collection attempt. |
+| `Primary Count` | nodes | Primary nodes identified in the topology. |
+| `Primary Timeline` | timeline | PostgreSQL timeline reported by the selected primary. |
+| `No Primary Flag` | flag | `1` when no usable primary is identified; otherwise `0`. |
+| `Split Brain Flag` | flag | `1` when an unexpected multiple-primary condition is detected; otherwise `0`. |
+| `Timeline Mismatch Flag` | flag | `1` when node timelines indicate a mismatch; otherwise `0`. |
+| `Server PID` | pid | Process ID of the selected PostgreSQL server. |
+| `Failover Age Seconds` | s | Seconds since the most recently observed failover event. |
+| `Failovers Last 24h` | failovers | Failover events observed in the previous 24 hours. |
+| `Last Failover To` | text | Node recorded as the destination of the latest failover. |
+| `Last Failover Timeline` | timeline | Timeline recorded for the latest failover. |
+
+#### Replication and slots
+
+| Metric | Unit / type | Description |
+| --- | --- | --- |
+| `Standbys Expected` | standbys | Standby nodes expected from the discovered/configured topology. |
+| `Standbys Streaming` | standbys | Expected standbys currently streaming. |
+| `Standby Disconnect Flag` | flag | `1` when an expected standby is not streaming; otherwise `0`. |
+| `Sync Standby Count` | standbys | Synchronous standbys reported by the primary. |
+| `Cascading Standby Count` | standbys | Reachable standbys that stream from another standby. |
+| `Max Replay Backlog` | bytes | Largest observed WAL replay backlog. |
+| `Max Replay Delay` | s | Largest observed WAL replay delay in seconds. |
+| `Replication Slots Total` | slots | Replication slots observed by the collector. |
+| `Replication Slots Active` | slots | Slots currently active. |
+| `Inactive Slots Count` | slots | Slots currently inactive. |
+| `Max Slot Lag Bytes` | bytes | Largest WAL retention attributed to a replication slot. |
+| `Slot Wal Status Risk` | risk | Highest observed slot WAL risk: `0` normal, `1` unreserved, `2` lost. |
+| `Logical Replication Used` | flag | `1` when logical replication evidence is present; otherwise `0`. |
+| `Mesh Links Declared` | links | Logical links/subscriptions declared across a multi-master topology. |
+| `Mesh Links Active` | links | Declared logical links currently active. |
+| `Mesh Disconnect Flag` | flag | `1` when one or more declared mesh links are inactive; otherwise `0`. |
+| `Max Logical Lag Bytes` | bytes | Largest logical replication lag in bytes. |
+| `Max Logical Lag Seconds` | s | Largest logical replication lag in seconds. |
+| `Subscription Apply Errors` | errors | Subscription apply errors reported by PostgreSQL. |
+| `Subscription Conflicts` | conflicts | Subscription synchronization conflicts reported by PostgreSQL. |
+
+#### Database, I/O, and checkpoints
+
+| Metric | Unit / type | Description |
+| --- | --- | --- |
+| `Table Count` | tables | Number of tables in the monitored database statistics view. |
+| `Database Count` | databases | Number of non-template databases on the instance. |
+| `Uptime` | s | Seconds since the PostgreSQL server started. |
+| `Total Rows Inserted` | rows | Cumulative rows inserted across databases. |
+| `Total Rows Updated` | rows | Cumulative rows updated across databases. |
+| `Total Rows Deleted` | rows | Cumulative rows deleted across databases. |
+| `Total Rows Fetched` | rows | Cumulative rows fetched across databases. |
+| `Total Rows Returned` | rows | Cumulative rows returned across databases. |
+| `Total Block Reads` | blocks | Cumulative database blocks read from storage. |
+| `Total Block Hits` | blocks | Cumulative database blocks served from shared buffers. |
+| `Heap Blocks Read` | blocks | Cumulative heap blocks read from storage. |
+| `Heap Blocks Hit` | blocks | Cumulative heap blocks served from shared buffers. |
+| `Cache Hit Ratio` | ratio | Ratio of heap buffer hits to total heap reads and hits. |
+| `Index Scans` | scans | Cumulative index scans. |
+| `Index Rows Read` | rows | Cumulative index entries returned by scans. |
+| `Index Rows Fetched` | rows | Cumulative table rows fetched by index scans. |
+| `Dead Tuples` | tuples | Estimated dead tuples in user tables. |
+| `Checkpoints Timed` | checkpoints | Cumulative checkpoints initiated by the timeout. |
+| `Checkpoints Req` | checkpoints | Cumulative checkpoints requested by other causes. |
+| `Checkpoint Write Time` | ms | Cumulative checkpoint write time in milliseconds. |
+| `Checkpoint Sync Time` | ms | Cumulative checkpoint synchronization time in milliseconds. |
+| `Buffers Checkpoint` | buffers | Buffers written during checkpoints. |
+| `Buffers Clean` | buffers | Buffers written by the background writer. |
+| `Maxwritten Clean` | buffers | Background-writer rounds stopped after reaching the write limit. |
+| `Buffers Backend` | buffers | Buffers written directly by backend processes; omitted on PostgreSQL 17+. |
+| `Buffers Backend Fsync` | calls | Backend fsync calls; omitted on PostgreSQL 17+. |
+| `Buffers Alloc` | buffers | Buffers allocated by the background writer. |
+| `Server Version` | text | PostgreSQL server version reported by the selected primary. |
+
+#### Transactions and sessions
+
+| Metric | Unit / type | Description |
+| --- | --- | --- |
+| `Active Connections` | connections | Current connections across databases on the selected primary. |
+| `Active Queries` | queries | Queries currently active, excluding idle sessions. |
+| `Active Waiting Queries` | queries | Active queries waiting on a PostgreSQL wait event; available on PostgreSQL 10+. |
+| `Max Connections` | connections | Configured maximum number of concurrent connections. |
+| `Connection Usage Percent` | % | Active connections as a percentage of `Max Connections`. |
+| `Locks Count` | locks | Locks currently visible in `pg_locks`. |
+| `Transactions Open` | transactions | Sessions with a transaction start time. |
+| `Idle Transactions` | transactions | Sessions idle while holding an open transaction. |
+| `Oldest Transaction ID Age` | xids | Age of the oldest transaction ID reported by PostgreSQL. |
+| `Oldest Running Txn Age` | s | Age in seconds of the oldest running transaction. |
+| `Total Commits` | transactions | Cumulative commits across databases. |
+| `Total Rollbacks` | transactions | Cumulative rollbacks across databases. |
+| `Total Conflicts` | conflicts | Cumulative conflicts read from the active primary; this is not a cluster-wide standby conflict total. |
+| `Total Sessions` | sessions | Cumulative sessions started across databases; available on PostgreSQL 14+. |
+| `Total Sessions Abandoned` | sessions | Cumulative sessions abandoned; available on PostgreSQL 14+. |
+| `Total Sessions Fatal` | sessions | Cumulative sessions ended by fatal errors; available on PostgreSQL 14+. |
+| `Total Sessions Killed` | sessions | Cumulative sessions terminated by administrator action; available on PostgreSQL 14+. |
+
+#### WAL and recovery
+
+| Metric | Unit / type | Description |
+| --- | --- | --- |
+| `WAL Write Position` | MB | Current WAL write position, expressed in megabytes. |
+| `WAL Insert Position` | MB | Current WAL insert position, expressed in megabytes. |
+| `WAL Flush Position` | MB | Current WAL flush position, expressed in megabytes. |
+| `WAL Files Count` | files | WAL segment files currently present in the WAL directory. |
+| `WAL Total Size` | MB | Total size of WAL files currently present. |
+| `Archive Mode` | text | Configured WAL archive mode (`off`, `on`, or `always`). |
+| `Archive Status Success` | files | Cumulative WAL files successfully archived since the statistics reset. |
+| `Archive Status Failed` | files | Cumulative WAL archive attempts that failed since the statistics reset. |
+| `Archive Ready Files Count` | files | Current WAL files marked `.ready` in the archive status directory. |
+| `Last Archived WAL File` | text | Name of the most recently archived WAL file. |
+| `Recovery Conflicts Total` | conflicts | Sum of five recovery-conflict types read from the active primary; this does not aggregate standbys or include PostgreSQL 16+ `confl_active_logicalslot`. |
+| `Conflicts Tablespace` | conflicts | Recovery conflicts caused by tablespace removal. |
+| `Conflicts Lock` | conflicts | Recovery conflicts caused by lock acquisition. |
+| `Conflicts Snapshot` | conflicts | Recovery conflicts caused by snapshot cleanup. |
+| `Conflicts Buffer Pin` | conflicts | Recovery conflicts caused by pinned buffers. |
+| `Conflicts Deadlock` | conflicts | Recovery conflicts caused by deadlocks. |
+
+Conflict metric caveat: these flat conflict values are collected from the active primary. PostgreSQL records recovery conflicts on standby servers, so the values may be zero and do not summarize conflicts across the cluster. The collector currently sums five conflict categories; PostgreSQL 16+ also exposes `confl_active_logicalslot`, which is not included. See the [PostgreSQL 16 statistics documentation](https://www.postgresql.org/docs/16/monitoring-stats.html). PostgreSQL statistics counters are cumulative since the last statistics reset, not per-second rates. Session metrics are absent before PostgreSQL 14, and `Active Waiting Queries` is absent before PostgreSQL 10. PostgreSQL 17+ uses the new checkpoint statistics view and omits the two backend buffer metrics shown above. `Slot Wal Status Risk` appears only when the server exposes `wal_status`; `Failover Age Seconds` and `Last Failover Timeline` appear only after a failover is identified. Primary-dependent metrics can be absent when no primary is reachable.
+
+### Dashboard tabs
+
+| Tab | What it shows |
+| --- | --- |
+| Cluster | Cluster type and health, node count, primary count/timeline, failover information, and node details |
+| Replication | Standby streaming/lag, replication slots, logical replication and mesh status |
+| Node Performance | Per-node I/O and checkpoint counters, database I/O statistics, and standalone database metrics |
+| Transactions and Sessions | Per-node activity, transactions, sessions, locks, and per-database transaction statistics |
+| WAL and Recovery | WAL positions/files, archive status, and recovery conflicts |
+
+### Child tables
+
+Site24x7 supports up to 25 rows per child table. This plugin emits at most 25 rows in each table; when additional rows exist, `msg` identifies the affected table and available row count. `Nodes Configured` counts seed addresses from config; `Nodes Discovered` counts additional members discovered; `Nodes Omitted` counts configured or discovered omission records at the 25-node cap; it is not guaranteed to be a unique-node count. If configured nodes beyond the cap are returned again by discovery, they can be counted twice; if topology discovery stops at its cap or deadline, additional unknown members may not be counted. `Nodes Total` counts nodes actually considered for polling. `Cluster Health` is evaluated against these considered nodes; when `Nodes Omitted` is greater than zero, the plugin may report a healthy status for only the polled subset. Configure a Site24x7 Trouble threshold on `Nodes Omitted > 0` until the collector health policy explicitly accounts for incomplete coverage.
+
+| Table | Tab | Contents |
+| --- | --- | --- |
+| `Cluster_Info` | Cluster | Cluster type, evidence, primary, health reason, node counts, and timeline. Columns: `name`, `cluster_type`, `type_evidence`, `primary_node`, `health_reason`, `nodes_total`, `nodes_up`, `primary_timeline`, `status`. Server version is available as the `Server Version` summary metric. |
+| `Cluster_Nodes` | Cluster | Per-node identity, role, reachability, timeline, response time, connections, replay backlog/delay, and monitoring status; optional fields depend on node evidence. |
+| `Replication_Links` | Replication | Physical streaming links or logical subscriptions: `name`, `link_type`, `source`, `target`, `state`, `replay_lag_bytes`, `write_lag_bytes`, `flush_lag_bytes`, `replay_lag_s`, `is_sync`, `active`, `status`. Some fields vary by link type. |
+| `Replication_Slots` | Replication | Slot name, plugin, type, activity, retained WAL, status, and `wal_status` when the server exposes it. |
+| `Node_IO` | Node Performance | `name`, `status`, row insert/update/delete/fetch/return counters, block reads/hits, heap reads/hits, cache-hit ratio, and index scan/read/fetch counters. |
+| `Node_Checkpoints` | Node Performance | `name`, `status`, checkpoint counts/times, checkpoint/clean buffers, maxwritten count, and allocated buffers. PG17+ omits `buffers_backend` and `buffers_backend_fsync`. |
+| `Stats_per_DB` | Node Performance | Standalone per-database rows: `name`, `active_connections`, `size_in_mb`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_fetched`, `rows_returned`, `block_reads`, and `block_hits`. |
+| `Node_Activity` | Transactions and Sessions | `name`, `status`, active/max connections, active/waiting queries, open/idle-in-transaction counts (`idle_in_txn_count`), locks, oldest transaction age, and uptime. |
+| `Node_Transactions` | Transactions and Sessions | `name`, `status`, commits, rollbacks, conflicts, and session counters (session fields are zero before PostgreSQL 14). |
+| `Transactions_Per_Database` | Transactions and Sessions | Per-database rows contain `name`, `commits`, `rollbacks`, and `conflicts`; PostgreSQL 14+ also reports sessions and session timing counters. The table name follows Site24x7’s documented attribute-name limit. |
+
+Site24x7 documents limits of 10 tables, 15 columns per table, 25 rows per table, five string columns per table, 200 generic metrics, a 520-character `name` value, and 100 characters for other string values. Attribute names follow Site24x7’s 25-character limit; the renamed schema differs from the standalone PostgreSQL plugin for the affected attributes. See [Site24x7 plugin limitations](https://support.site24x7.com/portal/en/kb/articles/limiting-features-of-a-plugin) and the migration note below.
+
+The `Stats_per_DB` and `Transactions_Per_Database` tables use Site24x7 child discovery and are collected from the active primary. Their columns and units follow the standalone PostgreSQL schema; session timing values are in milliseconds ([PostgreSQL statistics documentation](https://www.postgresql.org/docs/current/monitoring-stats.html)). Removed nodes may remain visible in Site24x7's historical child-table rows.
+
+### Attribute-name compatibility note
+
+Metric and table attribute names are kept within Site24x7’s documented 25-character limit. To comply, v4 changes three names from the standalone plugin: `Transactions Idle In Transaction` is now `Idle Transactions`, `Tranasctions_and_Session_per_Database` is now `Transactions_Per_Database`, and `session_idle_in_transaction_time` is now `idle_in_txn_time`. This is a breaking schema change. Existing thresholds, dashboards, reports, and integrations tied to the old names may need to be recreated or remapped when the new template version is registered. The cluster-specific labels were shortened as follows:
+
+| Previous cluster metric label | Current Site24x7 label |
+| --- | --- |
+| `Connection Utilization Percent` | `Connection Usage Percent` |
+| `Oldest Running Transaction Age` | `Oldest Running Txn Age` |
+| `Logical Replication In Use` | `Logical Replication Used` |
+| `Replication Slots Inactive` | `Inactive Slots Count` |
+| `Seconds Since Last Failover` | `Failover Age Seconds` |
+
+### Standalone PostgreSQL metric parity
+
+The cluster collector reuses the standalone plugin's core SQL for shared metrics, with version-specific checkpoint queries. The cluster monitor reports numeric values for many metrics that the standalone plugin serializes as strings. `Locks Count` can differ because the standalone connection counts locks held by its own monitoring transaction. The cluster collector excludes null database-name rows explicitly; the standalone collector removes the first fetched row, so the two per-database transaction tables are not guaranteed to match row-for-row. Three output names differ from standalone to satisfy Site24x7's 25-character attribute-name limit; see the compatibility note above. On PostgreSQL 17 and newer, `Buffers Backend` and `Buffers Backend Fsync` are omitted because those counters are no longer available in the statistics view used by the standalone plugin.
+
+Cluster-specific metrics include topology, node health, replication lag/slots, failover history, WAL/archive status, logical replication, and recovery-conflict information. Node child tables report metrics for reachable nodes; the flat standalone metrics are collected from the active primary.
+
+## Cluster health and alerts
+
+`Cluster Health` uses `0` for healthy, `1` for degraded, and `2` for critical. `status` is reserved by Site24x7 for monitor availability: the collector sets it to `1` when collection succeeds and `0` for configuration or execution failures. It is separate from cluster health; a node outage may make the cluster degraded while the plugin monitor remains available.
+
+Health evaluation considers no primary, split brain, expected standbys not streaming, node outages, replication delay/backlog, slot-retained WAL risk, recent failover, and timeline mismatch. Multi-master and Citus topologies have special handling for multiple primaries.
+
+Site24x7 creates a default threshold profile for plugin monitors, but does not set threshold values for the metrics. Configure a Plugin Integrations threshold profile after registration. Use static thresholds for explicit health flags and recovery objectives. Site24x7 also offers [Zia-based thresholds](https://www.site24x7.com/help/admin/configuration-profiles/threshold-and-availability/plugin-monitor.html) that learn normal behavior and flag abnormal spikes; consider them for continuous gauges such as replay delay/backlog and connection usage after collecting a representative baseline. Suggested static starting points (tune these to the topology and recovery objectives):
+
+| Metric | Condition | Suggested severity |
+| --- | --- | --- |
+| `Cluster Health` | `>= 1` | Trouble |
+| `Cluster Health` | `= 2` | Critical |
+| `No Primary Flag` | `= 1` | Critical |
+| `Split Brain Flag` | `= 1` | Critical |
+| `Max Replay Delay` | `> 60` seconds | Trouble |
+| `Max Replay Backlog` | `> 104857600` bytes | Trouble |
+| `Inactive Slots Count` | `> 0` | Trouble |
+| `Nodes Omitted` | `> 0` | Trouble |
+| `Connection Usage Percent` | `> 80` percent | Trouble |
+
+Child tables use at most five string columns, up to 15 total columns, and up to 25 rows; the reserved `name` value is capped at 520 characters and other strings at 100 characters. Collector health thresholds can be set in `postgres_cluster.cfg`: `replay_warn_seconds` (60 seconds), `replay_warn_bytes` (104857600 bytes), `failover_warn_seconds` (900 seconds), `slot_warn_bytes` (1073741824 bytes), and `slot_critical_bytes` (10737418240 bytes). Values must be integer bytes or seconds and cannot be negative. Setting `failover_warn_seconds` to `0` disables the recent-failover warning. Setting replay thresholds to `0` makes any positive delay/backlog degraded. Setting `slot_warn_bytes` to `0` means any positive inactive-slot retention meets the warning level; `slot_critical_bytes` cannot be `0` because it must be greater than the nonnegative warning threshold. Invalid ordering returns a configuration error. Site24x7 notification thresholds are configured separately in the web client.
+
+PostgreSQL statistics such as commits, rows, and blocks are cumulative since the last statistics reset. Read changes over time; absolute values are not per-second rates. Avoid applying anomaly thresholds to a monotonically increasing counter without a rate or reset-aware interpretation: normal growth can look like a sustained spike.
+
+## Updating the plugin
+
+Increment `PLUGIN_VERSION` by one when the metric or table schema changes, including adding, removing, or renaming an attribute or changing tabs. Logic-only collection changes that keep metric names and template structure the same do not require a version bump. Site24x7 requires an integer version below 10000; this release uses version 4 for the v4 schema changes. Use a new plugin name only when an existing account/agent setup requires a separate monitor during migration; it is not a substitute for incrementing the version. Before release, check that the canonical script and mirror use the same version, confirm changed JSON attributes have a version increment, and review the Site24x7 limits and nested units.
+
+## Tested cluster types
+
+“Live” means the plugin was run against a real test cluster. Detection fixtures alone do not count as live validation.
+
+| Cluster type | Integration evidence | Collector support |
+| --- | --- | --- |
+| Patroni | Live: three-node PostgreSQL 17.2 cluster; discovery and health are in the standard suite; failover, leader outage, and recovery to three nodes are checked only when `--failover` is enabled | Supported; tested |
+| Plain streaming replication | Live: two-node cluster; topology depends on seed direction | Supported; list all nodes for complete coverage |
+| repmgr | Live: PostgreSQL 17 primary, standbys, witness, and existing failover event history; the live check does not trigger a failover | Supported; tested |
+| Stolon | Live: PostgreSQL 15; all keeper addresses listed | Supported; tested |
+| pg_auto_failover | Live: monitor plus two data nodes; the testbed uses an unpinned `latest` image; list both data nodes | Supported; tested; PostgreSQL version not pinned |
+| Citus | Live: coordinator and workers | Supported; tested; exact PostgreSQL version not recorded here |
+| pgpool-II | Live: PostgreSQL 16 backends discovered from pgpool address | Supported; tested |
+| Multi-Master (native logical) | Live: PostgreSQL 17 three-node active-active cluster | Supported; tested |
+| CloudNativePG | Live: three instances in kind; the manifest does not pin a PostgreSQL image version, and the read-only service did not expose every instance | Supported; tested with discovery limitation; PostgreSQL version not pinned |
+| Multi-Master (pglogical) | Detection fixture only; no live integration testbed | Supported by collector; integration behavior unverified |
+| AWS Aurora, AWS RDS, Azure Database for PostgreSQL, GCP Cloud SQL | Detection fixtures only | Detected labels are not in the supported-type allowlist; collection currently returns an unsupported-type error |
+| One-way logical replication, mixed/unknown evidence, standalone, split-brain streaming evidence | Detection fixtures only | Detection behavior only; not end-to-end cluster support claims |
+
+See the testbeds in `testbeds/` and the live discovery runner in `tester/test_discovery_live.py` for the specific test setup. PostgreSQL releases, cluster-manager versions, and operating systems not shown as live-tested should be treated as unverified.
+
+## Known limitations
+
+- Every discovered address must be reachable and resolvable from the agent host.
+- The PostgreSQL password remains stored in plaintext in the plugin configuration file. The Windows installer restricts that file to SYSTEM and Administrators; apply equivalent access controls on Linux and after manual edits.
+- Some cluster managers do not expose a complete member list through PostgreSQL; list all nodes when required by the table above.
+- Cloud provider-managed standbys may not be directly reachable. The plugin cannot discover provider-side topology that is not exposed through PostgreSQL or a supported manager API.
+- Database-scoped metrics describe the database configured in `db`; per-database tables are limited to 25 rows.
+- PostgreSQL 17 moved checkpoint counters. `Buffers Backend` and `Buffers Backend Fsync` are omitted on PostgreSQL 17 and newer because the statistics view used by the standalone plugin no longer provides them.
+- Linux and Windows installer behavior has not been validated against a live Site24x7 agent in this v4 review. PostgreSQL versions shown in the test matrix have live collector test coverage; other versions should be validated in your environment before production use.
+- Site24x7 may retain old child-table rows after a node is removed from the cluster.
+
+## Create the monitoring user
+
+Run once on the primary for a physical replication cluster:
+
+```bash
+psql -h <primary-host> -U postgres \
+  -v mon_user=site24x7 -f prerequisites/create_user.sql
+psql -h <primary-host> -U postgres \
+  -v mon_user=site24x7 -c '\password :mon_user'
+```
+
+The provided SQL creates a least-privilege monitoring role and grants the PostgreSQL monitoring roles needed by the plugin. The second command uses psql's secure password prompt, avoiding a password in SQL files, command arguments, or shell history ([psql documentation](https://www.postgresql.org/docs/current/app-psql.html)). The bundled Linux helper runs both steps interactively. For multi-master or Citus, create the user on each node. Optional repmgr grants are included in the SQL file.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| No monitor appears | Run the manual JSON check; confirm the agent can run Python and import `psycopg2`; inspect the agent plugin registration log |
+| Node is offline | Confirm PostgreSQL port reachability and DNS from the agent host; map container/NAT addresses with `address_map` |
+| No primary detected | Check the listed/discovered nodes and verify failover has completed |
+| WAL metrics missing | Confirm the monitoring role can read the relevant PostgreSQL functions/views; the plugin reports unavailable metrics in `msg` |
+| Topology cache warning in `msg` | Confirm the agent can write to the plugin directory; live discovery and node polling continue without a successful cache refresh |
+| Duplicate monitor appears | Match plugin folder, script, config, and section names |
+
+## Developer notes
+
+The canonical plugin source is `upstream_layout/postgres_cluster/`. The repository's `postgres_cluster/` directory is the working mirror for the collector script. The root-level `postgres_cluster/postgres_cluster.ps1` is a legacy wrapper and is not part of the supported installation; use the Python collector and configuration described above. Run `check-layout.ps1` after changing canonical plugin files; it compares collector, README, installer, user-setup helper, and config-template mirrors and checks collector-version parity. It does not detect schema changes that were made without incrementing `PLUGIN_VERSION`. Add a cluster manager to the supported list only after its live test passes; detection-only fixtures are not sufficient evidence of support.
+
+When adding a cluster type, update evidence detection, member discovery, health handling, and a live testbed/runner entry together. Document whether discovery requires one seed or every node, then update the tested-cluster matrix above.

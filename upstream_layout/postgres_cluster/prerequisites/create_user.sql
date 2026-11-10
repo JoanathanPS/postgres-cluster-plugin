@@ -2,10 +2,9 @@
 -- Creates a dedicated least-privilege user for PostgreSQL cluster monitoring.
 -- Run this script as a superuser (e.g. 'postgres') on the primary node.
 --
---   psql -h <primary-host> -U postgres -v mon_user=site24x7 -v mon_pass='your_password' -f create_user.sql
+--   psql -h <primary-host> -U postgres -v mon_user=site24x7 -f create_user.sql
 --
--- mon_user defaults to 'site24x7' and mon_pass defaults to 'site24x7' if you do not pass them.
--- Always choose your own password for a real cluster.
+-- Run this SQL file, then use psql's \password command as shown in the README.
 
 \set ON_ERROR_STOP on
 
@@ -13,13 +12,10 @@
 \else
   \set mon_user site24x7
 \endif
-\if :{?mon_pass}
-\else
-  \set mon_pass site24x7
-\endif
+BEGIN;
 
--- Create the login role (an existing role keeps its password)
-SELECT format('CREATE ROLE %I WITH LOGIN PASSWORD %L', :'mon_user', :'mon_pass')
+-- Create the login role without a password; set it with psql's password prompt next.
+SELECT format('CREATE ROLE %I WITH LOGIN', :'mon_user')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mon_user') \gexec
 SELECT format('ALTER ROLE %I WITH LOGIN', :'mon_user') \gexec
 
@@ -47,10 +43,12 @@ SELECT format('GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO %I', :'mon
 SELECT format('GRANT SELECT ON pg_catalog.pg_subscription TO %I', :'mon_user')
  WHERE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'pg_catalog' AND c.relname = 'pg_subscription') \gexec
 
+COMMIT;
+
 -- OPTIONAL, repmgr clusters only: lets the plugin read the repmgr node list (database "repmgr") for node discovery.
 -- Without it the plugin still finds the nodes by walking the replication topology.
 -- \c repmgr
 -- GRANT USAGE ON SCHEMA repmgr TO site24x7;
 -- GRANT SELECT ON ALL TABLES IN SCHEMA repmgr TO site24x7;
 
-SELECT 'monitoring user ' || :'mon_user' || ' is ready' AS result;
+SELECT 'monitoring role privileges configured for ' || :'mon_user' AS result;

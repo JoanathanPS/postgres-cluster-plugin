@@ -13,7 +13,7 @@
 .PARAMETER Username
     REQUIRED. PostgreSQL monitoring username. There is no default.
 .PARAMETER Password
-    REQUIRED. PostgreSQL monitoring password. There is no default.
+    PostgreSQL monitoring password. Prefer the secure interactive prompt or the S247_POSTGRES_CLUSTER_INSTALL_PASSWORD / MONITOR_PASSWORD environment variable over a command-line argument.
 .PARAMETER Database
     REQUIRED. Database the plugin connects to. There is no default.
 .PARAMETER PatroniPort
@@ -29,19 +29,27 @@
 .PARAMETER DryRun
     Validates environment and runs plugin without modifying the Agent directory
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "10.0.0.5:5432:8008" -Username "site24x7" -Password "<password>" -Database "postgres" -NonInteractive
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -Nodes "10.0.0.5:5432:8008" -Username "site24x7" -Database "postgres" -DryRun
 .EXAMPLE
-    .\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_dev" -Nodes "10.0.0.5:5432:none" -Username "site24x7" -Password "<password>" -Database "postgres" -NonInteractive
+    # Set MONITOR_PASSWORD securely in the deployment environment first.
+    .\Site24x7PostgresClusterPluginInstaller.ps1 -PluginFolderName "postgres_cluster_dev" -Nodes "10.0.0.5:5432:none" -Username "site24x7" -Database "postgres" -NonInteractive -DryRun
 #>
 
 [CmdletBinding()]
 param(
+    [string]$ClusterHost = "",
+    [string]$PostgresPort = "",
     [string]$Nodes = "",
     [string]$Username = "",
     [string]$Password = "",
-    [string]$Database = "",
+    [string]$Database = "postgres",
     [string]$PatroniPort = "",
     [string]$AddressMap = "",
+    [int]$ReplayWarnSeconds = 60,
+    [long]$ReplayWarnBytes = 104857600,
+    [int]$FailoverWarnSeconds = 900,
+    [long]$SlotWarnBytes = 1073741824,
+    [long]$SlotCriticalBytes = 10737418240,
     [string]$AgentDir = "C:\Program Files (x86)\Site24x7\WinAgent",
     [string]$PluginFolderName = "postgres_cluster",
     [switch]$NonInteractive,
@@ -50,6 +58,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$InstallPasswordEnv = "S247_POSTGRES_CLUSTER_INSTALL_PASSWORD"
+if (-not $Password) { $Password = [Environment]::GetEnvironmentVariable($InstallPasswordEnv) }
+if (-not $Password) { $Password = $env:MONITOR_PASSWORD }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Write-Step {
@@ -91,13 +102,19 @@ if ($DryRun -or $SkipAdminCheck) {
             $elevate = Read-Host "Would you like to relaunch this installer as Administrator? (Y/n)"
             if ($elevate -eq "" -or $elevate -match "^[Yy]") {
                 $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+                if ($ClusterHost) { $argList += " -ClusterHost `"$ClusterHost`"" }
+                if ($PostgresPort) { $argList += " -PostgresPort `"$PostgresPort`"" }
                 if ($Nodes) { $argList += " -Nodes `"$Nodes`"" }
                 if ($Username) { $argList += " -Username `"$Username`"" }
-                if ($Password) { $argList += " -Password `"$Password`"" }
                 if ($Database) { $argList += " -Database `"$Database`"" }
                 if ($PatroniPort) { $argList += " -PatroniPort `"$PatroniPort`"" }
+                if ($AddressMap) { $argList += " -AddressMap `"$AddressMap`"" }
+                $argList += " -ReplayWarnSeconds $ReplayWarnSeconds -ReplayWarnBytes $ReplayWarnBytes"
                 if ($AgentDir) { $argList += " -AgentDir `"$AgentDir`"" }
                 if ($PluginFolderName) { $argList += " -PluginFolderName `"$PluginFolderName`"" }
+                if ($NonInteractive) { $argList += " -NonInteractive" }
+                if ($DryRun) { $argList += " -DryRun" }
+                if ($Password) { [Environment]::SetEnvironmentVariable($InstallPasswordEnv, $Password, "Process") }
                 Start-Process powershell -Verb RunAs -ArgumentList $argList
                 exit 0
             }
@@ -115,51 +132,36 @@ Write-Step "2/5 Locating Python 3 and psycopg2-binary"
 
 $PythonExe = $null
 
-$candidatePythons = @(
-    "C:\Users\Joanathan\AppData\Local\Programs\Python\Python313\python.exe",
-    "C:\Users\Joanathan\AppData\Local\Programs\Python\Python311\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-    "C:\Program Files\Python313\python.exe",
-    "C:\Program Files\Python312\python.exe",
-    "C:\Program Files\Python311\python.exe"
-)
-foreach ($p in $candidatePythons) {
-    if ($p -and (Test-Path $p)) {
-        $PythonExe = $p
-        break
+$pythonCandidates = @()
+$pythonPathCmd = Get-Command python.exe -ErrorAction SilentlyContinue
+if ($pythonPathCmd -and $pythonPathCmd.Source -notmatch "WindowsApps") {
+    $pythonCandidates += $pythonPathCmd.Source
+}
+$pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
+if ($pyLauncher) {
+    foreach ($line in (& $pyLauncher.Source -0p 2>$null)) {
+        if ($line -match '([A-Za-z]:\\.*\\python(?:3)?\.exe)\s*$') {
+            $pythonCandidates += $matches[1]
+        }
     }
 }
 
-if (-not $PythonExe) {
-    try {
-        $pyCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-        if ($pyCmd -and $pyCmd.Source -notmatch "WindowsApps") {
-            $PythonExe = $pyCmd.Source
+$supportedPythonCandidates = @()
+foreach ($candidate in ($pythonCandidates | Select-Object -Unique)) {
+    if (-not (Test-Path $candidate)) { continue }
+    $versionText = (& $candidate -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null).ToString().Trim()
+    if ($LASTEXITCODE -eq 0 -and $versionText -match '^(\d+)\.(\d+)$') {
+        $candidateVersion = [version]::new([int]$matches[1], [int]$matches[2])
+        if ($candidateVersion -ge [version]'3.9') {
+            $supportedPythonCandidates += [pscustomobject]@{ Path = $candidate; Version = $candidateVersion }
         }
-    } catch {}
+    }
 }
+$selectedPython = $supportedPythonCandidates | Sort-Object Version -Descending | Select-Object -First 1
+if ($selectedPython) { $PythonExe = $selectedPython.Path }
 
 if (-not $PythonExe) {
-    try {
-        $pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
-        if ($pyLauncher) {
-            $lines = & py -0p 2>&1
-            foreach ($line in $lines) {
-                if ($line -match '([A-Z]:\\[^\s]+\\python\.exe)') {
-                    $candidate = $matches[1]
-                    if (Test-Path $candidate) {
-                        $PythonExe = $candidate
-                        break
-                    }
-                }
-            }
-        }
-    } catch {}
-}
-
-if (-not $PythonExe) {
-    Write-ErrorMsg "Python 3 could not be located. Please install Python 3 and add it to PATH."
+    Write-ErrorMsg "Python 3.9 or newer could not be located. Install it and add it to PATH or the Python launcher."
     exit 1
 }
 
@@ -170,6 +172,10 @@ Write-Success "Found Python runtime: $PythonExe ($pyVersion)"
 Write-Host "Verifying psycopg2 module..."
 $psycopgCheck = & $PythonExe -c "import psycopg2; print(psycopg2.__version__)" 2>&1
 if ($LASTEXITCODE -ne 0) {
+    if ($DryRun) {
+        Write-ErrorMsg "psycopg2 is missing. DryRun will not install packages; install psycopg2-binary in $PythonExe and rerun."
+        exit 1
+    }
     Write-WarningMsg "psycopg2 is not installed in $PythonExe. Installing psycopg2-binary..."
     & $PythonExe -m pip install --quiet psycopg2-binary
     if ($LASTEXITCODE -ne 0) {
@@ -181,15 +187,18 @@ if ($LASTEXITCODE -ne 0) {
     Write-Success "psycopg2 is available (version $psycopgCheck)."
 }
 
-# Ensure Python directory is in Machine PATH for LocalSystem agent service
-$pyFolder = Split-Path -Parent $PythonExe
-$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-if ($machinePath -and $machinePath -notmatch [regex]::Escape($pyFolder)) {
-    try {
-        [Environment]::SetEnvironmentVariable("Path", "$pyFolder;$machinePath", "Machine")
-        Write-Success "Added Python folder '$pyFolder' to Machine PATH."
-    } catch {
-        Write-WarningMsg "Could not update Machine PATH (non-critical if already in PATH): $_"
+# Ensure Python directory is in Machine PATH for the LocalSystem agent service.
+# DryRun must not change machine configuration.
+if (-not $DryRun) {
+    $pyFolder = Split-Path -Parent $PythonExe
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    if ($machinePath -and $machinePath -notmatch [regex]::Escape($pyFolder)) {
+        try {
+            [Environment]::SetEnvironmentVariable("Path", "$pyFolder;$machinePath", "Machine")
+            Write-Success "Added Python folder '$pyFolder' to Machine PATH."
+        } catch {
+            Write-WarningMsg "Could not update Machine PATH (non-critical if already in PATH): $_"
+        }
     }
 }
 
@@ -200,23 +209,36 @@ Write-Step "3/5 Configuration Parameters"
 
 # There are no built-in defaults: every required value is asked for, or must be passed as a parameter.
 if (-not $NonInteractive) {
-    if ($Nodes -eq "") { $Nodes = Read-Host "PostgreSQL cluster node address, host:port[:patroni_port] (comma separated for several)" }
+    if ($ClusterHost -eq "" -and $Nodes -eq "") {
+        $ClusterHost = Read-Host "PostgreSQL cluster seed host or IP (e.g. postgres-primary.prod.internal)"
+    }
     if ($Username -eq "") { $Username = Read-Host "Monitoring username" }
     if ($Password -eq "") {
         $secPass = Read-Host -Prompt "Monitoring password" -AsSecureString
         $Password = [System.Net.NetworkCredential]::new("", $secPass).Password
     }
-    if ($Database -eq "") { $Database = Read-Host "Database name" }
-    if ($PatroniPort -eq "") { $PatroniPort = Read-Host "Patroni REST port (leave empty if not Patroni)" }
+    if ($Database -eq "") {
+        $dbInput = Read-Host "Database name [default: postgres]"
+        $Database = if ($dbInput) { $dbInput } else { "postgres" }
+    }
+    if ($PatroniPort -eq "") { $PatroniPort = Read-Host "Patroni REST port (leave empty for default 8008; 'none' to disable)" }
 }
+if ($Database -eq "") { $Database = "postgres" }
 
 $missingSettings = @()
-if ($Nodes -eq "")    { $missingSettings += "Nodes" }
+if ($ClusterHost -eq "" -and $Nodes -eq "") { $missingSettings += "ClusterHost" }
 if ($Username -eq "") { $missingSettings += "Username" }
 if ($Password -eq "") { $missingSettings += "Password" }
-if ($Database -eq "") { $missingSettings += "Database" }
 if ($missingSettings.Count -gt 0) {
-    Write-ErrorMsg ("Missing required setting(s): " + ($missingSettings -join ", ") + ". Pass them as parameters (for example -Nodes, -Username, -Password, -Database) or enter them when asked.")
+    Write-ErrorMsg ("Missing required setting(s): " + ($missingSettings -join ", ") + ". Pass connection settings as parameters or enter them when asked. For unattended use, provide the password through S247_POSTGRES_CLUSTER_INSTALL_PASSWORD or MONITOR_PASSWORD.")
+    exit 1
+}
+if (($ReplayWarnSeconds -lt 0) -or ($ReplayWarnBytes -lt 0) -or ($FailoverWarnSeconds -lt 0) -or ($SlotWarnBytes -lt 0) -or ($SlotCriticalBytes -lt 0)) {
+    Write-ErrorMsg "Health threshold values must be zero or greater."
+    exit 1
+}
+if ($SlotCriticalBytes -le $SlotWarnBytes) {
+    Write-ErrorMsg "SlotCriticalBytes must be greater than SlotWarnBytes."
     exit 1
 }
 
@@ -280,12 +302,28 @@ if ($DryRun) {
                 "use_agent_python=0",
                 "redirect_output=1",
                 "",
-                "[$PluginFolderName]",
-                "nodes=`"$Nodes`"",
+                "[$PluginFolderName]"
+            )
+            if ($ClusterHost) {
+                $cfgLines += "cluster_host=`"$ClusterHost`""
+                if ($PostgresPort) { $cfgLines += "postgres_port=`"$PostgresPort`"" }
+            } else {
+                $cfgLines += "nodes=`"$Nodes`""
+            }
+            $cfgLines += @(
                 "username=`"$Username`"",
                 "password=`"$Password`"",
-                "db=`"$Database`"",
-                "patroni_port=`"$PatroniPort`""
+                "db=`"$Database`""
+            )
+            if ($PatroniPort) {
+                $cfgLines += "patroni_port=`"$PatroniPort`""
+            }
+            $cfgLines += @(
+                "replay_warn_seconds=$ReplayWarnSeconds",
+                "replay_warn_bytes=$ReplayWarnBytes",
+                "failover_warn_seconds=$FailoverWarnSeconds",
+                "slot_warn_bytes=$SlotWarnBytes",
+                "slot_critical_bytes=$SlotCriticalBytes"
             )
             if ($AddressMap) {
                 $cfgLines += "address_map=`"$AddressMap`""
@@ -294,8 +332,10 @@ if ($DryRun) {
 
             $targetCfg = Join-Path $targetPluginsDir "$PluginFolderName.cfg"
             Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii
+            & icacls.exe $targetCfg /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Could not restrict config file ACL with icacls." }
             (Get-Item $targetCfg).LastWriteTime = Get-Date
-            Write-Success "Deployed configuration to $targetCfg (unencrypted, agent will encrypt)"
+            Write-Success "Deployed configuration to $targetCfg with access limited to LocalSystem and Administrators. The password is stored in plaintext."
         } catch {
             Write-ErrorMsg "Failed to deploy files to ${targetPluginsDir}: $_"
             exit 1
@@ -309,11 +349,15 @@ if ($DryRun) {
 Write-Step "5/5 Validating Plugin Execution"
 
 $scriptToRun = if ($DryRun) { $sourcePy } else { Join-Path $targetPluginsDir "$PluginFolderName.py" }
-$testArgs = @(
-    $scriptToRun,
-    "--nodes", $Nodes,
+$testArgs = @($scriptToRun)
+if ($ClusterHost) {
+    $testArgs += @("--cluster_host", $ClusterHost)
+    if ($PostgresPort) { $testArgs += @("--postgres_port", $PostgresPort) }
+} else {
+    $testArgs += @("--nodes", $Nodes)
+}
+$testArgs += @(
     "--username", $Username,
-    "--password", $Password,
     "--db", $Database
 )
 if ($PatroniPort -and $PatroniPort -ne "none") {
@@ -322,10 +366,21 @@ if ($PatroniPort -and $PatroniPort -ne "none") {
 if ($AddressMap) {
     $testArgs += @("--address_map", $AddressMap)
 }
+if ($ReplayWarnSeconds -ne 60) { $testArgs += @("--replay_warn_seconds", $ReplayWarnSeconds) }
+if ($ReplayWarnBytes -ne 104857600) { $testArgs += @("--replay_warn_bytes", $ReplayWarnBytes) }
+$testArgs += @("--failover_warn_seconds", $FailoverWarnSeconds)
+$testArgs += @("--slot_warn_bytes", $SlotWarnBytes)
+$testArgs += @("--slot_critical_bytes", $SlotCriticalBytes)
 
 Write-Host "Running collector verification via $PythonExe..."
 $t0 = [System.Diagnostics.Stopwatch]::StartNew()
-$output = & $PythonExe @testArgs 2>&1
+$previousPgpw = $env:PGPASSWORD
+$env:PGPASSWORD = $Password
+try {
+    $output = & $PythonExe @testArgs 2>&1
+} finally {
+    $env:PGPASSWORD = $previousPgpw
+}
 $t0.Stop()
 $exitCode = $LASTEXITCODE
 $elapsedMs = $t0.ElapsedMilliseconds
@@ -349,9 +404,9 @@ try {
     Write-Host "  Primary Count:       $($json.'Primary Count')" -ForegroundColor Gray
     Write-Host "  Primary Timeline:    $($json.'Primary Timeline')" -ForegroundColor Gray
     Write-Host "  Max Replay Backlog:  $($json.'Max Replay Backlog') bytes" -ForegroundColor Gray
-    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Replication Slots Active') active, $($json.'Replication Slots Inactive') inactive)" -ForegroundColor Gray
+    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Replication Slots Active') active, $($json.'Inactive Slots Count') inactive)" -ForegroundColor Gray
     Write-Host "  Cluster Nodes:       $($json.Cluster_Nodes.Count) rows" -ForegroundColor Gray
-    $linksCount = if ($json.Replication_Links) { $json.Replication_Links.Count } else { ($json.Replication_Standbys).Count }
+    $linksCount = if ($json.Replication_Links) { $json.Replication_Links.Count } else { 0 }
     Write-Host "  Replication Links:   $linksCount rows" -ForegroundColor Gray
 } catch {
     Write-ErrorMsg "Failed to parse plugin output as JSON: $_"

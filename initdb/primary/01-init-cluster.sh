@@ -21,9 +21,11 @@ done
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" --dbname "${POSTGRES_DB:-postgres}" \
-     -v repl_user="$REPLICATION_USER" -v repl_pass="$REPLICATION_PASSWORD" \
+     -v repl_user="$REPLICATION_USER" \
      -v repl_slot="$REPLICATION_SLOT" \
-     -v mon_user="$MONITOR_USER"     -v mon_pass="$MONITOR_PASSWORD" <<'SQL'
+     -v mon_user="$MONITOR_USER" <<'SQL'
+\getenv repl_pass REPLICATION_PASSWORD
+\getenv mon_pass MONITOR_PASSWORD
 -- Replication account: may only open replication connections.
 CREATE ROLE :"repl_user" WITH LOGIN REPLICATION PASSWORD :'repl_pass';
 

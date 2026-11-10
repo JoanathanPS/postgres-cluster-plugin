@@ -12,13 +12,17 @@ import json
 import time
 import copy
 import re
+import tempfile
 import urllib.request
 import urllib.error
 import concurrent.futures
 from collections import OrderedDict
 
+MAX_NAME_LENGTH = 520  # Site24x7 child-table name column limit
+MAX_TABLE_STRING_LENGTH = 100  # Site24x7 non-name table string value limit
+
 def safe_name(raw):
-    return re.sub(r'[^A-Za-z0-9]', '', str(raw))
+    return re.sub(r'[^A-Za-z0-9]', '', str(raw))[:MAX_NAME_LENGTH]
 
 
 class PluginError(Exception):
@@ -220,19 +224,24 @@ def parse_conninfo_hostport(conninfo):
     return host, port
 
 
-#These settings come from postgres_cluster.cfg. There are no built-in defaults for the first four.
-NODES = ''                        #Change the node address here: host:port[:patroni_port], one address is enough
+#These settings come from postgres_cluster.cfg.
+CLUSTER_HOST = ''                 #Change the cluster seed IP or hostname here: one bare address only
+NODES = ''                        #Legacy fallback: host:port[:patroni_port], one address is enough
 USERNAME = ''                     #Change the username here
 PASSWORD = ''                     #Change the authentication method
-DB = ''                           #Change the DB name here
-PATRONI_PORT = ''                 #Change the Patroni REST port here (leave empty if it is not a Patroni cluster)
+DB = 'postgres'                   #Database name (defaults to postgres)
+PATRONI_PORT = ''                 #Change the Patroni REST port here (default: 8008 when Patroni is used; 'none' to disable)
 ADDRESS_MAP = ''                  #Optional, for Docker/NAT: internal_host:port=reachable_host:port, comma separated
 CLUSTER_TYPE = 'auto'             #auto detects the cluster type, or write the type here
 DISCOVER = 'auto'                 #auto finds the other nodes from the address above, off monitors only the nodes listed
 
+DEFAULT_POSTGRES_PORT = 5432
+DEFAULT_PATRONI_PORT = 8008
+
 #Limits of this plugin, change them only if you know why
 DISCOVERY_DEADLINE_S = 2.0        #Seconds allowed for finding the nodes of the cluster
 MAX_NODES = 25                    #Site24x7 allows at most 25 rows in a table
+MAX_TABLE_ROWS = 25               #Site24x7 child-table row limit
 PGPOOL_DEFAULT_PORT = 9999        #pgpool-II listens on this port by default, so an address on it is asked for its backends
 CONNECT_TIMEOUT = 2               #Seconds to wait when connecting to a node
 STATEMENT_TIMEOUT_MS = 3000       #Milliseconds a single query may run
@@ -242,9 +251,11 @@ NODE_COLLECT_DEADLINE_S = 5.0     #Seconds allowed for collecting from all the n
 FAILOVER_WARN_SECONDS = 900       #A failover newer than this many seconds is reported
 SLOT_WARN_BYTES = 1073741824      #Replication slot retaining more WAL than this is a warning
 SLOT_CRITICAL_BYTES = 10737418240 #Replication slot retaining more WAL than this is critical
+REPLAY_WARN_SECONDS = 60           #Standby replay delay above this is degraded
+REPLAY_WARN_BYTES = 104857600      #Standby replay backlog above this is degraded
 
 #if any impacting changes to this plugin kindly increment the plugin version here.
-PLUGIN_VERSION = 2
+PLUGIN_VERSION = 5
 
 #Setting this to true will alert you when there is a communication problem while posting plugin data to server
 HEARTBEAT = True
@@ -255,14 +266,15 @@ tabs = {
         "Cluster": {"order": "1", "tablist": [
             "Cluster_Info", "Cluster_Nodes", "Nodes Total", "Primary Count", "Primary Timeline",
             "No Primary Flag", "Split Brain Flag", "Timeline Mismatch Flag", "Server PID",
-            "Seconds Since Last Failover", "Failovers Last 24h", "Last Failover To", "Last Failover Timeline"]},
+            "Nodes Configured", "Nodes Discovered", "Nodes Omitted",
+            "Failover Age Seconds", "Failovers Last 24h", "Last Failover To", "Last Failover Timeline"]},
         "Replication": {"order": "2", "tablist": [
             "Replication_Links", "Replication_Slots", "Standbys Expected", "Standbys Streaming",
             "Standby Disconnect Flag", "Sync Standby Count", "Cascading Standby Count",
             "Max Replay Backlog", "Max Replay Delay", "Replication Slots Total",
-            "Replication Slots Active", "Replication Slots Inactive", "Max Slot Lag Bytes",
+            "Replication Slots Active", "Inactive Slots Count", "Max Slot Lag Bytes",
             "Slot Wal Status Risk",
-            "Logical Replication In Use", "Mesh Links Declared", "Mesh Links Active", "Mesh Disconnect Flag", "Max Logical Lag Bytes", "Max Logical Lag Seconds", "Subscription Apply Errors", "Subscription Conflicts"]},
+            "Logical Replication Used", "Mesh Links Declared", "Mesh Links Active", "Mesh Disconnect Flag", "Max Logical Lag Bytes", "Max Logical Lag Seconds", "Subscription Apply Errors", "Subscription Conflicts"]},
         "Node Performance": {"order": "3", "tablist": [
             "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Total Rows Inserted", "Total Rows Updated",
             "Total Rows Deleted", "Total Rows Fetched", "Total Rows Returned", "Total Block Reads",
@@ -270,11 +282,11 @@ tabs = {
             "Checkpoint Sync Time", "Buffers Checkpoint", "Buffers Clean", "Maxwritten Clean",
             "Buffers Backend", "Buffers Backend Fsync", "Buffers Alloc", "Dead Tuples"]},
         "Transactions and Sessions": {"order": "4", "tablist": [
-            "Node_Activity", "Node_Transactions", "Tranasctions_and_Session_per_Database",
+            "Node_Activity", "Node_Transactions", "Transactions_Per_Database",
             "Total Commits", "Total Rollbacks", "Total Conflicts", "Total Sessions",
             "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed",
-            "Transactions Open", "Transactions Idle In Transaction", "Connection Utilization Percent",
-            "Oldest Transaction ID Age", "Oldest Running Transaction Age"]},
+            "Transactions Open", "Idle Transactions", "Connection Usage Percent",
+            "Oldest Transaction ID Age", "Oldest Running Txn Age"]},
         "WAL and Recovery": {"order": "5", "tablist": [
             "WAL Write Position", "WAL Insert Position", "WAL Flush Position", "WAL Files Count",
             "WAL Total Size", "Archive Mode", "Archive Status Success", "Archive Status Failed",
@@ -290,12 +302,15 @@ units = {
     "Nodes Total": "nodes",
     "Server PID": "pid",
     "Nodes Up": "nodes",
+    "Nodes Configured": "nodes",
+    "Nodes Discovered": "nodes",
+    "Nodes Omitted": "nodes",
     "Primary Count": "nodes",
     "No Primary Flag": "flag",
     "Split Brain Flag": "flag",
     "Primary Timeline": "timeline",
     "Timeline Mismatch Flag": "flag",
-    "Seconds Since Last Failover": "s",
+    "Failover Age Seconds": "s",
     "Failovers Last 24h": "failovers",
     "Last Failover Timeline": "timeline",
 
@@ -309,10 +324,10 @@ units = {
     "Max Replay Delay": "s",
     "Replication Slots Total": "slots",
     "Replication Slots Active": "slots",
-    "Replication Slots Inactive": "slots",
+    "Inactive Slots Count": "slots",
     "Max Slot Lag Bytes": "bytes",
     "Slot Wal Status Risk": "risk",
-    "Logical Replication In Use": "flag",
+    "Logical Replication Used": "flag",
     "Mesh Links Declared": "links",
     "Mesh Links Active": "links",
     "Mesh Disconnect Flag": "flag",
@@ -334,7 +349,7 @@ units = {
     "Conflicts Snapshot": "conflicts",
     "Conflicts Buffer Pin": "conflicts",
     "Conflicts Deadlock": "conflicts",
-    "Oldest Running Transaction Age": "s",
+    "Oldest Running Txn Age": "s",
 
     # Node Performance tab
     "Total Rows Inserted": "rows",
@@ -365,7 +380,7 @@ units = {
     # Transactions and Sessions tab
     "Active Connections": "connections",
     "Max Connections": "connections",
-    "Connection Utilization Percent": "%",
+    "Connection Usage Percent": "%",
     "Active Queries": "queries",
     "Active Waiting Queries": "queries",
     "Locks Count": "locks",
@@ -374,7 +389,7 @@ units = {
     "Total Rollbacks": "transactions",
     "Total Conflicts": "conflicts",
     "Transactions Open": "transactions",
-    "Transactions Idle In Transaction": "transactions",
+    "Idle Transactions": "transactions",
     "Total Sessions": "sessions",
     "Total Sessions Abandoned": "sessions",
     "Total Sessions Fatal": "sessions",
@@ -449,7 +464,7 @@ units = {
         "active_queries": "queries",
         "active_waiting_queries": "queries",
         "transactions_open": "transactions",
-        "transactions_idle_in_transaction": "transactions",
+        "idle_in_txn_count": "transactions",
         "locks_count": "locks",
         "oldest_xact_age_s": "s",
         "uptime": "s",
@@ -464,14 +479,38 @@ units = {
         "sessions_fatal": "sessions",
         "sessions_killed": "sessions",
         "status": "status"
+    },
+    "Stats_per_DB": {
+        "active_connections": "connections",
+        "size_in_mb": "MB",
+        "rows_inserted": "rows",
+        "rows_updated": "rows",
+        "rows_deleted": "rows",
+        "rows_fetched": "rows",
+        "rows_returned": "rows",
+        "block_reads": "blocks",
+        "block_hits": "blocks"
+    },
+    "Transactions_Per_Database": {
+        "commits": "transactions",
+        "rollbacks": "transactions",
+        "conflicts": "conflicts",
+        "sessions": "sessions",
+        "sessions_abandoned": "sessions",
+        "sessions_fatal": "sessions",
+        "sessions_killed": "sessions",
+        "session_time": "ms",
+        "sessions_active_time": "ms",
+        "idle_in_txn_time": "ms"
     }
 }
 
 
 def get_standalone_queries(major_version, middle_version=0):
     """
-    Returns the exact SQL queries used by standalone postgres.py for parameter parity.
-    Matches postgres.py query definitions character-for-character.
+    Returns shared standalone PostgreSQL queries adapted for the cluster collector.
+    Output aliases may differ where the cluster schema has Site24x7-specific names,
+    and checkpoint queries are selected by PostgreSQL version.
     """
     #Add your queries here
     queries = {
@@ -497,14 +536,14 @@ def get_standalone_queries(major_version, middle_version=0):
 
     if major_version >= 17:
         queries['checkpoints'] = "SELECT num_timed, num_requested, write_time, sync_time, buffers_written FROM pg_stat_checkpointer;"
-        queries['bg_stats'] = "SELECT buffers_clean, maxwritten_clean, 0 as buffers_backend, 0 as buffers_backend_fsync, buffers_alloc FROM pg_stat_bgwriter;"
+        queries['bg_stats'] = "SELECT buffers_clean, maxwritten_clean, buffers_alloc FROM pg_stat_bgwriter;"
     else:
         queries['checkpoints'] = "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, checkpoint_sync_time, buffers_checkpoint FROM pg_stat_bgwriter;"
         queries['bg_stats'] = "SELECT buffers_clean, maxwritten_clean, buffers_backend, buffers_backend_fsync, buffers_alloc FROM pg_stat_bgwriter;"
 
     queries['per_db_stats'] = "SELECT d.datname AS name, s.numbackends as active_connections, ROUND(pg_database_size(d.datname) / 1024 / 1024,2) AS size_in_mb, tup_inserted as rows_inserted, tup_updated as rows_updated, tup_deleted as rows_deleted, tup_fetched as rows_fetched, tup_returned as rows_returned, blks_read as block_reads, blks_hit as block_hits FROM pg_database d JOIN pg_stat_database s ON d.oid = s.datid;"
     if major_version >= 14:
-        queries['per_db_trans'] = "SELECT datname as name, xact_commit as commits, xact_rollback as rollbacks, conflicts, sessions, sessions_abandoned, sessions_fatal, sessions_killed, session_time, active_time as sessions_active_time, idle_in_transaction_time as session_idle_in_transaction_time FROM pg_stat_database WHERE datname IS NOT NULL;"
+        queries['per_db_trans'] = "SELECT datname as name, xact_commit as commits, xact_rollback as rollbacks, conflicts, sessions, sessions_abandoned, sessions_fatal, sessions_killed, session_time, active_time as sessions_active_time, idle_in_transaction_time as idle_in_txn_time FROM pg_stat_database WHERE datname IS NOT NULL;"
     else:
         queries['per_db_trans'] = "SELECT datname as name, xact_commit as commits, xact_rollback as rollbacks, conflicts FROM pg_stat_database WHERE datname IS NOT NULL;"
 
@@ -790,7 +829,7 @@ class PostgresNodeClient:
         self.name = name                               # Display name / alias in tables
         self.has_explicit_alias = has_explicit_alias
         self.raw_host = host
-        self.hostname = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
+        self.hostname = host
         self.port = int(port)
         self.username = username
         self.password = password
@@ -874,7 +913,7 @@ class PostgresNodeClient:
         """Best-effort Patroni REST API query."""
         if not self.patroni_port or self.patroni_port == "none":
             return
-        url = f"http://{self.hostname}:{self.patroni_port}/patroni"
+        url = f"http://{_http_host(self.hostname)}:{self.patroni_port}/patroni"
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Site24x7-PGCluster'})
             with urllib.request.urlopen(req, timeout=1.5) as resp:
@@ -1034,7 +1073,7 @@ class PostgresNodeClient:
                 row["transactions_open"] = int(cur.fetchone()[0])
 
                 cur.execute("SELECT COUNT(*) as transactions_idle_in_transaction FROM pg_stat_activity WHERE state = 'idle in transaction';")
-                row["transactions_idle_in_transaction"] = int(cur.fetchone()[0])
+                row["idle_in_txn_count"] = int(cur.fetchone()[0])
 
                 cur.execute("SELECT COUNT(*) as locks_count FROM pg_locks;")
                 row["locks_count"] = int(cur.fetchone()[0])
@@ -1226,7 +1265,7 @@ class PostgresNodeClient:
                     r = cur.fetchone()
                     if r and r[0]:
                         evidence["repmgr_table"] = True
-                    else:
+                    elif 'repmgr' in evidence.get("extensions", []):
                         cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
                         for db_cand in [row[0] for row in cur.fetchall()]:
                             try:
@@ -1409,9 +1448,61 @@ class PostgresNodeClient:
 #                   -> walk pg_stat_wal_receiver (upstream) and pg_stat_replication (downstream)
 # Standbys found through pg_stat_replication only expose an IP, so the primary's port is assumed.
 # ---------------------------------------------------------------------------
+def validate_cluster_host(raw):
+    """
+    Validates cluster_host: accepts exactly one bare IP address or hostname.
+    Rejects embedded ports, URL prefixes, or multiple nodes with a clear ConfigError.
+    Supports bracketed IPv6 (e.g. [::1]) and bare IPv6 (e.g. ::1).
+    """
+    raw = str(raw or "").strip().strip("'\"")
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        raise ConfigError(f"cluster_host must be a bare hostname or IP address without URL scheme: '{raw}'.")
+    if "/" in raw:
+        raise ConfigError(f"cluster_host must not include path separators: '{raw}'.")
+    if "," in raw or ";" in raw:
+        raise ConfigError(f"cluster_host must accept only a single bare IP address or hostname without multiple nodes (found '{raw}'). Use the legacy 'nodes' parameter for multiple seed nodes.")
+    if raw.startswith("["):
+        if "]" in raw:
+            end = raw.index("]")
+            rest = raw[end+1:]
+            if rest:
+                raise ConfigError(f"cluster_host must not include embedded ports (found '{raw}'). Use postgres_port and patroni_port to specify custom ports.")
+            inside = raw[1:end].strip()
+            try:
+                import ipaddress
+                ipaddress.IPv6Address(inside)
+                return inside
+            except ValueError:
+                raise ConfigError(f"Invalid IPv6 address in cluster_host: '{inside}'.")
+        else:
+            raise ConfigError(f"Unmatched bracket in cluster_host: '{raw}'.")
+
+    # Check if raw is a valid bare IPv6 address (e.g. ::1 or 2001:db8::1)
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(raw)
+        if isinstance(ip, ipaddress.IPv6Address):
+            return raw
+    except ValueError:
+        pass
+
+    if ":" in raw:
+        raise ConfigError(f"cluster_host must not include embedded ports (found '{raw}'). Use postgres_port and patroni_port to specify custom ports.")
+    return raw
+
+
 def _norm_host(h):
     h = str(h).strip().lower()
     return "127.0.0.1" if h in ("localhost", "::1", "127.0.0.1") else h
+
+
+def _http_host(h):
+    s = str(h).strip()
+    if ":" in s and not s.startswith("["):
+        return f"[{s}]"
+    return s
 
 
 def _http_json(url, timeout=1.5):
@@ -1427,7 +1518,7 @@ def _http_json(url, timeout=1.5):
 
 def discover_via_patroni(host, patroni_port, address_map=None):
     """Returns (members, scope) from the Patroni REST API of one member, or ([], None)."""
-    data = _http_json(f"http://{host}:{patroni_port}/cluster")
+    data = _http_json(f"http://{_http_host(host)}:{patroni_port}/cluster")
     if not data or not isinstance(data.get("members"), list):
         return [], None
     members = []
@@ -1436,7 +1527,7 @@ def discover_via_patroni(host, patroni_port, address_map=None):
         if not (name and h and p):
             continue
         pp = str(patroni_port)
-        mm = re.match(r"https?://[^:/]+:(\d+)", str(m.get("api_url") or ""))
+        mm = re.search(r":(\d+)(?:/|$)", str(m.get("api_url") or ""))
         if mm:
             pp = mm.group(1)
         if address_map:
@@ -1452,7 +1543,7 @@ def discover_via_patroni(host, patroni_port, address_map=None):
 
 def _pg_connect(host, port, user, pw, db):
     import psycopg2
-    conn = psycopg2.connect(dbname=db, user=user, password=pw, host=_norm_host(host) if _norm_host(host) == "127.0.0.1" else host,
+    conn = psycopg2.connect(dbname=db, user=user, password=pw, host=host,
                             port=int(port), connect_timeout=2, options="-c statement_timeout=2000")
     conn.autocommit = True
     return conn
@@ -1796,7 +1887,7 @@ def discover_cluster_members(seeds, user, pw, db, deadline_s, address_map=None, 
 
 
 def _patroni_member_name(host, patroni_port):
-    data = _http_json(f"http://{host}:{patroni_port}/patroni", timeout=1.0)
+    data = _http_json(f"http://{_http_host(host)}:{patroni_port}/patroni", timeout=1.0)
     return str(((data or {}).get("patroni") or {}).get("name") or "") or None
 
 
@@ -1814,27 +1905,89 @@ class PostgresClusterCollector:
     Main collector coordinating concurrent node probes, cluster-level metrics,
     per-node tables, cluster type detection, and Site24x7 JSON packaging.
     """
-    def __init__(self, nodes_str, username, password, db, patroni_port=PATRONI_PORT, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP, failover_warn_seconds=FAILOVER_WARN_SECONDS, slot_warn_bytes=SLOT_WARN_BYTES, slot_critical_bytes=SLOT_CRITICAL_BYTES):
-        self.nodes_str = nodes_str
+    def __init__(self, nodes_str=None, username="", password="", db="postgres", patroni_port=None, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP, failover_warn_seconds=FAILOVER_WARN_SECONDS, slot_warn_bytes=SLOT_WARN_BYTES, slot_critical_bytes=SLOT_CRITICAL_BYTES, replay_warn_seconds=REPLAY_WARN_SECONDS, replay_warn_bytes=REPLAY_WARN_BYTES, default_port=DEFAULT_POSTGRES_PORT, cluster_host=None):
         self.username = username
         self.password = password
-        self.db = db
-        self.patroni_port = patroni_port
+        self.db = db if (db and str(db).strip()) else "postgres"
         self.cluster_type_override = cluster_type
         self.discover = discover
         self.address_map_str = address_map
         self.address_map = parse_address_map(address_map)
+        self.default_port = str(default_port or DEFAULT_POSTGRES_PORT).strip()
+
+        if cluster_host:
+            self.cluster_host = validate_cluster_host(cluster_host)
+            self.is_cluster_host = True
+            self.nodes_str = self.cluster_host
+        elif nodes_str:
+            self.cluster_host = None
+            self.is_cluster_host = False
+            self.nodes_str = str(nodes_str).strip()
+        else:
+            self.cluster_host = None
+            self.is_cluster_host = False
+            self.nodes_str = ""
+
+        if patroni_port is not None and str(patroni_port).strip() != "":
+            raw_pat = str(patroni_port).strip().lower()
+            self.patroni_port = "none" if raw_pat == "none" else str(patroni_port).strip()
+        elif self.is_cluster_host:
+            if str(self.cluster_type_override or "").strip().lower() in ("auto", "patroni"):
+                self.patroni_port = str(DEFAULT_PATRONI_PORT)
+            else:
+                self.patroni_port = "none"
+        elif str(self.cluster_type_override or "").strip().lower() == "patroni":
+            self.patroni_port = str(DEFAULT_PATRONI_PORT)
+        else:
+            self.patroni_port = "none"
+
         self.failover_warn_seconds = int(failover_warn_seconds) if failover_warn_seconds is not None else FAILOVER_WARN_SECONDS
         self.slot_warn_bytes = int(slot_warn_bytes) if slot_warn_bytes is not None else SLOT_WARN_BYTES
         self.slot_critical_bytes = int(slot_critical_bytes) if slot_critical_bytes is not None else SLOT_CRITICAL_BYTES
+        self.replay_warn_seconds = int(replay_warn_seconds) if replay_warn_seconds is not None else REPLAY_WARN_SECONDS
+        self.replay_warn_bytes = int(replay_warn_bytes) if replay_warn_bytes is not None else REPLAY_WARN_BYTES
+        for key, value in (("failover_warn_seconds", self.failover_warn_seconds),
+                           ("slot_warn_bytes", self.slot_warn_bytes),
+                           ("slot_critical_bytes", self.slot_critical_bytes),
+                           ("replay_warn_seconds", self.replay_warn_seconds),
+                           ("replay_warn_bytes", self.replay_warn_bytes)):
+            if value < 0:
+                raise ConfigError(f"{key} must be zero or greater")
+        if self.slot_critical_bytes <= self.slot_warn_bytes:
+            raise ConfigError("slot_critical_bytes must be greater than slot_warn_bytes")
         self.discovery_added = 0
+        self.discovery_seen = 0
+        self.nodes_configured = 0
+        self.nodes_omitted = 0
         self.discovery_source = ""
         self.msg_notes = []
+        self.truncation_notes = []
 
     def _add_note(self, text):
         clean = str(text).strip()
         if clean and clean not in self.msg_notes:
             self.msg_notes.append(clean)
+
+    def _add_truncation_note(self, text):
+        clean = str(text).strip()
+        if clean and clean not in self.truncation_notes:
+            self.truncation_notes.append(clean)
+
+    def _limit_table(self, table_name, rows):
+        # Enforce Site24x7's child name-column length limit even for externally supplied node/database names.
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if isinstance(row.get("name"), str):
+                row["name"] = row["name"][:MAX_NAME_LENGTH]
+            for column, value in row.items():
+                if column != "name" and isinstance(value, str):
+                    row[column] = value[:MAX_TABLE_STRING_LENGTH]
+        row_count = len(rows)
+        if row_count > MAX_TABLE_ROWS:
+            note = f"{table_name}: showing {MAX_TABLE_ROWS} of {row_count} rows"
+            self._add_truncation_note(note)
+        return rows[:MAX_TABLE_ROWS]
 
     def _cache_path(self):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1856,6 +2009,7 @@ class PostgresClusterCollector:
 
     def _save_cache(self, members, source="", seed_names=None):
         cache_file = self._cache_path()
+        temp_file = None
         try:
             existing = self._load_cache() or {}
             endpoints = existing.get("endpoints", {})
@@ -1884,12 +2038,30 @@ class PostgresClusterCollector:
                     for m in members if (m.get("alias") or m.get("member") or m.get("name"))
                 ]
             }
-            with open(cache_file, "w") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=os.path.dirname(cache_file),
+                prefix=".topology_cache.", suffix=".tmp", delete=False
+            ) as f:
+                temp_file = f.name
                 json.dump(data, f, indent=2)
+            os.replace(temp_file, cache_file)
         except Exception:
-            pass
+            self._add_note("Topology cache could not be refreshed; cached discovery fallback may be unavailable.")
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
 
     def _parse_nodes(self):
+        if getattr(self, "is_cluster_host", False) and getattr(self, "cluster_host", None):
+            h = self.cluster_host
+            p = str(self.default_port or DEFAULT_POSTGRES_PORT).strip()
+            pat = str(self.patroni_port or "none").strip()
+            display_name = _name_from_address_map(h, p, self.address_map) or _default_node_name(h, p)
+            return [(display_name, h, p, pat, False)]
+
         parsed = []
         cache = self._load_cache()
         cached_endpoints = (cache or {}).get("endpoints", {})
@@ -1908,26 +2080,81 @@ class PostgresClusterCollector:
                         cached_map[pat_val] = mname
 
         for raw in self.nodes_str.split(','):
-            entry = raw.strip()
+            entry = raw.strip().strip("'\"")
             if not entry:
                 continue
             alias = None
             has_explicit_alias = False
             if "=" in entry:
                 alias, entry = entry.split("=", 1)
-                alias = alias.strip()
-                entry = entry.strip()
+                alias = alias.strip().strip("'\"")
+                entry = entry.strip().strip("'\"")
                 if alias:
                     has_explicit_alias = True
 
-            parts = entry.split(':')
-            if len(parts) >= 3:
-                h, p, pat = parts[0], parts[1], parts[2]
-            elif len(parts) == 2:
-                h, p, pat = parts[0], parts[1], self.patroni_port
+            if entry.startswith("http://"):
+                entry = entry[7:]
+            elif entry.startswith("https://"):
+                entry = entry[8:]
+            if "/" in entry:
+                entry = entry.split("/")[0]
+
+            h = None
+            p = None
+            pat = None
+
+            if entry.startswith("["):
+                if "]" in entry:
+                    end = entry.index("]")
+                    h = entry[1:end]
+                    rest = entry[end+1:]
+                    if rest.startswith(":"):
+                        subparts = rest[1:].split(":")
+                        p = subparts[0]
+                        if len(subparts) >= 2:
+                            pat = subparts[1]
+                    elif rest:
+                        continue
+                else:
+                    continue
             else:
-                self._add_note(f"Node '{entry}' has no port; write it as host:port (ignored)")
-                continue
+                try:
+                    import ipaddress
+                    if isinstance(ipaddress.ip_address(entry), ipaddress.IPv6Address):
+                        h = entry
+                except ValueError:
+                    pass
+
+                if h is None:
+                    parts = entry.split(':')
+                    if len(parts) >= 3:
+                        h, p, pat = parts[0], parts[1], parts[2]
+                    elif len(parts) == 2:
+                        h, p = parts[0], parts[1]
+                    elif len(parts) == 1:
+                        h = parts[0]
+                    else:
+                        continue
+
+            if p is None:
+                p = getattr(self, 'default_port', None) or str(DEFAULT_POSTGRES_PORT)
+            try:
+                int(p)
+            except ValueError:
+                p = getattr(self, 'default_port', None) or str(DEFAULT_POSTGRES_PORT)
+
+            if pat is None:
+                if self.patroni_port:
+                    if str(self.patroni_port).strip().lower() == "none":
+                        pat = "none"
+                    else:
+                        pat = str(self.patroni_port).strip()
+                elif getattr(self, "is_cluster_host", False) and str(self.cluster_type_override or "").lower() in ("auto", "patroni"):
+                    pat = str(DEFAULT_PATRONI_PORT)
+                elif str(self.cluster_type_override or "").lower() == "patroni":
+                    pat = str(DEFAULT_PATRONI_PORT)
+                else:
+                    pat = "none"
 
             h_norm = str(h).strip().lower()
             p_str = str(p).strip()
@@ -2016,6 +2243,7 @@ class PostgresClusterCollector:
 
         if not members:
             return node_defs
+        self.discovery_seen = len(members)
 
         #A pgpool-II address only forwards to its backends: monitor the backends, not the proxy in front of them
         proxies = {(_norm_host(m["via_proxy"][0]), int(m["via_proxy"][1])) for m in members if m.get("via_proxy")}
@@ -2065,13 +2293,14 @@ class PostgresClusterCollector:
             return node_defs
 
         added = 0
+        omitted_discovered = 0
         for m in members:
             key = (_norm_host(m["host"]), int(m["port"]))
             if key in known_addr or m["alias"].lower() in known_alias or m["alias"].lower() in known_member:
                 continue
             if len(node_defs) >= MAX_NODES:
-                self._add_note(f"Cluster has more than {MAX_NODES} nodes; extra nodes are not shown")
-                break
+                omitted_discovered += 1
+                continue
             name, k = m["alias"] or _name_from_address_map(m["host"], m["port"], self.address_map) or _default_node_name(m['host'], m['port']), 2
             while name.lower() in known_alias:
                 name = f"{m['alias']}{k}"
@@ -2081,6 +2310,9 @@ class PostgresClusterCollector:
             known_addr.add(key)
             added += 1
         self.discovery_added = added
+        if omitted_discovered:
+            self.nodes_omitted += omitted_discovered
+            self._add_truncation_note(f"Discovery: {omitted_discovered} node(s) omitted by the {MAX_NODES}-node display limit")
         self.discovery_source = source
         return node_defs
 
@@ -2115,9 +2347,8 @@ class PostgresClusterCollector:
                 "name": "cluster",
                 "cluster_type": str(e.cluster_type)[:99],
                 "type_evidence": str(e.evidence)[:99],
-                "server_version": "unknown",
                 "primary_node": "none",
-                "health_reason": f"Unsupported: {e.cluster_type}",
+                "health_reason": f"Unsupported: {e.cluster_type}"[:MAX_TABLE_STRING_LENGTH],
                 "nodes_total": 0,
                 "nodes_up": 0,
                 "primary_timeline": 0,
@@ -2151,7 +2382,14 @@ class PostgresClusterCollector:
     def _collect_internal(self, results):
         server_version_str = "unknown"
 
-        node_defs = self._apply_discovery(self._parse_nodes())
+        parsed_nodes = self._parse_nodes()
+        self.nodes_configured = len(parsed_nodes)
+        if len(parsed_nodes) > MAX_NODES:
+            configured_omitted = len(parsed_nodes) - MAX_NODES
+            self.nodes_omitted += configured_omitted
+            self._add_truncation_note(f"Configuration: {configured_omitted} node(s) omitted by the {MAX_NODES}-node display limit")
+            parsed_nodes = parsed_nodes[:MAX_NODES]
+        node_defs = self._apply_discovery(parsed_nodes)
         nodes_total = len(node_defs)
         if nodes_total == 0:
             results["status"] = 0
@@ -2373,8 +2611,6 @@ class PostgresClusterCollector:
                         "source": source_node,
                         "target": c.name,
                         "state": state,
-                        "sync_state": "async",
-                        "client_addr": "unknown",
                         "replay_lag_bytes": 0,
                         "write_lag_bytes": 0,
                         "flush_lag_bytes": 0,
@@ -2460,7 +2696,6 @@ class PostgresClusterCollector:
                             "source": active_primary.name,
                             "target": standby_name,
                             "state": str(r[2]),
-                            "sync_state": str(r[3] or "async"),
                             "replay_lag_bytes": rep_lag_bytes,
                             "write_lag_bytes": w_lag_bytes,
                             "flush_lag_bytes": f_lag_bytes,
@@ -2608,7 +2843,7 @@ class PostgresClusterCollector:
             try:
                 with active_primary.conn.cursor() as cur:
                     cur.execute(std_queries['transacttions_idle'])
-                    results["Transactions Idle In Transaction"] = int(cur.fetchone()[0])
+                    results["Idle Transactions"] = int(cur.fetchone()[0])
             except Exception as e:
                 self._add_note(f"Transactions idle: {e}")
 
@@ -2633,7 +2868,7 @@ class PostgresClusterCollector:
                     results["Total Rollbacks"] = int(r[2] or 0)
                     results["Total Conflicts"] = int(r[3] or 0)
                     if max_conn:
-                        results["Connection Utilization Percent"] = round((act_conn / max_conn) * 100.0, 2)
+                        results["Connection Usage Percent"] = round((act_conn / max_conn) * 100.0, 2)
             except Exception as e:
                 self._add_note(f"Database stats: {e}")
 
@@ -2702,9 +2937,12 @@ class PostgresClusterCollector:
                     r = cur.fetchone()
                     results["Buffers Clean"] = int(r[0] or 0)
                     results["Maxwritten Clean"] = int(r[1] or 0)
-                    results["Buffers Backend"] = int(r[2] or 0)
-                    results["Buffers Backend Fsync"] = int(r[3] or 0)
-                    results["Buffers Alloc"] = int(r[4] or 0)
+                    if major_v >= 17:
+                        results["Buffers Alloc"] = int(r[2] or 0)
+                    else:
+                        results["Buffers Backend"] = int(r[2] or 0)
+                        results["Buffers Backend Fsync"] = int(r[3] or 0)
+                        results["Buffers Alloc"] = int(r[4] or 0)
             except Exception as e:
                 self._add_note(f"BG stats: {e}")
 
@@ -2721,11 +2959,11 @@ class PostgresClusterCollector:
                 except Exception as e:
                     self._add_note(f"Sessions: {e}")
 
-            # Oldest Running Transaction Age
+            # Oldest Running Txn Age
             try:
                 with active_primary.conn.cursor() as cur:
                     cur.execute("SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start))::bigint, 0) FROM pg_stat_activity WHERE state <> 'idle';")
-                    results["Oldest Running Transaction Age"] = int(cur.fetchone()[0])
+                    results["Oldest Running Txn Age"] = int(cur.fetchone()[0])
             except Exception as e:
                 self._add_note(f"Oldest xact age: {e}")
 
@@ -2745,16 +2983,16 @@ class PostgresClusterCollector:
             except Exception as e:
                 self._add_note(f"Oldest TxID age: {e}")
 
-            # Logical Replication In Use
+            # Logical Replication Used
             try:
                 with active_primary.conn.cursor() as cur:
                     cur.execute("SELECT (SELECT count(*) FROM pg_publication) + (SELECT count(*) FROM pg_subscription);")
-                    results["Logical Replication In Use"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
+                    results["Logical Replication Used"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
             except Exception:
                 try:
                     with active_primary.conn.cursor() as cur:
                         cur.execute("SELECT count(*) FROM pg_publication;")
-                        results["Logical Replication In Use"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
+                        results["Logical Replication Used"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
                 except Exception as e:
                     self._add_note(f"Logical replication query: {e}")
 
@@ -2832,7 +3070,7 @@ class PostgresClusterCollector:
             except Exception as e:
                 self._add_note(f"pg_stat_database_conflicts: {e}")
 
-            # Child discovery tables: Stats_per_DB and Tranasctions_and_Session_per_Database
+            # Child discovery tables: Stats_per_DB and Transactions_Per_Database
             try:
                 with active_primary.conn.cursor() as cur:
                     cur.execute(std_queries['per_db_stats'])
@@ -2843,7 +3081,7 @@ class PostgresClusterCollector:
                         for i, col in enumerate(db_cols):
                             r_dict[col] = safe_name(str(row[i])) if col == 'name' else (float(row[i] or 0.0) if col == 'size_in_mb' else int(row[i] or 0))
                         db_stats_rows.append(r_dict)
-                    results["Stats_per_DB"] = db_stats_rows[:25]
+                    results["Stats_per_DB"] = self._limit_table("Stats_per_DB", db_stats_rows)
             except Exception as e:
                 self._add_note(f"Stats_per_DB: {e}")
 
@@ -2862,9 +3100,9 @@ class PostgresClusterCollector:
                             else:
                                 r_dict[col] = int(row[i] or 0)
                         tx_stats_rows.append(r_dict)
-                    results["Tranasctions_and_Session_per_Database"] = tx_stats_rows[:25]
+                    results["Transactions_Per_Database"] = self._limit_table("Transactions_Per_Database", tx_stats_rows)
             except Exception as e:
-                self._add_note(f"Tranasctions_and_Session_per_Database: {e}")
+                self._add_note(f"Transactions_Per_Database: {e}")
 
         else:
             self._add_note("Cluster alert: No reachable primary node detected")
@@ -2899,7 +3137,7 @@ class PostgresClusterCollector:
         if agg_evidence.get("patroni", {}).get("is_patroni"):
             for c in clients:
                 if c.is_up and c.patroni_port and str(c.patroni_port) != "none":
-                    hist_data = _http_json(f"http://{c.hostname}:{c.patroni_port}/history", timeout=1.5)
+                    hist_data = _http_json(f"http://{_http_host(c.hostname)}:{c.patroni_port}/history", timeout=1.5)
                     if isinstance(hist_data, list) and hist_data:
                         entries = [e for e in hist_data if isinstance(e, list) and len(e) >= 5]
                         if entries:
@@ -3037,6 +3275,8 @@ class PostgresClusterCollector:
             mesh_disconnect_flag=mesh_disconnect_flag,
             subscription_apply_errors=subscription_apply_errors,
             slots_info=replication_slots,
+            delay_threshold_s=self.replay_warn_seconds,
+            backlog_threshold_bytes=self.replay_warn_bytes,
             slot_warn_bytes=self.slot_warn_bytes,
             slot_critical_bytes=self.slot_critical_bytes,
             seconds_since_last_failover=seconds_since_last_failover,
@@ -3048,6 +3288,9 @@ class PostgresClusterCollector:
 
         results["Nodes Total"] = int(nodes_total)
         results["Nodes Up"] = int(nodes_up)
+        results["Nodes Configured"] = int(self.nodes_configured)
+        results["Nodes Discovered"] = int(self.discovery_added)
+        results["Nodes Omitted"] = int(self.nodes_omitted)
         results["Primary Count"] = int(primary_count)
         results["No Primary Flag"] = int(no_primary_flag)
         results["Split Brain Flag"] = int(split_brain_flag)
@@ -3064,13 +3307,13 @@ class PostgresClusterCollector:
 
         results["Replication Slots Total"] = int(slots_total)
         results["Replication Slots Active"] = int(slots_active)
-        results["Replication Slots Inactive"] = int(slots_inactive)
+        results["Inactive Slots Count"] = int(slots_inactive)
         results["Max Slot Lag Bytes"] = int(max_slot_lag_bytes)
         if has_wal_status:
             results["Slot Wal Status Risk"] = int(max_wal_status_risk)
 
         if seconds_since_last_failover is not None:
-            results["Seconds Since Last Failover"] = int(seconds_since_last_failover)
+            results["Failover Age Seconds"] = int(seconds_since_last_failover)
             results["Last Failover Timeline"] = int(last_failover_timeline)
         results["Failovers Last 24h"] = int(failovers_last_24h)
         results["Last Failover To"] = str(last_failover_to)
@@ -3089,26 +3332,25 @@ class PostgresClusterCollector:
             "name": safe_name(str(patroni_scope_discovered or "postgrescluster")) or "cluster",
             "cluster_type": str(detected_type)[:99],
             "type_evidence": _evidence_with_discovery(detected_evidence, nodes_total, self.discovery_added, self.discovery_source),
-            "server_version": str(server_version_str)[:99],
-            "primary_node": active_primary.name if active_primary else "none",
+            "primary_node": (active_primary.name if active_primary else "none")[:MAX_TABLE_STRING_LENGTH],
             "health_reason": str(health_reason)[:99],
             "nodes_total": int(nodes_total),
             "nodes_up": int(nodes_up),
             "primary_timeline": int(primary_timeline),
             "status": 1 if nodes_up else 0,
         }]
-        results["Cluster_Nodes"] = cluster_nodes[:25]
-        results["Replication_Links"] = replication_links[:25]
-        results["Replication_Slots"] = replication_slots[:25]
-        results["Node_IO"] = node_io_table[:25]
-        results["Node_Checkpoints"] = node_checkpoints_table[:25]
-        results["Node_Activity"] = node_activity_table[:25]
-        results["Node_Transactions"] = node_transactions_table[:25]
+        results["Cluster_Nodes"] = self._limit_table("Cluster_Nodes", cluster_nodes)
+        results["Replication_Links"] = self._limit_table("Replication_Links", replication_links)
+        results["Replication_Slots"] = self._limit_table("Replication_Slots", replication_slots)
+        results["Node_IO"] = self._limit_table("Node_IO", node_io_table)
+        results["Node_Checkpoints"] = self._limit_table("Node_Checkpoints", node_checkpoints_table)
+        results["Node_Activity"] = self._limit_table("Node_Activity", node_activity_table)
+        results["Node_Transactions"] = self._limit_table("Node_Transactions", node_transactions_table)
 
         # Site24x7 Child Discovery
         results["s247config"] = {
             "childdiscovery": [
-                "Tranasctions_and_Session_per_Database",
+                "Transactions_Per_Database",
                 "Stats_per_DB"
             ]
         }
@@ -3117,29 +3359,98 @@ class PostgresClusterCollector:
         results.update(copy.deepcopy(tabs))
         results["units"] = units
 
-        if self.msg_notes:
-            results["msg"] = "; ".join(self.msg_notes[:5])
+        notes = self.truncation_notes + self.msg_notes[:5]
+        if notes:
+            results["msg"] = "; ".join(notes[:5])
 
         return results
+
+
+def _read_int_setting(param, key, default):
+    value = param.get(key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{key} must be an integer")
 
 
 def run(param):
     """Site24x7 agent Python plugin entrypoint."""
     try:
+        if sys.version_info < (3, 9):
+            return {
+                "plugin_version": PLUGIN_VERSION,
+                "heartbeat_required": HEARTBEAT,
+                "status": 0,
+                "msg": "Python 3.9 or newer is required by this plugin."
+            }
         param = param or {}
-        nodes = str(param.get("nodes") or "").strip()
-        username = str(param.get("username") or "").strip()
-        password = str(param.get("password") or "")
-        db = str(param.get("db") or "").strip()
-        patroni_port = str(param.get("patroni_port") or "").strip()
+        raw_cluster_host = param.get("cluster_host") or param.get("cluster_ip") or param.get("clusterip")
+        raw_nodes = param.get("nodes") or param.get("host")
+        default_port = str(param.get("postgres_port") or param.get("port") or DEFAULT_POSTGRES_PORT).strip().strip("'\"")
+        username = str(param.get("username") or param.get("user") or "").strip().strip("'\"")
+        password = str(param.get("password") or os.environ.get("PGPASSWORD") or "")
+        if password.strip().lower() in {"change_me_monitor", "change_me", "changeme", "<password>", "your_password"}:
+            raise ConfigError("Replace the placeholder password in postgres_cluster.cfg or provide the real password through PGPASSWORD.")
+        raw_db = str(param.get("db") or param.get("database") or "").strip().strip("'\"")
+        db = raw_db if raw_db else "postgres"
+        raw_pat = param.get("patroni_port")
         cluster_type = param.get("cluster_type") or CLUSTER_TYPE
         discover = param.get("discover") or DISCOVER
-        address_map = str(param.get("address_map") or ADDRESS_MAP).strip()
-        failover_warn_seconds = int(param.get("failover_warn_seconds") if param.get("failover_warn_seconds") is not None else FAILOVER_WARN_SECONDS)
-        slot_warn_bytes = int(param.get("slot_warn_bytes") if param.get("slot_warn_bytes") is not None else SLOT_WARN_BYTES)
-        slot_critical_bytes = int(param.get("slot_critical_bytes") if param.get("slot_critical_bytes") is not None else SLOT_CRITICAL_BYTES)
+        address_map = str(param.get("address_map") or ADDRESS_MAP).strip().strip("'\"")
+        failover_warn_seconds = _read_int_setting(param, "failover_warn_seconds", FAILOVER_WARN_SECONDS)
+        slot_warn_bytes = _read_int_setting(param, "slot_warn_bytes", SLOT_WARN_BYTES)
+        slot_critical_bytes = _read_int_setting(param, "slot_critical_bytes", SLOT_CRITICAL_BYTES)
+        replay_warn_seconds = _read_int_setting(param, "replay_warn_seconds", REPLAY_WARN_SECONDS)
+        replay_warn_bytes = _read_int_setting(param, "replay_warn_bytes", REPLAY_WARN_BYTES)
 
-        missing = [k for k, v in (("nodes", nodes), ("username", username), ("db", db)) if not v]
+        if raw_cluster_host and str(raw_cluster_host).strip():
+            clean_host = validate_cluster_host(raw_cluster_host)
+            seed_target = clean_host
+            collector = PostgresClusterCollector(
+                cluster_host=clean_host,
+                username=username,
+                password=password,
+                db=db,
+                patroni_port=raw_pat,
+                cluster_type=cluster_type,
+                discover=discover,
+                address_map=address_map,
+                failover_warn_seconds=failover_warn_seconds,
+                slot_warn_bytes=slot_warn_bytes,
+                slot_critical_bytes=slot_critical_bytes,
+                replay_warn_seconds=replay_warn_seconds,
+                replay_warn_bytes=replay_warn_bytes,
+                default_port=default_port
+            )
+        elif raw_nodes and str(raw_nodes).strip():
+            seed_target = str(raw_nodes).strip()
+            collector = PostgresClusterCollector(
+                nodes_str=seed_target,
+                username=username,
+                password=password,
+                db=db,
+                patroni_port=raw_pat,
+                cluster_type=cluster_type,
+                discover=discover,
+                address_map=address_map,
+                failover_warn_seconds=failover_warn_seconds,
+                slot_warn_bytes=slot_warn_bytes,
+                slot_critical_bytes=slot_critical_bytes,
+                replay_warn_seconds=replay_warn_seconds,
+                replay_warn_bytes=replay_warn_bytes,
+                default_port=default_port
+            )
+        else:
+            seed_target = ""
+
+        missing = []
+        if not seed_target:
+            missing.append("cluster_host")
+        if not username:
+            missing.append("username")
         if missing:
             return {
                 "plugin_version": PLUGIN_VERSION,
@@ -3148,7 +3459,6 @@ def run(param):
                 "msg": "Missing required setting(s): " + ", ".join(missing) + ". Set them in postgres_cluster.cfg."
             }
 
-        collector = PostgresClusterCollector(nodes, username, password, db, patroni_port, cluster_type, discover, address_map=address_map, failover_warn_seconds=failover_warn_seconds, slot_warn_bytes=slot_warn_bytes, slot_critical_bytes=slot_critical_bytes)
         return collector.collect()
     except ConfigError as e:
         return {
@@ -3169,32 +3479,115 @@ def run(param):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Site24x7 PostgreSQL Cluster Plugin")
-    parser.add_argument('--nodes', help='Required. Comma-separated nodes (host:port, name=host:port, or host:port:patroni_port)', default=NODES)
-    parser.add_argument('--username', help='Required. PostgreSQL monitoring username', default=USERNAME)
-    parser.add_argument('--password', help='PostgreSQL password', default=PASSWORD)
-    parser.add_argument('--db', help='Required. Database name', default=DB)
-    parser.add_argument('--patroni_port', help='Patroni REST API port (empty if not Patroni)', default=PATRONI_PORT)
-    parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=CLUSTER_TYPE)
-    parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=DISCOVER)
-    parser.add_argument('--address_map', help='Optional internal host:port=reachable host:port mappings for Docker/NAT', default=ADDRESS_MAP)
-    parser.add_argument('--failover_warn_seconds', help='Failover warning window in seconds', type=int, default=FAILOVER_WARN_SECONDS)
-    parser.add_argument('--slot_warn_bytes', help='Inactive slot warning threshold in bytes', type=int, default=SLOT_WARN_BYTES)
-    parser.add_argument('--slot_critical_bytes', help='Inactive slot critical threshold in bytes', type=int, default=SLOT_CRITICAL_BYTES)
+    parser.add_argument('--cluster_host', help='Cluster seed IP or hostname (e.g. postgres-primary.prod.internal)', default=None)
+    parser.add_argument('--cluster_ip', '--clusterip', help='Alternative to --cluster_host', default=None)
+    parser.add_argument('--postgres_port', help=f'PostgreSQL database port (default {DEFAULT_POSTGRES_PORT})', default=None)
+    parser.add_argument('--port', help='Alternative to --postgres_port', default=None)
+    parser.add_argument('--nodes', help='Legacy parameter: comma-separated nodes (host:port[:patroni_port])', default=None)
+    parser.add_argument('--host', help='Alternative to --cluster_host / --nodes', default=None)
+    parser.add_argument('--username', help='PostgreSQL monitoring username', default=None)
+    parser.add_argument('--user', help='Alternative to --username', default=None)
+    parser.add_argument('--password', help='PostgreSQL password (prefer PGPASSWORD to avoid command-line exposure)', default=os.environ.get("PGPASSWORD"))
+    parser.add_argument('--db', help='Database name (default postgres)', default=None)
+    parser.add_argument('--database', help='Alternative to --db', default=None)
+    parser.add_argument('--patroni_port', help=f'Patroni REST API port (default {DEFAULT_PATRONI_PORT} with cluster_host; use "none" to disable)', default=None)
+    parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=None)
+    parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=None)
+    parser.add_argument('--address_map', help='Optional internal host:port=reachable host:port mappings for Docker/NAT', default=None)
+    parser.add_argument('--failover_warn_seconds', help=f'Failover warning window in seconds (default {FAILOVER_WARN_SECONDS})', type=int, default=None)
+    parser.add_argument('--slot_warn_bytes', help=f'Inactive slot warning threshold in bytes (default {SLOT_WARN_BYTES})', type=int, default=None)
+    parser.add_argument('--slot_critical_bytes', help=f'Inactive slot critical threshold in bytes (default {SLOT_CRITICAL_BYTES})', type=int, default=None)
+    parser.add_argument('--replay_warn_seconds', help=f'Replay delay warning threshold in seconds (default {REPLAY_WARN_SECONDS})', type=int, default=None)
+    parser.add_argument('--replay_warn_bytes', help=f'Replay backlog warning threshold in bytes (default {REPLAY_WARN_BYTES})', type=int, default=None)
     args = parser.parse_args()
 
+    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postgres_cluster.cfg")
+    cfg_params = {}
+    if os.path.exists(cfg_file):
+        import configparser
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(cfg_file)
+            section = "postgres_cluster" if cp.has_section("postgres_cluster") else (cp.sections()[0] if cp.sections() else None)
+            if section:
+                for k, v in cp.items(section):
+                    cfg_params[k] = v.strip().strip("'\"")
+        except Exception:
+            pass
+
+    cli_cluster_host = args.cluster_host or args.cluster_ip
+    cfg_cluster_host = cfg_params.get("cluster_host") or cfg_params.get("cluster_ip") or cfg_params.get("clusterip")
+
+    cli_nodes = args.nodes or args.host
+    cfg_nodes = cfg_params.get("nodes") or cfg_params.get("host")
+
+    cli_user = args.username or args.user
+    cfg_user = cfg_params.get("username") or cfg_params.get("user")
+    user_val = cli_user or cfg_user or USERNAME
+
+    cli_pw = args.password
+    cfg_pw = cfg_params.get("password")
+    pw_val = cli_pw or os.environ.get("PGPASSWORD") or cfg_pw or PASSWORD
+
+    cli_db = args.db or args.database
+    cfg_db = cfg_params.get("db") or cfg_params.get("database")
+    db_val = cli_db or cfg_db or DB or "postgres"
+
+    cli_port = args.postgres_port or args.port
+    cfg_port = cfg_params.get("postgres_port") or cfg_params.get("port")
+    port_val = cli_port or cfg_port or str(DEFAULT_POSTGRES_PORT)
+
+    cli_pat = args.patroni_port
+    cfg_pat = cfg_params.get("patroni_port")
+    pat_port_val = cli_pat or cfg_pat
+
+    cli_ctype = args.cluster_type
+    cfg_ctype = cfg_params.get("cluster_type")
+    ctype_val = cli_ctype or cfg_ctype or CLUSTER_TYPE
+
+    cli_disc = args.discover
+    cfg_disc = cfg_params.get("discover")
+    disc_val = cli_disc or cfg_disc or DISCOVER
+
+    cli_amap = args.address_map
+    cfg_amap = cfg_params.get("address_map")
+    amap_val = cli_amap or cfg_amap or ADDRESS_MAP
+
+    failover_val = args.failover_warn_seconds if args.failover_warn_seconds is not None else _read_int_setting(cfg_params, "failover_warn_seconds", FAILOVER_WARN_SECONDS)
+    slot_warn_val = args.slot_warn_bytes if args.slot_warn_bytes is not None else _read_int_setting(cfg_params, "slot_warn_bytes", SLOT_WARN_BYTES)
+    slot_crit_val = args.slot_critical_bytes if args.slot_critical_bytes is not None else _read_int_setting(cfg_params, "slot_critical_bytes", SLOT_CRITICAL_BYTES)
+    replay_warn_sec_val = args.replay_warn_seconds if args.replay_warn_seconds is not None else _read_int_setting(cfg_params, "replay_warn_seconds", REPLAY_WARN_SECONDS)
+    replay_warn_b_val = args.replay_warn_bytes if args.replay_warn_bytes is not None else _read_int_setting(cfg_params, "replay_warn_bytes", REPLAY_WARN_BYTES)
+
     param = {
-        "nodes": args.nodes,
-        "username": args.username,
-        "password": args.password,
-        "db": args.db,
-        "patroni_port": args.patroni_port,
-        "cluster_type": args.cluster_type,
-        "discover": args.discover,
-        "address_map": args.address_map,
-        "failover_warn_seconds": args.failover_warn_seconds,
-        "slot_warn_bytes": args.slot_warn_bytes,
-        "slot_critical_bytes": args.slot_critical_bytes
+        "postgres_port": port_val,
+        "port": port_val,
+        "username": user_val,
+        "password": pw_val,
+        "db": db_val,
+        "patroni_port": pat_port_val,
+        "cluster_type": ctype_val,
+        "discover": disc_val,
+        "address_map": amap_val,
+        "failover_warn_seconds": failover_val,
+        "slot_warn_bytes": slot_warn_val,
+        "slot_critical_bytes": slot_crit_val,
+        "replay_warn_seconds": replay_warn_sec_val,
+        "replay_warn_bytes": replay_warn_b_val
     }
+    # CLI seed flags take precedence over config file
+    if cli_cluster_host:
+        param["cluster_host"] = cli_cluster_host
+    elif cli_nodes:
+        param["nodes"] = cli_nodes
+    elif cfg_cluster_host:
+        param["cluster_host"] = cfg_cluster_host
+    elif cfg_nodes:
+        param["nodes"] = cfg_nodes
+    elif CLUSTER_HOST:
+        param["cluster_host"] = CLUSTER_HOST
+    elif NODES:
+        param["nodes"] = NODES
 
     try:
         result = run(param)

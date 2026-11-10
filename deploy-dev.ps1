@@ -15,7 +15,6 @@ param(
     [switch]$ForceReregister,
     [string]$Nodes = "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003",
     [string]$Username = "site24x7",
-    [string]$Password = "site24x7",
     [string]$Database = "postgres",
     [string]$PatroniPort = "8008"
 )
@@ -26,6 +25,14 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourcePy = Join-Path $scriptDir "upstream_layout\postgres_cluster\postgres_cluster.py"
 $agentPluginsDir = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins"
 $targetDir = Join-Path $agentPluginsDir "postgres_cluster_dev"
+$Password = $env:MONITOR_PASSWORD
+if (-not $Password) {
+    $securePassword = Read-Host -Prompt "Monitoring role password" -AsSecureString
+    $Password = [System.Net.NetworkCredential]::new("", $securePassword).Password
+}
+if (-not $Password) {
+    throw "A monitoring role password is required. Set MONITOR_PASSWORD or enter one at the prompt."
+}
 
 Write-Host "=== Site24x7 PostgreSQL Cluster Dev Deployment ===" -ForegroundColor Cyan
 Write-Host "Source script: $sourcePy"
@@ -59,7 +66,19 @@ patroni_port="$PatroniPort"
 cluster_type="auto"
 "@
 
-Set-Content -Path $targetCfg -Value $cfgContent -Encoding Ascii
+$tempCfg = Join-Path $targetDir ("postgres_cluster_dev.cfg.{0}.tmp" -f [Guid]::NewGuid().ToString("N"))
+try {
+    Set-Content -LiteralPath $tempCfg -Value $cfgContent -Encoding Ascii
+    & icacls.exe $tempCfg /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not restrict access to the temporary development config."
+    }
+    Move-Item -LiteralPath $tempCfg -Destination $targetCfg -Force
+} catch {
+    Remove-Item -LiteralPath $tempCfg -Force -ErrorAction SilentlyContinue
+    throw
+}
+Write-Host "Restricted config access to LocalSystem and Administrators; password stored as plaintext." -ForegroundColor Yellow
 
 # Touch LastWriteTime on cfg to signal agent file-watcher
 (Get-Item $targetCfg).LastWriteTime = (Get-Date)

@@ -1,5 +1,7 @@
 # PostgreSQL Cluster Monitoring Plugin for Site24x7: Complete Architecture & Metrics Reference
 
+> Historical material from an earlier plugin design. Its metrics, architecture, and tabular limits may not match v4; use `upstream_layout/postgres_cluster/README.md` as the current reference.
+
 ---
 
 ## 1. Executive Summary & Core Objective

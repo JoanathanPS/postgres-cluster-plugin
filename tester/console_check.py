@@ -413,7 +413,7 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
             except Exception as e:
                 print(f"[WARN] Failed to save tab strip HTML: {e}")
 
-        # Step 5: Check 6 tabs (strictly all 6 must be found, including checking inside 'More' dropdown)
+        # Step 5: Check all 5 configured tabs (including tabs inside the 'More' dropdown)
         expected_tabs = [
             "Cluster",
             "Replication",
@@ -559,11 +559,11 @@ def run_console_check(monitor_name=DEFAULT_MONITOR, force_headed=False, timeout_
                            f"Rendered rows: {row_count}, primary count: {primary_count}", shot_path)
 
                 elif tab_name == "Replication":
-                    has_standbys = "replication_standbys" in content_lower
+                    has_links = "replication_links" in content_lower
                     has_slots = "replication_slots" in content_lower
-                    rep_ok = (has_standbys and has_slots)
-                    record("Replication Tab (Standbys & Slots tables)", rep_ok,
-                           f"Replication_Standbys: {has_standbys}, Replication_Slots: {has_slots}", shot_path)
+                    rep_ok = (has_links and has_slots)
+                    record("Replication Tab (Links & Slots tables)", rep_ok,
+                           f"Replication_Links: {has_links}, Replication_Slots: {has_slots}", shot_path)
 
                 elif tab_name == "Node Performance":
                     has_io = "node_io" in content_lower or "stats_per_db" in content_lower or "checkpoints" in content_lower

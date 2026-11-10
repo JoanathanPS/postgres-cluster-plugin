@@ -82,7 +82,7 @@ def main():
     print("[1/4] Checking baseline plugin metrics...")
     data_init = run_plugin()
     print(f"  Max Replay Backlog:    {data_init.get('Max Replay Backlog', 0)} bytes")
-    print(f"  Replication Standbys:  {len(data_init.get('Replication_Standbys', []))} connected\n")
+    print(f"  Replication Links:  {len(data_init.get('Replication_Links', []))} connected\n")
 
     # Step 2: Induce backlog
     print(f"[2/4] Pausing standby '{standby}' to simulate network/storage stall...")
@@ -110,7 +110,7 @@ def main():
         print(f"  [METRIC] Max Replay Backlog:  {lag_bytes} bytes ({lag_bytes / 1024:.1f} KB)")
         print(f"  [METRIC] Max Slot Lag Bytes:  {slot_lag} bytes")
 
-        for s in data_lag.get("Replication_Standbys", []):
+        for s in data_lag.get("Replication_Links", []):
             print(f"    * Standby '{s.get('name')}': state={s.get('state')}, replay_lag={s.get('replay_lag_bytes')} bytes")
 
         if lag_bytes > 0:

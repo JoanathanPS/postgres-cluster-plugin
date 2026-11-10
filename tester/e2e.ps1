@@ -183,8 +183,8 @@ try {
     }
 
     # Check 4: Child tables structure
-    $tablesOk = ($healthyJson -and $healthyJson.Cluster_Nodes -and $healthyJson.Cluster_Nodes.Count -eq 3 -and $healthyJson.Replication_Standbys -and $healthyJson.Replication_Standbys.Count -ge 1)
-    Assert-Result "Child Tables Structure" $tablesOk "Cluster_Nodes rows: $(if ($healthyJson -and $healthyJson.Cluster_Nodes) { $healthyJson.Cluster_Nodes.Count } else { 0 }) | Replication_Standbys rows: $(if ($healthyJson -and $healthyJson.Replication_Standbys) { $healthyJson.Replication_Standbys.Count } else { 0 })"
+    $tablesOk = ($healthyJson -and $healthyJson.Cluster_Nodes -and $healthyJson.Cluster_Nodes.Count -eq 3 -and $healthyJson.Replication_Links -and $healthyJson.Replication_Links.Count -ge 1)
+    Assert-Result "Child Tables Structure" $tablesOk "Cluster_Nodes rows: $(if ($healthyJson -and $healthyJson.Cluster_Nodes) { $healthyJson.Cluster_Nodes.Count } else { 0 }) | Replication_Links rows: $(if ($healthyJson -and $healthyJson.Replication_Links) { $healthyJson.Replication_Links.Count } else { 0 })"
 
     # --------------------------------------------------------------------------
     # STAGE C: Existing Test Suites

@@ -1,4 +1,5 @@
-# pg_auto_failover test bed (PostgreSQL 11 demo image): 1 monitor + 2 data nodes. Trust auth, test only.
+# pg_auto_failover test bed using the upstream latest image: 1 monitor + 2 data nodes.
+# PostgreSQL version is not pinned. Trust authentication is for local testing only.
 name: tb-pgaf
 x-pgaf: &pgaf
   image: citusdata/pg_auto_failover:latest

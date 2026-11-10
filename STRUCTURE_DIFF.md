@@ -1,34 +1,34 @@
-# Structure diff: standalone `postgres` plugin vs `postgres_cluster`
+# Structure diff: standalone `postgres` vs `postgres_cluster`
 
-Observed in the Site24x7 console (monitor `postgres_cluster_v3-Joana-PC.`, PostgreSQL 17.2 Patroni cluster of 3 nodes) on 4 Nov 2026. The standalone side is taken from the `tabs` and `units` definitions in `postgres/postgres.py`.
+This document describes the current output schema from `postgres/postgres.py` and `upstream_layout/postgres_cluster/postgres_cluster.py`. It is a source-level mapping; console display can vary by agent/template registration. The official standalone installation and metric reference is [Site24x7's PostgreSQL plugin README](https://raw.githubusercontent.com/site24x7/plugins/master/postgres/README.md).
 
-## Summary page
+## Summary metrics
 
-| | Standalone `postgres` | `postgres_cluster` |
-| :--- | :--- | :--- |
-| Charts | 14: Active Connections, Active Queries, Active Waiting Queries, Cache Hit Ratio, Database Count, Heap Blocks Hit, Heap Blocks Read, Index Rows Fetched, Index Rows Read, Index Scans, Locks Count, Max Connections, Table Count, Uptime | The same 14, plus `Cluster Health` and `Nodes Up` (16 charts, verified in the console) |
-| Textual attributes | Server Version | Server Version, Archive Mode, Last Archived WAL File |
+The standalone plugin exposes its summary attributes without custom tabs. The cluster plugin retains the shared summary metrics from the active primary and adds `Cluster Health` and `Nodes Up`. `Server Version` remains textual. Some additional textual WAL/archive values may also appear depending on the current metric template.
 
-## Tabs
+Shared summary metric names: `Active Connections`, `Active Queries`, `Active Waiting Queries`, `Cache Hit Ratio`, `Database Count`, `Heap Blocks Hit`, `Heap Blocks Read`, `Index Rows Fetched`, `Index Rows Read`, `Index Scans`, `Locks Count`, `Max Connections`, `Table Count`, and `Uptime`.
 
-| Standalone tab | Cluster plugin tab | Charts seen in console | Tables seen in console |
-| :--- | :--- | :--- | :--- |
-| (none) | **Cluster** | 7: No Primary Flag, Nodes Total, Primary Count, Primary Timeline, Server PID, Split Brain Flag, Timeline Mismatch Flag | `Cluster_Info` (1 row: cluster type, evidence, version, primary node, health reason), `Cluster_Nodes` (3 rows) |
-| (none) | **Replication** | 12: standbys expected/streaming, disconnect flag, sync and cascading counts, max replay backlog/delay, slots total/active/inactive, max slot lag, logical replication flag | `Replication_Standbys`, `Replication_Slots` |
-| BG Writer + DB and IO stats | **Node Performance** | 16: rows inserted/updated/deleted/fetched/returned, block reads/hits, checkpoint timing and counts, buffers (alloc, checkpoint, clean), maxwritten clean, dead tuples | `Node_IO`, `Node_Checkpoints` (3 rows each), `Stats_per_DB` ("No Data Available" with a Discover button, same as the standalone monitor) |
-| Transactions and Sessions | **Transactions and Sessions** | 12: commits, rollbacks, conflicts, sessions (total, abandoned, fatal, killed), idle in transaction, open, connection utilization, oldest transaction ID age, oldest running transaction age | `Node_Transactions`, `Node_Activity` (3 rows each), `Tranasctions_and_Session_per_Database` ("No Data Available" with Discover, same as standalone) |
-| (none) | **WAL and Recovery** | 14: WAL positions, WAL file count and size, archive success/failed/ready, recovery conflict counters | none |
+## Cluster tabs and tables
 
-## What changed relative to the standalone plugin, and why
+| Cluster tab | Data |
+| --- | --- |
+| Cluster | Topology, primary count/timeline, failover metadata; `Cluster_Info` and `Cluster_Nodes` |
+| Replication | Streaming links, lag, slots, logical/mesh status; `Replication_Links` and `Replication_Slots` |
+| Node Performance | I/O, database activity, checkpoints; `Node_IO`, `Node_Checkpoints`, and `Stats_per_DB` |
+| Transactions and Sessions | Activity and transaction/session counters; `Node_Activity`, `Node_Transactions`, and `Transactions_Per_Database` |
+| WAL and Recovery | WAL positions/size, archive status, recovery conflicts; charts only |
 
-- Every standalone parameter exists with the same SQL. An automated test (`tester/test_cluster_plugin.py`, "OG parity") runs `postgres.py` and the cluster plugin against the same primary and compares them.
-- Standalone metrics are also reported per node (`Node_IO`, `Node_Checkpoints`, `Node_Activity`, `Node_Transactions`), so each node in the cluster has the standalone parameters. The flat Summary values come from the node that is the primary at poll time.
-- The `Tranasctions_and_Session_per_Database` null-name row is dropped, exactly as `postgres.py` does.
-- Numeric metrics are numbers instead of strings.
-- `Locks Count` is lower than the standalone plugin reports for the same SQL, because `postgres.py` counts the locks held by its own open transaction.
-- `Buffers Backend` and `Buffers Backend Fsync` do not exist on PostgreSQL 17 (moved to `pg_stat_io`) and are omitted there; the standalone plugin omits them on 17 too.
-- A metric that cannot be read is omitted, never replaced by 0.
+There are ten child tables in total, within Site24x7's table/row/column limits. Exact columns and units are listed in the cluster README.
 
-## Limits used
+## Parity and differences
 
-10 tables (max 10), at most 15 columns, 25 rows and 5 string columns per table, 83 flat metrics (max 200).
+- Shared standalone query formulas are reused for the flat primary metrics and the two per-database tables, with version-specific checkpoint queries.
+- Standalone flat values that were stringified are emitted as JSON numbers by the cluster plugin. Per-node tables provide selected metrics for each reachable node; the complete standalone metric set is not duplicated as flat metrics for every node.
+- `Locks Count` may differ because the standalone collector's own transaction contributes locks to its query.
+- On PostgreSQL 17+, the standalone collector omits `Buffers Backend` and `Buffers Backend Fsync`; the cluster collector now omits them too.
+- The per-database transaction rows are not guaranteed to match row-for-row: the cluster filters null database names explicitly, while the standalone drops the first fetched row.
+- Cluster-only metrics include topology, replication, failover history, WAL/archive telemetry, logical replication, and health state.
+
+## Site24x7 limits
+
+The cluster output is designed for a maximum of 10 tables, 15 columns per table, 25 rows per table, 5 string columns per table including the reserved `name` column, and 200 generic metrics. Tables over 25 rows are truncated; the collector's truncation notice is reported in `msg`.
