@@ -100,6 +100,11 @@ def validate_schema(data, rep):
         rep.check(m in data, f"Cluster metric '{m}' is present ({data.get(m)})")
 
     # Child tables
+    rep.check("Cluster_Info" in data and isinstance(data["Cluster_Info"], list), "Cluster_Info table present")
+    if "Cluster_Info" in data:
+        for row in data["Cluster_Info"]:
+            rep.check("name" in row, f"Cluster_Info row has 'name' key ({row.get('name')})")
+
     rep.check("Cluster_Nodes" in data and isinstance(data["Cluster_Nodes"], list), "Cluster_Nodes table present")
     if "Cluster_Nodes" in data:
         for row in data["Cluster_Nodes"]:
@@ -114,12 +119,14 @@ def validate_schema(data, rep):
     units = data.get("units", {})
     rep.check(isinstance(units, dict) and "Nodes Total" in units, "units dictionary configured")
     tabs = data.get("tabs", {})
-    rep.check("Cluster" in tabs, "Cluster tab present in tabs definition")
+    expected_tabs = ["Cluster", "Replication", "Node Performance", "Transactions and Sessions", "WAL and Recovery"]
+    for t in expected_tabs:
+        rep.check(t in tabs, f"'{t}' tab present in tabs definition")
 
     # Childdiscovery in s247config
     childdiscovery = (data.get("s247config") or {}).get("childdiscovery", [])
-    rep.check("Cluster_Nodes" in childdiscovery and "Replication_Standbys" in childdiscovery,
-              f"s247config.childdiscovery includes cluster tables: {childdiscovery}")
+    rep.check("Stats_per_DB" in childdiscovery and "Tranasctions_and_Session_per_Database" in childdiscovery,
+              f"s247config.childdiscovery includes per-DB child tables: {childdiscovery}")
 
 
 def test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep):
@@ -199,7 +206,7 @@ def main():
     args = parser.parse_args()
 
     plugin_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster", "postgres_cluster.py"))
-    nodes = os.environ.get("PG_NODES", "node1=localhost:5441,node2=localhost:5442,node3=localhost:5443")
+    nodes = os.environ.get("PG_NODES", "pgnode1=127.0.0.1:5441:8001,pgnode2=127.0.0.1:5442:8002,pgnode3=127.0.0.1:5443:8003")
     user = os.environ.get("MONITOR_USER", "site24x7")
     password = os.environ.get("MONITOR_PASSWORD", "site24x7")
     db = os.environ.get("MONITOR_DB", "appdb")
