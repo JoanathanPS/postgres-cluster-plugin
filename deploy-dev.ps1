@@ -22,7 +22,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$sourcePy = Join-Path $scriptDir "upstream_layout\postgres_cluster\postgres_cluster.py"
+$sourcePy = Join-Path $scriptDir "postgres_cluster\postgres_cluster.py"
 $agentPluginsDir = "C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins"
 $targetDir = Join-Path $agentPluginsDir "postgres_cluster_dev"
 $Password = $env:MONITOR_PASSWORD

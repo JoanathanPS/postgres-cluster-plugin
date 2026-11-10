@@ -362,7 +362,7 @@ def test_thread_safety_concurrency(plugin_py, nodes, user, password, db, patroni
     Asserts no shared-state contamination, no crashes, and all 3 produce valid output.
     """
     print("\n=== Test: Thread-Safety Under Concurrency ===")
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster")))
     import postgres_cluster as pg_mod
 
     def run_single_collector(thread_id):
@@ -396,7 +396,7 @@ def test_cluster_type_fixtures(rep):
     Tests detect_cluster_type pure function against all 16 realistic cluster fixtures.
     """
     print("\n=== Test: Cluster Type Detection (16 Fixtures) ===")
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster")))
     from postgres_cluster import detect_cluster_type
 
     fixtures = [
@@ -839,7 +839,7 @@ def test_exception_injection(plugin_py, nodes, user, password, db, patroni_port,
     retains data collected so far, and never emits an unhandled traceback to stdout.
     """
     print("\n=== Test: Unexpected Exception Injection Handling ===")
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster")))
     import postgres_cluster as pg_mod
 
     collector = pg_mod.PostgresClusterCollector(
@@ -873,7 +873,7 @@ def test_exception_injection(plugin_py, nodes, user, password, db, patroni_port,
     # Subprocess execution test: verify CLI execution outputs valid JSON with status 0 and no traceback on stdout
     test_code = (
         "import sys, json, os\n"
-        f"sys.path.insert(0, r'{os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'upstream_layout', 'postgres_cluster'))}')\n"
+        f"sys.path.insert(0, r'{os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'postgres_cluster'))}')\n"
         "import postgres_cluster as pg\n"
         "def broken_parse(self):\n"
         "    raise ValueError('SIMULATED_CLI_EXCEPTION')\n"
@@ -901,7 +901,7 @@ def test_standalone_sql_parity(rep):
     matches standalone postgres.py character-for-character across PG 14, 16, and 17.
     """
     print("\n=== Test: Standalone SQL Parity vs postgres.py ===")
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster")))
     import postgres_cluster as pg_mod
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres")))
     import postgres as std_mod
@@ -929,7 +929,7 @@ def test_cluster_health_rules(rep):
     Healthy: all criteria met.
     """
     print("\n=== Test: Cluster Health Rules and Fixtures ===")
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster")))
     from postgres_cluster import evaluate_cluster_health
 
     # 1. Critical: No primary
@@ -1423,9 +1423,7 @@ def main():
     parser.add_argument("--failover", action="store_true", help="Run dynamic failover assertion test")
     args = parser.parse_args()
 
-    upstream_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "upstream_layout", "postgres_cluster", "postgres_cluster.py"))
-    fallback_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster", "postgres_cluster.py"))
-    plugin_py = upstream_py if os.path.exists(upstream_py) else fallback_py
+    plugin_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "postgres_cluster", "postgres_cluster.py"))
     nodes = os.environ.get("PG_NODES", "127.0.0.1:5441:8001,127.0.0.1:5442:8002,127.0.0.1:5443:8003")
     user = os.environ.get("MONITOR_USER", "site24x7")
     password = os.environ.get("MONITOR_PASSWORD", "site24x7")

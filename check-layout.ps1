@@ -1,7 +1,7 @@
 # ==============================================================================
 # check-layout.ps1
-# Validates the upstream_layout/postgres_cluster directory structure, syntax,
-# imports, configuration standards, and runtime execution.
+# Validates the postgres_cluster directory structure, syntax, imports,
+# configuration standards, runtime execution, and standalone plugin integrity.
 # ==============================================================================
 
 [CmdletBinding()]
@@ -9,11 +9,12 @@ param()
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$upstreamDir = Join-Path $scriptDir "upstream_layout\postgres_cluster"
+$clusterDir = Join-Path $scriptDir "postgres_cluster"
+$standaloneDir = Join-Path $scriptDir "postgres"
 
 Write-Host "=================================================================" -ForegroundColor Cyan
-Write-Host " Site24x7 Upstream Layout Compliance & Health Check" -ForegroundColor Cyan
-Write-Host " Target Directory: $upstreamDir" -ForegroundColor Cyan
+Write-Host " Site24x7 Layout Compliance & Health Check" -ForegroundColor Cyan
+Write-Host " Target Directory: $clusterDir" -ForegroundColor Cyan
 Write-Host "=================================================================" -ForegroundColor Cyan
 
 $passed = 0
@@ -53,13 +54,13 @@ $requiredFiles = @(
 )
 
 foreach ($relPath in $requiredFiles) {
-    $fullPath = Join-Path $upstreamDir $relPath
+    $fullPath = Join-Path $clusterDir $relPath
     Assert-Check "File exists: $relPath" { Test-Path $fullPath }
 }
 
 Write-Host "`n--- Step 2: Configuration Standards Integrity ---" -ForegroundColor Yellow
 
-$cfgPath = Join-Path $upstreamDir "postgres_cluster.cfg"
+$cfgPath = Join-Path $clusterDir "postgres_cluster.cfg"
 Assert-Check "Configuration contains [global_configurations] with redirect_output=1" {
     $content = Get-Content $cfgPath -Raw
     $content -match '\[global_configurations\]' -and $content -match 'redirect_output\s*=\s*1'
@@ -75,13 +76,13 @@ Write-Host "`n--- Step 3: Script Syntax & Import Validation ---" -ForegroundColo
 $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $pyExe) { $pyExe = "python" }
 
-$pyPath = Join-Path $upstreamDir "postgres_cluster.py"
+$pyPath = Join-Path $clusterDir "postgres_cluster.py"
 Assert-Check "Python syntax compilation check (py_compile)" {
     $compOut = & $pyExe -m py_compile $pyPath 2>&1
     $LASTEXITCODE -eq 0
 }
 
-$ps1Installer = Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.ps1"
+$ps1Installer = Join-Path $clusterDir "installer\Site24x7PostgresClusterPluginInstaller.ps1"
 Assert-Check "PowerShell installer syntax check (AST parser)" {
     $tokens = $null
     $errors = $null
@@ -89,7 +90,7 @@ Assert-Check "PowerShell installer syntax check (AST parser)" {
     $errors.Count -eq 0
 }
 
-$shInstaller = Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.sh"
+$shInstaller = Join-Path $clusterDir "installer\Site24x7PostgresClusterPluginInstaller.sh"
 Assert-Check "Bash installer uses standardized [postgres_cluster] section" {
     $content = Get-Content $shInstaller -Raw
     $content -match '\[\$plugin\]' -or $content -match '\[postgres_cluster\]'
@@ -115,28 +116,23 @@ Assert-Check "Plugin runs cleanly against active cluster with valid JSON output"
     return $true
 }
 
-Write-Host "`n--- Step 5: Parity with Working Collector ---" -ForegroundColor Yellow
+Write-Host "`n--- Step 5: Standalone Plugin Integrity ---" -ForegroundColor Yellow
 
-$workingPy = Join-Path $scriptDir "postgres_cluster\postgres_cluster.py"
-Assert-Check "canonical plugin files match their working mirrors" {
-    $mirrorPairs = @(
-        [pscustomobject]@{ Canonical = $pyPath; Mirror = $workingPy },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "README.md"); Mirror = (Join-Path $scriptDir "postgres_cluster\README.md") },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.ps1"); Mirror = (Join-Path $scriptDir "postgres_cluster\Site24x7PostgresClusterPluginInstaller.ps1") },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "installer\Site24x7PostgresClusterPluginInstaller.sh"); Mirror = (Join-Path $scriptDir "postgres_cluster\Site24x7PostgresClusterPluginInstaller.sh") },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "prerequisites\create_user.sql"); Mirror = (Join-Path $scriptDir "postgres_cluster\create_user.sql") },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "prerequisites\create_user.sh"); Mirror = (Join-Path $scriptDir "postgres_cluster\create_user.sh") },
-        [pscustomobject]@{ Canonical = (Join-Path $upstreamDir "postgres_cluster.cfg"); Mirror = (Join-Path $scriptDir "postgres_cluster\postgres_cluster.cfg.example") }
-    )
-    foreach ($pair in $mirrorPairs) {
-        if (-not (Test-Path $pair.Canonical) -or -not (Test-Path $pair.Mirror)) { return $false }
-        $canonicalHash = (Get-FileHash $pair.Canonical -Algorithm SHA256).Hash
-        $mirrorHash = (Get-FileHash $pair.Mirror -Algorithm SHA256).Hash
-        if ($canonicalHash -ne $mirrorHash) { return $false }
-    }
-    $canonicalVersion = [regex]::Match((Get-Content $pyPath -Raw), 'PLUGIN_VERSION\s*=\s*(\d+)').Groups[1].Value
-    $mirrorVersion = [regex]::Match((Get-Content $workingPy -Raw), 'PLUGIN_VERSION\s*=\s*(\d+)').Groups[1].Value
-    return ($canonicalVersion -ne '') -and ($canonicalVersion -eq $mirrorVersion)
+Assert-Check "Standalone plugin exists: postgres/postgres.py" {
+    Test-Path (Join-Path $standaloneDir "postgres.py")
+}
+
+Assert-Check "Standalone plugin exists: postgres/postgres.cfg" {
+    Test-Path (Join-Path $standaloneDir "postgres.cfg")
+}
+
+Assert-Check "Standalone README exists: postgres/README.md" {
+    Test-Path (Join-Path $standaloneDir "README.md")
+}
+
+Assert-Check "Standalone Python syntax compilation check (py_compile)" {
+    $stCompOut = & $pyExe -m py_compile (Join-Path $standaloneDir "postgres.py") 2>&1
+    $LASTEXITCODE -eq 0
 }
 
 Write-Host "`n=================================================================" -ForegroundColor Cyan
