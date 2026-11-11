@@ -1,0 +1,34 @@
+{
+  "Cluster_Nodes": [
+    {
+      "last_seen_s": 0,
+      "name": "pg1",
+      "role": 1,
+      "status": 1
+    }
+  ],
+  "Primary_Commits": 100000,
+  "Primary_Connections": 42,
+  "Primary_Up": 1,
+  "heartbeat_required": true,
+  "plugin_version": 5,
+  "status": 1,
+  "tabs": {
+    "tabs": {
+      "Primary": {
+        "order": "1",
+        "tablist": [
+          "Primary_Up",
+          "Primary_Connections",
+          "Primary_Commits",
+          "Primary_Typo"
+        ]
+      }
+    }
+  },
+  "units": {
+    "Primary_Commits": "txns",
+    "Primary_Connections": "connections",
+    "Primary_Up": "flag"
+  }
+}
