@@ -112,7 +112,7 @@ Assert-Check "Plugin runs cleanly against active cluster with valid JSON output"
     if ($json.plugin_version -lt 1) { return $false }
     if (-not $json.Cluster_Nodes) { return $false }
     if (-not $json.Replication_Links) { return $false }
-    if (-not $json.tabs.Cluster) { return $false }
+    if (-not ($json.tabs.Cluster -or $json.tabs.tabs.Diagnosis -or $json.tabs.tabs.Nodes)) { return $false }
     return $true
 }
 

@@ -1,3605 +1,2424 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""
+PostgreSQL Cluster Monitoring Plugin for Site24x7 (v5 Engine).
+Architecture: Catalogue -> Capabilities -> Truth Model -> Health Object -> Emitter.
+Single-file deliverable conforming to Site24x7 hard constraints.
+"""
 
-### This plugin is used for monitoring PostgreSQL Cluster
-### For monitoring the health, replication and performance metrics of all the nodes of your PostgreSQL cluster using Site24x7 Server Monitoring Plugins.
-###
-### Language : Python
-### Tested with Patroni, repmgr, Stolon, Citus, pg_auto_failover, CloudNativePG and multi-master clusters (Windows agent verified with Patroni)
+from __future__ import annotations
 
-import os
-import sys
-import json
-import time
-import copy
-import re
-import tempfile
-import urllib.request
-import urllib.error
+import argparse
 import concurrent.futures
-from collections import OrderedDict
+import copy
+import hashlib
+import json
+import math
+import os
+import re
+import socket
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-MAX_NAME_LENGTH = 520  # Site24x7 child-table name column limit
-MAX_TABLE_STRING_LENGTH = 100  # Site24x7 non-name table string value limit
-
-def safe_name(raw):
-    return re.sub(r'[^A-Za-z0-9]', '', str(raw))[:MAX_NAME_LENGTH]
-
-
-class PluginError(Exception):
-    """Base exception for postgres_cluster plugin."""
-    pass
-
-class ConfigError(PluginError):
-    """Configuration missing or invalid."""
-    pass
-
-class AuthError(PluginError):
-    """PostgreSQL or Patroni authentication failure."""
-    pass
-
-class UnreachableError(PluginError):
-    """Host or port unreachable / connection refused / timeout."""
-    pass
-
-class DiscoveryError(PluginError):
-    """Cluster discovery failed (e.g. seed down with no cache)."""
-    pass
-
-class UnsupportedClusterError(PluginError):
-    """Cluster type detected but unsupported by this plugin version."""
-    def __init__(self, cluster_type, evidence=""):
-        super().__init__(f"Detected {cluster_type}: not supported by this plugin version")
-        self.cluster_type = cluster_type
-        self.evidence = evidence
-
-class MetricUnavailable(PluginError):
-    """Specific metric query failed due to permissions or missing views."""
-    pass
-
-def _table_readable(cur, qualified):
-    """True only if the table exists and the current user may read it, so querying it can never raise a server-side error."""
-    try:
-        cur.execute("SELECT CASE WHEN to_regclass(%s) IS NULL THEN false ELSE has_table_privilege(to_regclass(%s), 'SELECT') END;", (qualified, qualified))
-        r = cur.fetchone()
-        return bool(r and r[0])
-    except Exception:
-        return False
+try:
+    import psycopg2
+    import psycopg2.extensions
+    HAVE_PSYCOPG2 = True
+except ImportError:
+    HAVE_PSYCOPG2 = False
 
 
-def _column_readable(cur, qualified, column):
-    """Same as _table_readable for one column (pg_subscription.subconninfo is readable by superusers or after a GRANT only)."""
-    try:
-        cur.execute("SELECT CASE WHEN to_regclass(%s) IS NULL THEN false ELSE has_column_privilege(to_regclass(%s), %s, 'SELECT') END;", (qualified, qualified, column))
-        r = cur.fetchone()
-        return bool(r and r[0])
-    except Exception:
-        return False
+# -----------------------------------------------------------------------------
+# 0. PLATFORM CONSTANTS & ABSOLUTE LIMITS (Site24x7 Enforced)
+# -----------------------------------------------------------------------------
+PLUGIN_VERSION = 5
+HEARTBEAT_REQUIRED = True
 
+MAX_TABLES = 10
+MAX_COLUMNS = 15
+MAX_ROWS = 25
+MAX_STRING_COLS = 5       # includes 'name'
+MAX_NAME_CHARS = 520
+MAX_STRING_CHARS = 100
+MAX_METRICS = 200
+MAX_MSG_CHARS = 180
 
-def check_for_pooler(conn):
-    """Detects if the endpoint is a connection pooler like PgBouncer.
-    Raises ConfigError if a pooler is detected."""
-    try:
-        with conn.cursor() as cur:
-            #A real PostgreSQL answers this, so we stop here and no failing command is written to its log
-            try:
-                cur.execute("SELECT current_setting('server_version_num');")
-                r0 = cur.fetchone()
-                if r0 and str(r0[0]).strip().isdigit():
-                    return
-            except Exception:
-                pass
-            try:
-                cur.execute("SHOW VERSION;")
-                row = cur.fetchone()
-                if row and "pgbouncer" in str(row[0]).lower():
-                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
-            except ConfigError:
-                raise
-            except Exception as e:
-                err_str = str(e).lower()
-                if "show help" in err_str or "pgbouncer" in err_str:
-                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
-
-            try:
-                cur.execute("SELECT pg_is_in_recovery();")
-            except Exception as e:
-                err_str = str(e).lower()
-                if "show help" in err_str or "invalid command" in err_str:
-                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
-    except ConfigError:
-        raise
-    except Exception:
-        pass
-
-def classify(e):
-    """Classifies an exception into typed PluginError hierarchy."""
-    try:
-        import psycopg2
-        if isinstance(e, psycopg2.OperationalError):
-            msg = str(e).lower()
-            if "authentication failed" in msg or "password authentication" in msg or "pg_hba.conf" in msg:
-                return AuthError(str(e))
-            return UnreachableError(str(e))
-        pgcode = getattr(e, 'pgcode', None)
-        if pgcode in ('42501', '42P01', '42883', '42703', '57014'):
-            return MetricUnavailable(str(e))
-        name = type(e).__name__
-        if name in ('InsufficientPrivilege', 'UndefinedTable', 'UndefinedFunction', 'UndefinedColumn', 'QueryCanceled'):
-            return MetricUnavailable(str(e))
-    except ImportError:
-        pass
-    if isinstance(e, PluginError):
-        return e
-    return e
-
-SUPPORTED_CLUSTER_TYPES = {
-    "Patroni",
-    "repmgr",
-    "streaming replication (no HA manager detected)",
-    "standalone",
-    "Multi-Master (native logical)",
-    "Multi-Master (pglogical)",
-    "pgpool-II",
-    "Stolon",
-    "Citus Distributed",
-    "pg_auto_failover",
-    "CloudNative-PG",
+RESERVED_KEYS = {
+    "plugin_version", "heartbeat_required", "status", "msg",
+    "units", "tabs", "s4z7config"
 }
 
-def parse_address_map(raw_map):
-    mapping = {}
-    if not raw_map:
-        return mapping
-    for entry in str(raw_map).split(","):
+# -----------------------------------------------------------------------------
+# 1. ENUMS (Integer encoded for Site24x7 table constraints)
+# -----------------------------------------------------------------------------
+# Overall & Node Status
+STATUS_DOWN = 0
+STATUS_UP = 1
+
+# Node Roles
+ROLE_UNKNOWN = 0
+ROLE_PRIMARY = 1
+ROLE_STANDBY = 2
+ROLE_WITNESS = 3
+ROLE_OFFLINE = 4
+ROLE_CASCADING = 5
+ROLE_DELAYED = 6
+ROLE_STANDBY_LEADER = 7
+
+ROLE_NAMES = {
+    ROLE_UNKNOWN: "unknown",
+    ROLE_PRIMARY: "primary",
+    ROLE_STANDBY: "standby",
+    ROLE_WITNESS: "witness",
+    ROLE_OFFLINE: "offline",
+    ROLE_CASCADING: "cascading",
+    ROLE_DELAYED: "delayed",
+    ROLE_STANDBY_LEADER: "standby_leader",
+}
+
+# Standby Sync States
+SYNC_ASYNC = 0
+SYNC_SYNC = 1
+SYNC_QUORUM = 2
+
+# Cluster Health Severities
+HEALTH_OK = 0
+HEALTH_WARN = 1
+HEALTH_CRITICAL = 2
+
+HEALTH_NAMES = {
+    HEALTH_OK: "OK",
+    HEALTH_WARN: "WARN",
+    HEALTH_CRITICAL: "CRITICAL",
+}
+
+# Health Condition Codes (Stable, alertable, documented)
+HEALTH_CODE_OK = 0
+HEALTH_CODE_PRIMARY_DOWN = 1
+HEALTH_CODE_SPLIT_BRAIN = 2
+HEALTH_CODE_NO_STANDBYS_STREAMING = 3
+HEALTH_CODE_SYNC_STANDBYS_DEFICIT = 4
+HEALTH_CODE_SLOT_LOST_OR_CRITICAL = 5
+HEALTH_CODE_XID_CRITICAL = 6
+HEALTH_CODE_NO_FAILOVER_CANDIDATE = 7
+
+HEALTH_CODE_NODE_DOWN = 10
+HEALTH_CODE_STANDBY_LAG_HIGH = 11
+HEALTH_CODE_INACTIVE_SLOT_WARN = 12
+HEALTH_CODE_TIMELINE_MISMATCH = 13
+HEALTH_CODE_RECENT_FAILOVER = 14
+HEALTH_CODE_XID_WARN = 15
+HEALTH_CODE_HIGH_CONNECTIONS = 16
+HEALTH_CODE_ARCHIVE_FAILING = 17
+HEALTH_CODE_STALE_STATS = 18
+
+# Error Taxonomy Codes
+ERR_CONFIG_INVALID = "config_error"
+ERR_AUTH_FAILURE = "auth_failure"
+ERR_UNREACHABLE = "unreachable"
+ERR_METRIC_UNAVAILABLE = "metric_unavailable"
+ERR_POOLER_DETECTED = "pooler_detected"
+ERR_UNSUPPORTED_CLUSTER = "unsupported_cluster"
+ERR_BUDGET_EXCEEDED = "budget_exceeded"
+
+# Patroni States
+PATRONI_STATE_UNKNOWN = 0
+PATRONI_STATE_RUNNING = 1
+PATRONI_STATE_STOPPED = 2
+PATRONI_STATE_STARTING = 3
+PATRONI_STATE_STOPPED_FAILED = 4
+PATRONI_STATE_CRASHED = 5
+PATRONI_STATE_PAUSED = 6
+PATRONI_STATE_CREATING_STANDBY = 7
+PATRONI_STATE_NA = 8
+
+PATRONI_STATE_MAP = {
+    "running": PATRONI_STATE_RUNNING,
+    "stopped": PATRONI_STATE_STOPPED,
+    "starting": PATRONI_STATE_STARTING,
+    "stop failed": PATRONI_STATE_STOPPED_FAILED,
+    "crashed": PATRONI_STATE_CRASHED,
+    "paused": PATRONI_STATE_PAUSED,
+    "creating replica": PATRONI_STATE_CREATING_STANDBY,
+}
+
+# Replication Slot Risk
+RISK_OK = 0
+RISK_WARN = 1
+RISK_CRITICAL = 2
+RISK_LOST = 3
+
+# Replication Link Types & States
+LINK_PHYSICAL = 0
+LINK_LOGICAL = 1
+
+LINK_STATE_STREAMING = 0
+LINK_STATE_CATCHUP = 1
+LINK_STATE_STOPPED = 2
+LINK_STATE_PAUSED = 3
+LINK_STATE_UNKNOWN = 4
+
+SLOT_PHYSICAL = 0
+SLOT_LOGICAL = 1
+
+
+# -----------------------------------------------------------------------------
+# 1.1 PURE HELPERS: VERSION PARSING & ADDRESS MAPPING
+# -----------------------------------------------------------------------------
+_VER_RE = re.compile(r"(\d+)(?:\.(\d+))?")
+
+def parse_pg_version(raw: str) -> Tuple[int, int]:
+    """
+    Tolerantly extracts (major, minor) integers from real-world PostgreSQL strings:
+    - '16.2' -> (16, 2)
+    - '10.0' -> (10, 0)
+    - '12.3_TDE_1.0' -> (12, 3)
+    - '11.22-rds.20241121' -> (11, 22)
+    - '12beta1' -> (12, 0)
+    - '17devel' -> (17, 0)
+    - 'PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2)...' -> (16, 15)
+    Returns (0, 0) on total failure without crashing.
+    """
+    if not raw or not isinstance(raw, str):
+        return 0, 0
+    clean = raw.strip()
+    # If string contains 'PostgreSQL x.y', strip prefix
+    idx = clean.find("PostgreSQL ")
+    if idx != -1:
+        clean = clean[idx + len("PostgreSQL "):]
+    match = _VER_RE.search(clean)
+    if not match:
+        return 0, 0
+    major = int(match.group(1))
+    minor = int(match.group(2)) if match.group(2) is not None else 0
+    return major, minor
+
+
+def parse_address_map(raw_map: str) -> Dict[str, str]:
+    """
+    Parses comma-separated key=value address translations:
+    'pg-node1:5432=127.0.0.1:5441,pg-node1:8008=127.0.0.1:8001'
+    Used for container port forwarding and NAT bridging.
+    """
+    out: Dict[str, str] = {}
+    if not raw_map or not isinstance(raw_map, str):
+        return out
+    for entry in raw_map.split(","):
         entry = entry.strip()
         if not entry:
             continue
         if "=" in entry:
             src, dst = entry.split("=", 1)
-        elif "->" in entry:
-            src, dst = entry.split("->", 1)
-        else:
-            continue
-        src = src.strip()
-        dst = dst.strip()
-        mapping[src.lower()] = dst
-        if ":" in src:
-            shost, sport = src.split(":", 1)
-            try:
-                mapping[(shost.strip().lower(), int(sport.strip()))] = dst
-            except ValueError:
-                pass
-    return mapping
-
-def map_address(host, port, address_map):
-    if not address_map:
-        return host, int(port)
-    h_norm = str(host).strip().lower()
-    p_int = int(port)
-    if (h_norm, p_int) in address_map:
-        target = address_map[(h_norm, p_int)]
-        if ":" in target:
-            th, tp = target.split(":", 1)
-            return th.strip(), int(tp.strip())
-        return target.strip(), p_int
-    key_str = f"{h_norm}:{p_int}"
-    if key_str in address_map:
-        target = address_map[key_str]
-        if ":" in target:
-            th, tp = target.split(":", 1)
-            return th.strip(), int(tp.strip())
-        return target.strip(), p_int
-    if h_norm in address_map:
-        target = address_map[h_norm]
-        if ":" in target:
-            th, tp = target.split(":", 1)
-            return th.strip(), int(tp.strip())
-        return target.strip(), p_int
-    return host, p_int
-
-def parse_conninfo_hostport(conninfo):
-    if not conninfo:
-        return None, None
-    host, port = None, None
-    if "://" in conninfo:
-        from urllib.parse import urlparse
-        try:
-            u = urlparse(conninfo)
-            return u.hostname, u.port
-        except Exception:
-            pass
-    for token in conninfo.split():
-        if "=" in token:
-            k, v = token.split("=", 1)
-            k = k.strip().lower()
-            v = v.strip().strip("'\"")
-            if k == "host":
-                host = v
-            elif k == "port":
-                try:
-                    port = int(v)
-                except ValueError:
-                    pass
-    return host, port
+            out[src.strip()] = dst.strip()
+    return out
 
 
-#These settings come from postgres_cluster.cfg.
-CLUSTER_HOST = ''                 #Change the cluster seed IP or hostname here: one bare address only
-NODES = ''                        #Legacy fallback: host:port[:patroni_port], one address is enough
-USERNAME = ''                     #Change the username here
-PASSWORD = ''                     #Change the authentication method
-DB = 'postgres'                   #Database name (defaults to postgres)
-PATRONI_PORT = ''                 #Change the Patroni REST port here (default: 8008 when Patroni is used; 'none' to disable)
-ADDRESS_MAP = ''                  #Optional, for Docker/NAT: internal_host:port=reachable_host:port, comma separated
-CLUSTER_TYPE = 'auto'             #auto detects the cluster type, or write the type here
-DISCOVER = 'auto'                 #auto finds the other nodes from the address above, off monitors only the nodes listed
-
-DEFAULT_POSTGRES_PORT = 5432
-DEFAULT_PATRONI_PORT = 8008
-
-#Limits of this plugin, change them only if you know why
-DISCOVERY_DEADLINE_S = 2.0        #Seconds allowed for finding the nodes of the cluster
-MAX_NODES = 25                    #Site24x7 allows at most 25 rows in a table
-MAX_TABLE_ROWS = 25               #Site24x7 child-table row limit
-PGPOOL_DEFAULT_PORT = 9999        #pgpool-II listens on this port by default, so an address on it is asked for its backends
-CONNECT_TIMEOUT = 2               #Seconds to wait when connecting to a node
-STATEMENT_TIMEOUT_MS = 3000       #Milliseconds a single query may run
-NODE_COLLECT_DEADLINE_S = 5.0     #Seconds allowed for collecting from all the nodes
-
-#Alert levels used in the health reason
-FAILOVER_WARN_SECONDS = 900       #A failover newer than this many seconds is reported
-SLOT_WARN_BYTES = 1073741824      #Replication slot retaining more WAL than this is a warning
-SLOT_CRITICAL_BYTES = 10737418240 #Replication slot retaining more WAL than this is critical
-REPLAY_WARN_SECONDS = 60           #Standby replay delay above this is degraded
-REPLAY_WARN_BYTES = 104857600      #Standby replay backlog above this is degraded
-
-#if any impacting changes to this plugin kindly increment the plugin version here.
-PLUGIN_VERSION = 5
-
-#Setting this to true will alert you when there is a communication problem while posting plugin data to server
-HEARTBEAT = True
-
-#Tabs shown in the console. A numeric metric that is in no tab is charted on the Summary page
-tabs = {
-    "tabs": {
-        "Cluster": {"order": "1", "tablist": [
-            "Cluster_Info", "Cluster_Nodes", "Nodes Total", "Primary Count", "Primary Timeline",
-            "No Primary Flag", "Split Brain Flag", "Timeline Mismatch Flag", "Server PID",
-            "Nodes Configured", "Nodes Discovered", "Nodes Omitted",
-            "Failover Age Seconds", "Failovers Last 24h", "Last Failover To", "Last Failover Timeline"]},
-        "Replication": {"order": "2", "tablist": [
-            "Replication_Links", "Replication_Slots", "Standbys Expected", "Standbys Streaming",
-            "Standby Disconnect Flag", "Sync Standby Count", "Cascading Standby Count",
-            "Max Replay Backlog", "Max Replay Delay", "Replication Slots Total",
-            "Replication Slots Active", "Inactive Slots Count", "Max Slot Lag Bytes",
-            "Slot Wal Status Risk",
-            "Logical Replication Used", "Mesh Links Declared", "Mesh Links Active", "Mesh Disconnect Flag", "Max Logical Lag Bytes", "Max Logical Lag Seconds", "Subscription Apply Errors", "Subscription Conflicts"]},
-        "Node Performance": {"order": "3", "tablist": [
-            "Node_IO", "Node_Checkpoints", "Stats_per_DB", "Total Rows Inserted", "Total Rows Updated",
-            "Total Rows Deleted", "Total Rows Fetched", "Total Rows Returned", "Total Block Reads",
-            "Total Block Hits", "Checkpoints Timed", "Checkpoints Req", "Checkpoint Write Time",
-            "Checkpoint Sync Time", "Buffers Checkpoint", "Buffers Clean", "Maxwritten Clean",
-            "Buffers Backend", "Buffers Backend Fsync", "Buffers Alloc", "Dead Tuples"]},
-        "Transactions and Sessions": {"order": "4", "tablist": [
-            "Node_Activity", "Node_Transactions", "Transactions_Per_Database",
-            "Total Commits", "Total Rollbacks", "Total Conflicts", "Total Sessions",
-            "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed",
-            "Transactions Open", "Idle Transactions", "Connection Usage Percent",
-            "Oldest Transaction ID Age", "Oldest Running Txn Age"]},
-        "WAL and Recovery": {"order": "5", "tablist": [
-            "WAL Write Position", "WAL Insert Position", "WAL Flush Position", "WAL Files Count",
-            "WAL Total Size", "Archive Mode", "Archive Status Success", "Archive Status Failed",
-            "Archive Ready Files Count", "Last Archived WAL File", "Recovery Conflicts Total",
-            "Conflicts Tablespace", "Conflicts Lock", "Conflicts Snapshot", "Conflicts Buffer Pin",
-            "Conflicts Deadlock"]}
-    }
-}
-#Units of the metrics and of the table columns
-units = {
-    # Cluster tab
-    "Cluster Health": "status",
-    "Nodes Total": "nodes",
-    "Server PID": "pid",
-    "Nodes Up": "nodes",
-    "Nodes Configured": "nodes",
-    "Nodes Discovered": "nodes",
-    "Nodes Omitted": "nodes",
-    "Primary Count": "nodes",
-    "No Primary Flag": "flag",
-    "Split Brain Flag": "flag",
-    "Primary Timeline": "timeline",
-    "Timeline Mismatch Flag": "flag",
-    "Failover Age Seconds": "s",
-    "Failovers Last 24h": "failovers",
-    "Last Failover Timeline": "timeline",
-
-    # Replication tab
-    "Standbys Expected": "standbys",
-    "Standbys Streaming": "standbys",
-    "Standby Disconnect Flag": "flag",
-    "Sync Standby Count": "standbys",
-    "Cascading Standby Count": "standbys",
-    "Max Replay Backlog": "bytes",
-    "Max Replay Delay": "s",
-    "Replication Slots Total": "slots",
-    "Replication Slots Active": "slots",
-    "Inactive Slots Count": "slots",
-    "Max Slot Lag Bytes": "bytes",
-    "Slot Wal Status Risk": "risk",
-    "Logical Replication Used": "flag",
-    "Mesh Links Declared": "links",
-    "Mesh Links Active": "links",
-    "Mesh Disconnect Flag": "flag",
-    "Max Logical Lag Bytes": "bytes",
-    "Max Logical Lag Seconds": "s",
-    "Subscription Apply Errors": "errors",
-    "Subscription Conflicts": "conflicts",
-    "WAL Write Position": "MB",
-    "WAL Insert Position": "MB",
-    "WAL Flush Position": "MB",
-    "WAL Files Count": "files",
-    "WAL Total Size": "MB",
-    "Archive Status Success": "files",
-    "Archive Status Failed": "files",
-    "Archive Ready Files Count": "files",
-    "Recovery Conflicts Total": "conflicts",
-    "Conflicts Tablespace": "conflicts",
-    "Conflicts Lock": "conflicts",
-    "Conflicts Snapshot": "conflicts",
-    "Conflicts Buffer Pin": "conflicts",
-    "Conflicts Deadlock": "conflicts",
-    "Oldest Running Txn Age": "s",
-
-    # Node Performance tab
-    "Total Rows Inserted": "rows",
-    "Total Rows Updated": "rows",
-    "Total Rows Deleted": "rows",
-    "Total Rows Fetched": "rows",
-    "Total Rows Returned": "rows",
-    "Total Block Reads": "blocks",
-    "Total Block Hits": "blocks",
-    "Heap Blocks Read": "blocks",
-    "Heap Blocks Hit": "blocks",
-    "Cache Hit Ratio": "ratio",
-    "Index Scans": "scans",
-    "Index Rows Read": "rows",
-    "Index Rows Fetched": "rows",
-    "Checkpoints Timed": "checkpoints",
-    "Checkpoints Req": "checkpoints",
-    "Checkpoint Write Time": "ms",
-    "Checkpoint Sync Time": "ms",
-    "Buffers Checkpoint": "buffers",
-    "Buffers Clean": "buffers",
-    "Maxwritten Clean": "buffers",
-    "Buffers Backend": "buffers",
-    "Buffers Backend Fsync": "calls",
-    "Buffers Alloc": "buffers",
-    "Dead Tuples": "tuples",
-
-    # Transactions and Sessions tab
-    "Active Connections": "connections",
-    "Max Connections": "connections",
-    "Connection Usage Percent": "%",
-    "Active Queries": "queries",
-    "Active Waiting Queries": "queries",
-    "Locks Count": "locks",
-    "Oldest Transaction ID Age": "xids",
-    "Total Commits": "transactions",
-    "Total Rollbacks": "transactions",
-    "Total Conflicts": "conflicts",
-    "Transactions Open": "transactions",
-    "Idle Transactions": "transactions",
-    "Total Sessions": "sessions",
-    "Total Sessions Abandoned": "sessions",
-    "Total Sessions Fatal": "sessions",
-    "Total Sessions Killed": "sessions",
-    "Uptime": "s",
-    "Table Count": "tables",
-    "Database Count": "databases",
-
-    # Nested Table Units
-    "Cluster_Info": {
-        "nodes_total": "nodes",
-        "nodes_up": "nodes",
-        "primary_timeline": "timeline",
-        "status": "status"
-    },
-    "Cluster_Nodes": {
-        "is_primary": "flag",
-        "timeline": "timeline",
-        "response_time_ms": "ms",
-        "connections": "connections",
-        "replay_backlog_bytes": "bytes",
-        "replay_delay_s": "s",
-        "monitored": "flag",
-        "status": "status"
-    },
-    "Replication_Links": {
-        "replay_lag_bytes": "bytes",
-        "write_lag_bytes": "bytes",
-        "flush_lag_bytes": "bytes",
-        "replay_lag_s": "s",
-        "is_sync": "flag",
-        "active": "flag",
-        "status": "status"
-    },
-    "Replication_Slots": {
-        "active": "flag",
-        "wal_retained_bytes": "bytes",
-        "status": "status"
-    },
-    "Node_IO": {
-        "rows_inserted": "rows",
-        "rows_updated": "rows",
-        "rows_deleted": "rows",
-        "rows_fetched": "rows",
-        "rows_returned": "rows",
-        "block_reads": "blocks",
-        "block_hits": "blocks",
-        "heap_blocks_read": "blocks",
-        "heap_blocks_hit": "blocks",
-        "cache_hit_ratio": "ratio",
-        "index_scans": "scans",
-        "index_rows_read": "rows",
-        "index_rows_fetched": "rows",
-        "status": "status"
-    },
-    "Node_Checkpoints": {
-        "checkpoints_timed": "checkpoints",
-        "checkpoints_req": "checkpoints",
-        "checkpoint_write_time": "ms",
-        "checkpoint_sync_time": "ms",
-        "buffers_checkpoint": "buffers",
-        "buffers_clean": "buffers",
-        "maxwritten_clean": "buffers",
-        "buffers_backend": "buffers",
-        "buffers_backend_fsync": "calls",
-        "buffers_alloc": "buffers",
-        "status": "status"
-    },
-    "Node_Activity": {
-        "active_connections": "connections",
-        "max_connections": "connections",
-        "active_queries": "queries",
-        "active_waiting_queries": "queries",
-        "transactions_open": "transactions",
-        "idle_in_txn_count": "transactions",
-        "locks_count": "locks",
-        "oldest_xact_age_s": "s",
-        "uptime": "s",
-        "status": "status"
-    },
-    "Node_Transactions": {
-        "commits": "transactions",
-        "rollbacks": "transactions",
-        "conflicts": "conflicts",
-        "sessions": "sessions",
-        "sessions_abandoned": "sessions",
-        "sessions_fatal": "sessions",
-        "sessions_killed": "sessions",
-        "status": "status"
-    },
-    "Stats_per_DB": {
-        "active_connections": "connections",
-        "size_in_mb": "MB",
-        "rows_inserted": "rows",
-        "rows_updated": "rows",
-        "rows_deleted": "rows",
-        "rows_fetched": "rows",
-        "rows_returned": "rows",
-        "block_reads": "blocks",
-        "block_hits": "blocks"
-    },
-    "Transactions_Per_Database": {
-        "commits": "transactions",
-        "rollbacks": "transactions",
-        "conflicts": "conflicts",
-        "sessions": "sessions",
-        "sessions_abandoned": "sessions",
-        "sessions_fatal": "sessions",
-        "sessions_killed": "sessions",
-        "session_time": "ms",
-        "sessions_active_time": "ms",
-        "idle_in_txn_time": "ms"
-    }
-}
+def normalize_host(host: str) -> str:
+    """Normalizes IPv4, bracketed IPv6, and localhost addresses."""
+    if not host or not isinstance(host, str):
+        return ""
+    h = host.strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    return h
 
 
-def get_standalone_queries(major_version, middle_version=0):
+def safe_name(raw: Any) -> str:
+    """Site24x7 table name cleaner: alphanumeric only, <= 520 chars."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(raw))[:MAX_NAME_CHARS]
+
+
+def safe_int(val: Any, default: int = 0) -> int:
+    """Safely converts value to int without raising ValueError/TypeError."""
+    try:
+        if val is None:
+            return default
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely converts value to float without raising ValueError/TypeError."""
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# -----------------------------------------------------------------------------
+# 1.2 NODE CLIENT & QUERY HYGIENE (Never Harm Monitored Server)
+# -----------------------------------------------------------------------------
+class NodeClient:
     """
-    Returns shared standalone PostgreSQL queries adapted for the cluster collector.
-    Output aliases may differ where the cluster schema has Site24x7-specific names,
-    and checkpoint queries are selected by PostgreSQL version.
+    Resilient single-node connection manager.
+    Enforces strict connection timeouts, query statement timeouts,
+    read-only transactions, query comment tagging, and clean resource cleanup.
     """
-    #Add your queries here
-    queries = {
-        'table_count': "SELECT COUNT(*) AS table_count FROM pg_stat_all_tables;",
-        'transactions_open': "SELECT count(*) as transactions_open FROM pg_stat_activity WHERE xact_start IS NOT NULL;",
-        'version': "SHOW server_version;",
-        'locks_count': "SELECT COUNT(*) as locks_count FROM pg_locks;",
-        'max_conn': "select setting::int max_connections from pg_settings where name=$$max_connections$$;",
-        'db_stats': "SELECT sum(numbackends) as active_connections, sum(xact_commit) as total_commits, sum(xact_rollback) as total_rollbacks, sum(conflicts) as total_conflicts FROM pg_stat_database;",
-        'io_stats': "SELECT sum(tup_inserted) as total_rows_inserted, sum(tup_updated) as total_rows_updated ,sum(tup_deleted) as total_rows_deleted, sum(tup_fetched) as total_rows_fetched ,sum(tup_returned) as total_rows_returned,sum(blks_read) as total_block_reads , sum(blks_hit) as total_block_hits FROM pg_stat_database;",
-        'idx_stats': "SELECT sum(idx_scan) as index_scans,sum(idx_tup_read) as index_rows_read, sum(idx_tup_fetch) as index_rows_fetched FROM pg_stat_user_indexes;",
-        'uptime': "SELECT FLOOR(EXTRACT(EPOCH FROM current_timestamp - pg_postmaster_start_time())) as uptime;",
-        'no of databases': "SELECT COUNT(*) AS database_count FROM pg_database WHERE datname <> 'template0' AND datname <> 'template1';",
-        'heap_and_cache': "SELECT sum(heap_blks_read) as heap_blocks_read, sum(heap_blks_hit)  as heap_blocks_hit, CASE WHEN (sum(heap_blks_hit) + sum(heap_blks_read)) = 0 THEN 0 ELSE sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) END as cache_hit_ratio FROM pg_statio_user_tables;",
-    }
-    if (major_version >= 9 and middle_version >= 2) or (major_version >= 10):
-        queries['active_queries'] = "SELECT count(*) - ( SELECT count(*) FROM pg_stat_activity WHERE state = 'idle' ) as active_queries FROM pg_stat_activity;"
-        queries['active_waiting_queries'] = "SELECT count(*) as active_waiting_queries FROM pg_stat_activity WHERE state = 'active' AND wait_event IS NOT NULL;"
-        queries['transacttions_idle'] = "SELECT COUNT(*) as transactions_idle_in_transaction FROM pg_stat_activity WHERE state = 'idle in transaction';"
-    else:
-        queries['active_queries'] = "SELECT count(*) - ( SELECT count(*) FROM pg_stat_activity WHERE current_query = '<IDLE>' ) as active_queries FROM pg_stat_activity;"
-        queries['transacttions_idle'] = "SELECT COUNT(*) as transactions_idle_in_transaction FROM pg_stat_activity WHERE state = '<IDLE> in transaction';"
-
-    if major_version >= 17:
-        queries['checkpoints'] = "SELECT num_timed, num_requested, write_time, sync_time, buffers_written FROM pg_stat_checkpointer;"
-        queries['bg_stats'] = "SELECT buffers_clean, maxwritten_clean, buffers_alloc FROM pg_stat_bgwriter;"
-    else:
-        queries['checkpoints'] = "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, checkpoint_sync_time, buffers_checkpoint FROM pg_stat_bgwriter;"
-        queries['bg_stats'] = "SELECT buffers_clean, maxwritten_clean, buffers_backend, buffers_backend_fsync, buffers_alloc FROM pg_stat_bgwriter;"
-
-    queries['per_db_stats'] = "SELECT d.datname AS name, s.numbackends as active_connections, ROUND(pg_database_size(d.datname) / 1024 / 1024,2) AS size_in_mb, tup_inserted as rows_inserted, tup_updated as rows_updated, tup_deleted as rows_deleted, tup_fetched as rows_fetched, tup_returned as rows_returned, blks_read as block_reads, blks_hit as block_hits FROM pg_database d JOIN pg_stat_database s ON d.oid = s.datid;"
-    if major_version >= 14:
-        queries['per_db_trans'] = "SELECT datname as name, xact_commit as commits, xact_rollback as rollbacks, conflicts, sessions, sessions_abandoned, sessions_fatal, sessions_killed, session_time, active_time as sessions_active_time, idle_in_transaction_time as idle_in_txn_time FROM pg_stat_database WHERE datname IS NOT NULL;"
-    else:
-        queries['per_db_trans'] = "SELECT datname as name, xact_commit as commits, xact_rollback as rollbacks, conflicts FROM pg_stat_database WHERE datname IS NOT NULL;"
-
-    if major_version >= 14:
-        queries['session'] = "SELECT SUM(sessions) as total_sessions, SUM(sessions_abandoned) as total_sessions_abandoned, SUM(sessions_fatal) as total_sessions_fatal, SUM(sessions_killed) as total_sessions_killed FROM pg_stat_database;"
-
-    #Please add any new query designed above to this dictionary also with an appropriate key name
-    return queries
-
-
-def evaluate_cluster_health(
-    nodes_total, nodes_up, primary_count, no_primary_flag, split_brain_flag,
-    standbys_expected, standbys_streaming, max_replay_delay_s, max_replay_backlog,
-    slots_inactive, timeline_mismatch_flag, delay_threshold_s=60.0, backlog_threshold_bytes=104857600,
-    cluster_type=None, mesh_disconnect_flag=0, subscription_apply_errors=0,
-    slots_info=None, slot_warn_bytes=1073741824, slot_critical_bytes=10737418240,
-    seconds_since_last_failover=None, last_failover_to=None, last_failover_timeline=None, failover_warn_seconds=900
-):
-    """
-    Pure health evaluation function for unit testing and live monitoring.
-    Returns (status_code: int, reason: str < 100 chars).
-      0 = healthy
-      1 = degraded
-      2 = critical
-    Rule precedence:
-      Critical: No primary, split-brain (except multi-master), zero streaming standbys,
-                inactive slot > slot_critical_bytes or wal_status lost.
-      Degraded: Node down, standby disconnected, lag over threshold, inactive slot,
-                slot > slot_warn_bytes, timeline mismatch, recent failover within window.
-      Healthy: All criteria satisfied.
-    """
-    is_multimaster = False
-    if cluster_type:
-        c_lower = str(cluster_type).lower()
-        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower or "citus" in c_lower:
-            is_multimaster = True
-
-    # Multi-Master Health Rules
-    if is_multimaster:
-        if nodes_up == 0:
-            return 2, "Critical: No active master nodes reachable"
-        # Check slot critical in multi-master
-        if slots_info:
-            for s in slots_info:
-                if not s.get("active"):
-                    ret = s.get("wal_retained_bytes", 0) or 0
-                    w_st = str(s.get("wal_status") or "").lower()
-                    sn = s.get("name", "unknown")
-                    if ret > slot_critical_bytes or w_st == "lost":
-                        gb = round(ret / (1024**3), 1)
-                        return 2, f"Critical: Slot {sn} retains {gb:.1f} GB WAL"
-        if nodes_up < nodes_total:
-            return 1, f"Degraded: {nodes_total - nodes_up} of {nodes_total} master(s) offline"
-        if mesh_disconnect_flag == 1:
-            return 1, "Degraded: Multi-master mesh disconnected (one or more links inactive)"
-        if subscription_apply_errors > 0:
-            return 1, f"Degraded: {subscription_apply_errors} subscription apply error(s) detected"
-        # Check slot warn in multi-master
-        if slots_info:
-            for s in slots_info:
-                if not s.get("active"):
-                    ret = s.get("wal_retained_bytes", 0) or 0
-                    w_st = str(s.get("wal_status") or "").lower()
-                    sn = s.get("name", "unknown")
-                    if ret > slot_warn_bytes or w_st == "unreserved":
-                        gb = round(ret / (1024**3), 1)
-                        return 1, f"Degraded: Slot {sn} retains {gb:.1f} GB WAL"
-        if slots_inactive > 0:
-            return 1, f"Degraded: {slots_inactive} inactive replication slot(s) found"
-        return 0, f"Multi-master cluster healthy: {nodes_up}/{nodes_total} active master nodes replicating"
-
-    # Physical Cluster Rules
-    # 1. Critical rules
-    if primary_count == 0 or no_primary_flag == 1:
-        return 2, "Critical: No active primary node detected"
-    if split_brain_flag == 1 or primary_count > 1:
-        return 2, f"Critical: Split brain detected ({primary_count} primary nodes active)"
-    if standbys_expected > 0 and standbys_streaming == 0:
-        return 2, f"Critical: No streaming standbys connected ({standbys_expected} expected)"
-
-    # Critical slot severity: inactive slot retaining > slot_critical_bytes or wal_status == 'lost'
-    if slots_info:
-        for s in slots_info:
-            if not s.get("active"):
-                ret = s.get("wal_retained_bytes", 0) or 0
-                w_st = str(s.get("wal_status") or "").lower()
-                sn = s.get("name", "unknown")
-                if ret > slot_critical_bytes or w_st == "lost":
-                    gb = round(ret / (1024**3), 1)
-                    return 2, f"Critical: Slot {sn} retains {gb:.1f} GB WAL"
-
-    # 2. Degraded rules
-    if nodes_up < nodes_total:
-        return 1, f"Degraded: {nodes_total - nodes_up} of {nodes_total} node(s) offline"
-    if standbys_streaming < standbys_expected:
-        return 1, f"Degraded: {standbys_expected - standbys_streaming} of {standbys_expected} standby(s) not streaming"
-    if max_replay_delay_s > delay_threshold_s:
-        return 1, f"Degraded: Replay delay {max_replay_delay_s:.1f}s exceeds threshold ({delay_threshold_s:.0f}s)"
-    if max_replay_backlog > backlog_threshold_bytes:
-        mb = max_replay_backlog / (1024 * 1024)
-        thresh_mb = backlog_threshold_bytes / (1024 * 1024)
-        return 1, f"Degraded: Replay backlog {mb:.1f}MB exceeds threshold ({thresh_mb:.0f}MB)"
-
-    # Slot warn severity: inactive slot retaining > slot_warn_bytes or wal_status == 'unreserved'
-    slot_warn_found = None
-    if slots_info:
-        for s in slots_info:
-            if not s.get("active"):
-                ret = s.get("wal_retained_bytes", 0) or 0
-                w_st = str(s.get("wal_status") or "").lower()
-                sn = s.get("name", "unknown")
-                if ret > slot_warn_bytes or w_st == "unreserved":
-                    gb = round(ret / (1024**3), 1)
-                    slot_warn_found = f"Degraded: Slot {sn} retains {gb:.1f} GB WAL"
-                    break
-    if slot_warn_found:
-        return 1, slot_warn_found
-    if slots_inactive > 0:
-        return 1, f"Degraded: {slots_inactive} inactive replication slot(s) found"
-
-    if timeline_mismatch_flag == 1:
-        return 1, "Degraded: Timeline mismatch detected across cluster nodes"
-
-    # Failover warning check: recent failover within failover_warn_seconds
-    if failover_warn_seconds > 0 and seconds_since_last_failover is not None and seconds_since_last_failover <= failover_warn_seconds:
-        mins = max(1, seconds_since_last_failover // 60)
-        to_node = last_failover_to or "primary"
-        tl = last_failover_timeline or 1
-        prev_tl = tl - 1 if tl > 1 else 1
-        return 1, f"Failover {mins} min ago: primary now {to_node} (timeline {prev_tl} to {tl})"
-
-    # 3. Healthy rule
-    return 0, f"Cluster healthy: {nodes_up}/{nodes_total} nodes active, {primary_count} primary, {standbys_streaming} standbys streaming"
-
-
-def detect_cluster_type(evidence):
-    """
-    Pure evidence-based cluster type detection supporting all major architectures.
-    Returns (detected_type: str, evidence_summary: str < 100 chars).
-    """
-    managers = []
-    manager_evidences = []
-
-    # 1. Patroni check - Patroni always takes priority if active
-    patroni_info = evidence.get("patroni") or {}
-    if patroni_info.get("is_patroni"):
-        scope = patroni_info.get("scope", "patroni")
-        ver = patroni_info.get("version", "")
-        ver_str = f", v{ver}" if ver else ""
-        managers.append("Patroni")
-        manager_evidences.append(f"Patroni REST API response (scope: {scope}{ver_str})")
-
-    exts = evidence.get("extensions", [])
-    has_repmgr_table = evidence.get("repmgr_table", False)
-    slot_names = evidence.get("slot_names", [])
-    slot_types = evidence.get("slot_types", [])
-    app_names = evidence.get("app_names", [])
-    primary_count = evidence.get("primary_count", 0)
-    total_nodes = evidence.get("total_nodes", 1)
-
-    # 2. repmgr check
-    is_repmgr = (
-        ("repmgr" in exts) or has_repmgr_table or
-        any(s.startswith("repmgr_slot_") for s in slot_names) or
-        any(a.startswith("repmgr_") for a in app_names)
-    )
-    if is_repmgr:
-        managers.append("repmgr")
-        manager_evidences.append("repmgr extension / repmgr.nodes catalog found")
-
-    # 3. pg_auto_failover check
-    is_pgautofailover = (
-        ("pgautofailover" in exts) or
-        any(s.startswith("pgautofailover_standby_") for s in slot_names) or
-        any(a.startswith("pgautofailover_") for a in app_names)
-    )
-    if is_pgautofailover:
-        managers.append("pg_auto_failover")
-        manager_evidences.append("pgautofailover extension / standby slot found")
-
-    # 4. CloudNativePG (_cnpg_*)
-    is_cnpg = (
-        any(s.startswith("_cnpg_") for s in slot_names) or
-        any(a.startswith("_cnpg_") or a.startswith("cnpg_") for a in app_names)
-    )
-    if is_cnpg:
-        managers.append("CloudNative-PG")
-        manager_evidences.append("CloudNative-PG replication slot pattern _cnpg_* found")
-
-    # 5. Stolon
-    is_stolon = (
-        any(s.startswith("stolon_") for s in slot_names) or
-        any(a.startswith("stolon_") for a in app_names)
-    )
-    if is_stolon:
-        managers.append("Stolon")
-        manager_evidences.append("Stolon replication slot / app pattern found")
-
-    # 6. Citus Distributed
-    if "citus" in exts:
-        managers.append("Citus Distributed")
-        manager_evidences.append("citus distributed extension installed")
-
-    # 7. Multi-master (pglogical / BDR / Native Active-Active)
-    if "bdr" in exts:
-        managers.append("BDR")
-        manager_evidences.append("BDR multi-master extension detected")
-    elif "pglogical" in exts and primary_count >= 2:
-        managers.append("Multi-Master (pglogical)")
-        manager_evidences.append(f"pglogical active-active mesh ({primary_count} writable nodes)")
-    elif primary_count >= 2 and "citus" not in exts:
-        #Citus workers are all writable on purpose, so several primaries are not a split brain there
-        has_logical_slots = any(t == "logical" for t in slot_types) or any("logical" in str(s).lower() for s in slot_types)
-        subscriptions_count = evidence.get("subscriptions_count", 0)
-        logical_count = evidence.get("logical_replication_count", 0)
-        all_up_sub = evidence.get("all_up_subscribe", False)
-        all_up_pub = evidence.get("all_up_publish", False)
-        if (all_up_sub and all_up_pub) or (subscriptions_count >= primary_count and (has_logical_slots or logical_count > 0)):
-            managers.append("Multi-Master (native logical)")
-            manager_evidences.append(f"Active-Active logical replication mesh ({primary_count} concurrent primaries)")
-        else:
-            managers.append("streaming replication (no HA manager detected)")
-            manager_evidences.append(f"Split Brain: {primary_count} concurrent primary nodes without logical mesh")
-
-    # 8. Managed cloud services
-    if evidence.get("aurora_version"):
-        managers.append("AWS Aurora")
-        manager_evidences.append("aurora_version() function detected")
-    elif "rds_superuser" in evidence.get("managed_roles", []):
-        managers.append("AWS RDS")
-        manager_evidences.append("rds_superuser role detected")
-    elif "azure_pg_admin" in evidence.get("managed_roles", []):
-        managers.append("Azure Database for PostgreSQL")
-        manager_evidences.append("azure_pg_admin role detected")
-    elif "cloudsqlsuperuser" in evidence.get("managed_roles", []):
-        managers.append("GCP Cloud SQL")
-        manager_evidences.append("cloudsqlsuperuser role detected")
-
-    # pgpool-II is a proxy in front of the real cluster: it only names the type when no cluster manager was found
-    if evidence.get("pgpool") and not managers:
-        managers.append("pgpool-II")
-        manager_evidences.append("pgpool-II SHOW POOL_NODES lists the backends")
-
-    if sorted(managers) == ["Citus Distributed", "Patroni"]:
-        return ("Patroni + Citus", "Patroni REST API plus citus extension installed")
-
-    if len(managers) > 1:
-        conflicts_str = " and ".join(managers)
-        return ("mixed/unknown", f"Conflicting evidence: {conflicts_str} detected"[:99])
-
-    if len(managers) == 1:
-        return (managers[0], manager_evidences[0][:99])
-
-    # Check for one-way logical replication
-    has_logical_slots = any(t == "logical" for t in slot_types) or any("logical" in str(s).lower() for s in slot_types)
-    subscriptions_count = evidence.get("subscriptions_count", 0)
-    publications_count = evidence.get("publications_count", 0)
-    logical_count = evidence.get("logical_replication_count", 0)
-    has_logical = has_logical_slots or subscriptions_count > 0 or publications_count > 0 or logical_count > 0 or ("pglogical" in exts)
-
-    if has_logical and not evidence.get("has_standbys", False) and not evidence.get("is_in_recovery", False):
-        return ("logical replication (one-way)", "One-way logical replication detected (not active-active)"[:99])
-
-    # Fallback to physical streaming replication
-    has_standbys = evidence.get("has_standbys", False)
-    has_slots = evidence.get("has_replication_slots", False)
-    is_in_recovery = evidence.get("is_in_recovery", False)
-
-    if has_standbys or has_slots or is_in_recovery or total_nodes > 1:
-        st_count = evidence.get("standby_count", 0)
-        return ("streaming replication (no HA manager detected)", f"PostgreSQL physical streaming replication ({st_count} standbys)"[:99])
-
-    return ("standalone", "Single PostgreSQL instance without active streaming standbys"[:99])
-
-
-class PostgresNodeClient:
-    """
-    Per-instance, thread-safe PostgreSQL client.
-    Encapsulates all node-specific connection state, version detection, query preparation,
-    evidence, and per-node table collection without any module-level global variables.
-    """
-    def __init__(self, name, host, port, username, password, db, patroni_port=None, has_explicit_alias=False, discovered_role=None):
-        self.name = name                               # Display name / alias in tables
-        self.has_explicit_alias = has_explicit_alias
-        self.raw_host = host
-        self.hostname = host
-        self.port = int(port)
-        self.username = username
+    def __init__(
+        self,
+        name: str,
+        host: str,
+        port: int = 5432,
+        user: str = "site24x7",
+        password: str = "",
+        dbname: str = "postgres",
+        sslmode: str = "prefer",
+        sslrootcert: str = "",
+        sslcert: str = "",
+        sslkey: str = "",
+        connect_timeout: int = 2,
+        statement_timeout_ms: int = 3000
+    ):
+        self.name = name
+        self.host = normalize_host(host)
+        self.port = port
+        self.user = user
         self.password = password
-        self.db = db
-        self.patroni_port = patroni_port
-        self.discovered_role = str(discovered_role).strip().lower() if discovered_role else None
-        self.is_witness = (self.discovered_role == "witness")
-        self.endpoint_str = f"{host}:{port}"
-        if patroni_port and patroni_port != "none":
-            self.endpoint_str += f":{patroni_port}"
+        self.dbname = dbname
+        self.sslmode = sslmode
+        self.sslrootcert = sslrootcert
+        self.sslcert = sslcert
+        self.sslkey = sslkey
+        self.connect_timeout = connect_timeout
+        self.statement_timeout_ms = statement_timeout_ms
 
         self.conn = None
-        self.server_version_num = 0
-        self.server_version_str = ""
-        self.is_primary = False
-        self.timeline = None
-        self.response_time_ms = 0.0
-        self.is_up = False
-        self.patroni_state = "N/A"
-        self.patroni_info = None
-        self.patroni_member = None
-        self.notes = []
+        self.is_connected = False
+        self.version_num = 0
+        self.version_tuple = (0, 0)
+        self.is_recovery = False
+        self.system_identifier = ""
+        self.settings: Dict[str, Any] = {}
+        self.warnings: List[str] = []
 
-        # Per-node lag & connection counts
-        self.connections = None
-        self.replay_backlog_bytes = None
-        self.replay_delay_s = None
-        self.is_cascading = 0
-        self.upstream = "N/A"
+    def connect(self) -> bool:
+        """Establishes connection with protective GUCs and timeout limits."""
+        if not HAVE_PSYCOPG2:
+            self.warnings.append("psycopg2 module not installed")
+            return False
 
-        # Pre-collected per-node rows
-        self.subscriptions = []
-        self.logical_slots = []
-        self.logical_walsenders = []
-        self.publications = []
-
-        self.evidence = {}
-        self.activity_row = None
-        self.io_row = None
-        self.transactions_row = None
-        self.checkpoints_row = None
-        self.conflicts_row = None
-
-    def connect(self):
-        """Establishes connection to the PostgreSQL node with sub-second timeout."""
-        import psycopg2
-        t0 = time.time()
-        self.conn = psycopg2.connect(
-            dbname=self.db,
-            user=self.username,
-            password=self.password,
-            host=self.hostname,
-            port=self.port,
-            connect_timeout=CONNECT_TIMEOUT,
-            options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"
+        options = (
+            f"-c statement_timeout={self.statement_timeout_ms} "
+            f"-c idle_in_transaction_session_timeout=10000 "
+            f"-c default_transaction_read_only=on"
         )
-        self.conn.autocommit = True
-        self.response_time_ms = round((time.time() - t0) * 1000.0, 2)
-        self.is_up = True
-        self.server_version_num = self.conn.server_version
-        with self.conn.cursor() as cur:
-            try:
-                cur.execute("SHOW server_version;")
-                self.server_version_str = cur.fetchone()[0]
-            except Exception as e:
-                err_str = str(e).lower()
-                if "show help" in err_str or "pgbouncer" in err_str or "invalid command" in err_str:
-                    raise ConfigError("Seed looks like a connection pooler: point nodes at a PostgreSQL node")
-                raise
-        check_for_pooler(self.conn)
+
+        conn_host = self.host
+        if conn_host == "localhost":
+            conn_host = "127.0.0.1"
+
+        conn_kwargs: Dict[str, Any] = {
+            "host": conn_host,
+            "port": self.port,
+            "user": self.user,
+            "dbname": self.dbname,
+            "connect_timeout": self.connect_timeout,
+            "application_name": "site24x7_pgcluster",
+            "options": options,
+        }
+
+        if self.password:
+            conn_kwargs["password"] = self.password
+
+        if self.sslmode:
+            conn_kwargs["sslmode"] = self.sslmode
+        if self.sslrootcert and os.path.exists(self.sslrootcert):
+            conn_kwargs["sslrootcert"] = self.sslrootcert
+        if self.sslcert and os.path.exists(self.sslcert):
+            conn_kwargs["sslcert"] = self.sslcert
+        if self.sslkey and os.path.exists(self.sslkey):
+            conn_kwargs["sslkey"] = self.sslkey
+
+        try:
+            self.conn = psycopg2.connect(**conn_kwargs)
+            self.conn.autocommit = True
+            self.is_connected = True
+            self._load_node_capabilities()
+            return True
+        except Exception as e:
+            self.is_connected = False
+            self.warnings.append(f"Connection failed to {self.host}:{self.port} ({e})")
+            return False
+
+    def _load_node_capabilities(self):
+        """Discovers version, recovery state, system_identifier, and key settings."""
+        # 1. Recovery state
+        row = self.query_one("SELECT pg_is_in_recovery();")
+        if row is not None:
+            self.is_recovery = bool(row[0])
+
+        # 2. Version
+        vnum = getattr(self.conn, "server_version", None)
+        if vnum:
+            self.version_num = vnum
+            self.version_tuple = (vnum // 10000, (vnum % 10000) // 100)
+        else:
+            v_str = self.query_one("SELECT version();")
+            if v_str:
+                self.version_tuple = parse_pg_version(v_str[0])
+                self.version_num = self.version_tuple[0] * 10000 + self.version_tuple[1] * 100
+
+        # 3. System Identifier (pg_control_system in PG 10+)
+        if self.version_tuple[0] >= 10:
+            id_row = self.query_one("SELECT system_identifier FROM pg_control_system();")
+            if id_row:
+                self.system_identifier = str(id_row[0])
+
+        # 4. Critical GUC settings
+        guc_rows = self.query_all("""
+            SELECT name, setting FROM pg_settings
+            WHERE name IN (
+                'max_connections', 'autovacuum_freeze_max_age',
+                'wal_segment_size', 'max_wal_senders', 'synchronous_standby_names',
+                'archive_mode'
+            );
+        """)
+        for r in guc_rows:
+            if len(r) >= 2:
+                self.settings[r[0]] = r[1]
+            elif len(r) == 1:
+                self.settings["max_connections"] = r[0]
+
+    def query_one(self, sql: str, params: Optional[Tuple] = None) -> Optional[Tuple]:
+        """Executes query and returns first row or None."""
+        rows = self.query_all(sql, params)
+        return rows[0] if rows else None
+
+    def query_all(self, sql: str, params: Optional[Tuple] = None) -> List[Tuple]:
+        """Executes query with comment tag prefix and safely closes cursor."""
+        if not self.conn or not self.is_connected:
+            return []
+        tagged_sql = f"/* service='site24x7_pgcluster' */ {sql}"
+        cur = None
+        try:
+            cur = self.conn.cursor()
+            cur.execute(tagged_sql, params)
+            if cur.description or getattr(cur, "_rows", None):
+                return cur.fetchall()
+            return []
+        except Exception as e:
+            self.warnings.append(f"Query failed on {self.name}: {e}")
+            return []
+        finally:
+            if cur:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def close(self):
+        """Closes connection gracefully."""
         if self.conn:
             try:
                 self.conn.close()
             except Exception:
                 pass
-            self.conn = None
+            finally:
+                self.conn = None
+                self.is_connected = False
 
-    def query_patroni(self):
-        """Best-effort Patroni REST API query."""
-        if not self.patroni_port or self.patroni_port == "none":
-            return
-        url = f"http://{_http_host(self.hostname)}:{self.patroni_port}/patroni"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Site24x7-PGCluster'})
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    self.patroni_info = {
-                        "is_patroni": True,
-                        "state": data.get("state", "unknown"),
-                        "role": data.get("role", "unknown"),
-                        "scope": data.get("patroni", {}).get("scope", "cluster"),
-                        "version": data.get("patroni", {}).get("version", ""),
-                        "timeline": data.get("timeline")
-                    }
-                    self.patroni_state = data.get("state", "N/A")
-                    member = data.get("patroni", {}).get("name")
-                    if member:
-                        self.patroni_member = str(member).strip()
-        except Exception:
-            self.patroni_state = "N/A"
 
-    def collect_full(self):
+# -----------------------------------------------------------------------------
+# 1.3 HEALTH OBJECT & REASONING ENGINE (Pure Function)
+# -----------------------------------------------------------------------------
+class Health:
+    """Encapsulates cluster health decision with actionable remediation text."""
+    __slots__ = ("code", "severity", "fact", "quantified", "context", "hint")
+
+    def __init__(self, code: int, severity: int, fact: str,
+                 quantified: str = "", context: str = "", hint: str = ""):
+        self.code = code
+        self.severity = severity
+        self.fact = fact
+        self.quantified = quantified
+        self.context = context
+        self.hint = hint
+
+    def format_msg(self) -> str:
         """
-        Executes complete node probing, evidence, per-node tables, and lag calculations
-        inside the node worker thread. Enforces thread safety and returns self.
+        Renders Site24x7 single-line monitor message <= 180 chars:
+        '<SEVERITY> <code>: <fact> (<quantified>) | <context> | hint: <action>'
         """
-        try:
-            # 1. Best-effort Patroni probe
-            self.query_patroni()
+        sev_name = HEALTH_NAMES.get(self.severity, "INFO")
+        code_str = f"c{self.code}"
+        msg = f"{sev_name} {code_str}: {self.fact}"
+        if self.quantified:
+            msg += f" ({self.quantified})"
+        if self.context:
+            msg += f" | {self.context}"
+        if self.hint:
+            msg += f" | hint: {self.hint}"
+        return msg[:MAX_MSG_CHARS]
 
-            # 2. Database connection
-            self.connect()
 
-            # 3. Role, timeline & lag probing
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT pg_is_in_recovery();")
-                in_rec = cur.fetchone()[0]
-                self.is_primary = not in_rec
+def evaluate_cluster_health(
+    *,
+    has_primary: bool,
+    primary_name: str = "",
+    primary_last_seen_s: int = 0,
+    primary_last_seen_iso: str = "",
+    nodes_up: int = 0,
+    nodes_total: int = 0,
+    timeline: int = 0,
+    primaries_count: int = 0,
+    is_multi_master: bool = False,
+    expected_standbys: int = 0,
+    streaming_standbys: int = 0,
+    sync_standbys_expected: int = 0,
+    sync_standbys_actual: int = 0,
+    has_failover_candidate: bool = True,
+    slot_lost: bool = False,
+    max_slot_retained_bytes: int = 0,
+    slot_crit_bytes: int = 10 * 1024 * 1024 * 1024,
+    slot_warn_bytes: int = 1024 * 1024 * 1024,
+    inactive_slots: int = 0,
+    xid_wraparound_pct: float = 0.0,
+    max_replay_lag_s: float = 0.0,
+    max_replay_backlog_b: int = 0,
+    replay_warn_s: float = 60.0,
+    replay_warn_b: int = 100 * 1024 * 1024,
+    timeline_spread: int = 0,
+    failover_age_s: int = -1,
+    failover_window_s: int = 900,
+    conn_saturation_pct: float = 0.0,
+    archive_failed: int = 0,
+    stale_stats: int = 0,
+    auth_failure: bool = False,
+) -> Health:
+    """
+    Pure health reasoning engine. Evaluates criteria in strict precedence order:
+    CRITICAL -> WARN -> OK.
+    """
+    # 0. Auth failure is classified separately and MUST NOT masquerade as primary down
+    if auth_failure:
+        return Health(
+            code=HEALTH_CODE_OK,
+            severity=HEALTH_WARN,
+            fact="authentication failure on one or more cluster nodes",
+            quantified="auth error",
+            context=f"{nodes_up}/{nodes_total} nodes up",
+            hint="check monitor credentials in cfg"
+        )
 
-                if self.is_witness or self.discovered_role == "witness":
-                    self.is_primary = False
-                    self.is_witness = True
-                elif self.is_primary:
-                    try:
-                        if _table_readable(cur, 'repmgr.nodes'):
-                            cur.execute("SELECT type FROM repmgr.nodes WHERE node_name = %s OR conninfo LIKE %s LIMIT 1;", (self.name, f"%host={self.hostname}%"))
-                            r = cur.fetchone()
-                            if r and str(r[0]).strip().lower() == "witness":
-                                self.is_primary = False
-                                self.is_witness = True
-                    except Exception:
-                        pass
+    # 1. CRITICAL: No primary reachable
+    if not has_primary or primaries_count == 0:
+        last_seen = f"last seen {primary_name} {primary_last_seen_s}s ago" if primary_name else "no prior primary"
+        cand_hint = "failover --candidate" if has_failover_candidate else "manual recovery needed: no candidate"
+        return Health(
+            code=HEALTH_CODE_PRIMARY_DOWN if has_failover_candidate else HEALTH_CODE_NO_FAILOVER_CANDIDATE,
+            severity=HEALTH_CRITICAL,
+            fact="no primary reachable",
+            quantified=last_seen,
+            context=f"{nodes_up}/{nodes_total} nodes up, timeline {timeline}",
+            hint=f"patronictl list; {cand_hint}"
+        )
 
-                if self.is_witness:
-                    self.timeline = 0
-                elif self.is_primary:
-                    try:
-                        cur.execute("SELECT ('x' || substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8))::bit(32)::int;")
-                        r = cur.fetchone()
-                        if r and r[0] is not None:
-                            self.timeline = int(r[0])
-                    except Exception as e:
-                        self.notes.append(f"Primary timeline query error: {e}")
-                else:
-                    # Standby timeline: use pg_stat_wal_receiver.received_tli first, then pg_control_checkpoint()
-                    try:
-                        cur.execute("SELECT received_tli FROM pg_stat_wal_receiver WHERE received_tli IS NOT NULL LIMIT 1;")
-                        r = cur.fetchone()
-                        if r and r[0] is not None:
-                            self.timeline = int(r[0])
-                    except Exception as e:
-                        self.notes.append(f"Standby wal_receiver timeline error on {self.name}: {e}")
+    # 2. CRITICAL: Split Brain (>1 concurrent writable primaries without active-active mesh)
+    if primaries_count > 1 and not is_multi_master:
+        return Health(
+            code=HEALTH_CODE_SPLIT_BRAIN,
+            severity=HEALTH_CRITICAL,
+            fact="split brain detected: multiple concurrent primaries",
+            quantified=f"{primaries_count} primaries active",
+            context=f"{nodes_up}/{nodes_total} nodes up",
+            hint="fence rogue primary immediately"
+        )
 
-                    if self.timeline is None:
-                        try:
-                            cur.execute("SELECT timeline_id FROM pg_control_checkpoint();")
-                            r = cur.fetchone()
-                            if r and r[0] is not None:
-                                self.timeline = int(r[0])
-                        except Exception as e:
-                            self.notes.append(f"Standby checkpoint timeline error on {self.name}: {e}")
+    # 3. CRITICAL: 0 of N expected standbys streaming
+    if expected_standbys > 0 and streaming_standbys == 0:
+        return Health(
+            code=HEALTH_CODE_NO_STANDBYS_STREAMING,
+            severity=HEALTH_CRITICAL,
+            fact="zero standbys streaming WAL from primary",
+            quantified=f"0/{expected_standbys} streaming",
+            context=f"timeline {timeline}",
+            hint="check standby pg_is_in_recovery() and walsender logs"
+        )
 
-                # Real per-node active connections count from sum(numbackends)
-                try:
-                    cur.execute("SELECT sum(numbackends) FROM pg_stat_database;")
-                    r = cur.fetchone()
-                    self.connections = int(r[0] or 0)
-                except Exception:
-                    try:
-                        cur.execute("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';")
-                        self.connections = int(cur.fetchone()[0])
-                    except Exception as e:
-                        self.notes.append(f"Connections count error on {self.name}: {e}")
-                        self.connections = None
+    # 4. CRITICAL: Sync Standbys Deficit
+    if sync_standbys_expected > 0 and sync_standbys_actual < sync_standbys_expected:
+        return Health(
+            code=HEALTH_CODE_SYNC_STANDBYS_DEFICIT,
+            severity=HEALTH_CRITICAL,
+            fact="synchronous standbys below required quorum",
+            quantified=f"{sync_standbys_actual}/{sync_standbys_expected} sync",
+            context=f"durability compromised",
+            hint="check synchronous_standby_names"
+        )
 
-                # Standby replay lag and backlog (omit cells on primary)
-                if not self.is_primary:
-                    try:
-                        cur.execute("SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();")
-                        r_lsns = cur.fetchone()
-                        recv_lsn = r_lsns[0] if r_lsns else None
-                        rep_lsn = r_lsns[1] if r_lsns else None
-                        if recv_lsn and rep_lsn:
-                            cur.execute("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
-                            diff = cur.fetchone()[0]
-                            self.replay_backlog_bytes = max(0, int(diff)) if diff is not None else 0
-                            if recv_lsn == rep_lsn or self.replay_backlog_bytes == 0:
-                                self.replay_delay_s = 0.0
-                            else:
-                                cur.execute("SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));")
-                                delay = cur.fetchone()[0]
-                                self.replay_delay_s = max(0.0, round(float(delay), 2)) if delay is not None else 0.0
-                        else:
-                            self.replay_backlog_bytes = 0
-                            self.replay_delay_s = 0.0
-                    except Exception as e:
-                        self.notes.append(f"Standby lag query error on {self.name}: {e}")
+    # 5. CRITICAL: Slot Lost or Critical WAL Retention
+    if slot_lost or max_slot_retained_bytes >= slot_crit_bytes:
+        retained_mb = round(max_slot_retained_bytes / (1024 * 1024), 1)
+        return Health(
+            code=HEALTH_CODE_SLOT_LOST_OR_CRITICAL,
+            severity=HEALTH_CRITICAL,
+            fact="replication slot lost or retaining dangerous WAL volume",
+            quantified=f"slot WAL: {retained_mb} MB",
+            context="risk of disk exhaustion",
+            hint="pg_drop_replication_slot() or advance standby"
+        )
 
-            # 4. Evidence collection
-            self.collect_evidence()
+    # 6. CRITICAL: Transaction ID Wraparound >= 95%
+    if xid_wraparound_pct >= 95.0:
+        return Health(
+            code=HEALTH_CODE_XID_CRITICAL,
+            severity=HEALTH_CRITICAL,
+            fact="urgent: transaction ID wraparound impending",
+            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
+            context="server forced read-only soon",
+            hint="VACUUM FREEZE in single-user mode"
+        )
 
-            # 5. Per-node tables
-            self.activity_row = self.collect_node_activity()
-            self.io_row = self.collect_node_io()
-            self.transactions_row = self.collect_node_transactions()
-            self.checkpoints_row = self.collect_node_checkpoints()
-            if not self.is_primary:
-                self.conflicts_row = self.collect_standby_conflicts()
-            else:
-                self.conflicts_row = None
+    # -------------------------------------------------------------------------
+    # WARNINGS
+    # -------------------------------------------------------------------------
+    # 7. WARN: Any Node Down
+    if nodes_up < nodes_total:
+        return Health(
+            code=HEALTH_CODE_NODE_DOWN,
+            severity=HEALTH_WARN,
+            fact=f"{nodes_total - nodes_up} cluster node(s) unreachable",
+            quantified=f"{nodes_up}/{nodes_total} up",
+            context=f"primary: {primary_name}",
+            hint="inspect offline node postmaster"
+        )
 
-        except Exception as e:
-            self.is_up = False
-            self.notes.append(f"Node probe error on {self.name}: {e}")
-        return self
+    # 8. WARN: Standby Lag High
+    if max_replay_lag_s > replay_warn_s or max_replay_backlog_b > replay_warn_b:
+        lag_txt = f"{max_replay_lag_s:.1f}s" if max_replay_lag_s > replay_warn_s else f"{max_replay_backlog_b // (1024*1024)} MB"
+        return Health(
+            code=HEALTH_CODE_STANDBY_LAG_HIGH,
+            severity=HEALTH_WARN,
+            fact="standby replay lag exceeds threshold",
+            quantified=f"lag: {lag_txt}",
+            context=f"threshold: {replay_warn_s}s",
+            hint="check standby I/O saturation"
+        )
 
-    def collect_node_activity(self):
-        """Builds a row for Node_Activity table using standalone parameter aliases."""
-        row = {"name": self.name, "status": 1}
-        if not self.is_up:
-            row["status"] = 0
-            return row
+    # 9. WARN: Inactive Slot or Warn WAL Retention
+    if inactive_slots > 0 or max_slot_retained_bytes >= slot_warn_bytes:
+        return Health(
+            code=HEALTH_CODE_INACTIVE_SLOT_WARN,
+            severity=HEALTH_WARN,
+            fact=f"{inactive_slots} inactive slot(s) retaining WAL",
+            quantified=f"{max_slot_retained_bytes // (1024*1024)} MB",
+            context="WAL accumulating",
+            hint="verify slot consumer is running"
+        )
 
-        try:
-            with self.conn.cursor() as cur:
-                row["active_connections"] = self.connections if self.connections is not None else 0
+    # 10. WARN: Timeline Mismatch
+    if timeline_spread > 0:
+        return Health(
+            code=HEALTH_CODE_TIMELINE_MISMATCH,
+            severity=HEALTH_WARN,
+            fact="timeline disagreement across cluster nodes",
+            quantified=f"spread: {timeline_spread}",
+            context="stale standby on old timeline",
+            hint="pg_rewind standby to primary"
+        )
 
-                cur.execute("select setting::int max_connections from pg_settings where name=$$max_connections$$;")
-                row["max_connections"] = int(cur.fetchone()[0])
+    # 11. WARN: Recent Failover within Window
+    if 0 <= failover_age_s <= failover_window_s:
+        age_m = failover_age_s // 60
+        return Health(
+            code=HEALTH_CODE_RECENT_FAILOVER,
+            severity=HEALTH_WARN,
+            fact="recent failover occurred within warning window",
+            quantified=f"{age_m}m ago",
+            context=f"promoted: {primary_name}",
+            hint="verify previous primary re-joined as standby"
+        )
 
-                cur.execute("SELECT count(*) - ( SELECT count(*) FROM pg_stat_activity WHERE state = 'idle' ) as active_queries FROM pg_stat_activity;")
-                row["active_queries"] = int(cur.fetchone()[0])
+    # 12. WARN: XID Wraparound >= 70%
+    if xid_wraparound_pct >= 70.0:
+        return Health(
+            code=HEALTH_CODE_XID_WARN,
+            severity=HEALTH_WARN,
+            fact="autovacuum freeze required soon",
+            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
+            context="approaching freeze max age",
+            hint="check autovacuum settings"
+        )
 
-                cur.execute("SELECT count(*) as active_waiting_queries FROM pg_stat_activity WHERE state = 'active' AND wait_event IS NOT NULL;")
-                row["active_waiting_queries"] = int(cur.fetchone()[0])
+    # 13. WARN: High Connection Saturation >= 90%
+    if conn_saturation_pct >= 90.0:
+        return Health(
+            code=HEALTH_CODE_HIGH_CONNECTIONS,
+            severity=HEALTH_WARN,
+            fact="connection pool near exhaustion",
+            quantified=f"{conn_saturation_pct:.1f}% used",
+            context="max_connections threshold",
+            hint="scale connection pooler (pgBouncer)"
+        )
 
-                cur.execute("SELECT count(*) as transactions_open FROM pg_stat_activity WHERE xact_start IS NOT NULL;")
-                row["transactions_open"] = int(cur.fetchone()[0])
+    # 14. WARN: Archiver Failures Accumulating
+    if archive_failed > 0:
+        return Health(
+            code=HEALTH_CODE_ARCHIVE_FAILING,
+            severity=HEALTH_WARN,
+            fact="WAL archiver errors detected",
+            quantified=f"{archive_failed} failed archives",
+            context="backup continuity at risk",
+            hint="check archive_command script & storage"
+        )
 
-                cur.execute("SELECT COUNT(*) as transactions_idle_in_transaction FROM pg_stat_activity WHERE state = 'idle in transaction';")
-                row["idle_in_txn_count"] = int(cur.fetchone()[0])
+    # 15. WARN: Stale Statistics
+    if stale_stats > 0:
+        return Health(
+            code=HEALTH_CODE_STALE_STATS,
+            severity=HEALTH_WARN,
+            fact="tables with stale statistics detected",
+            quantified=f"{stale_stats} tables",
+            context="query planner degraded",
+            hint="run ANALYZE"
+        )
 
-                cur.execute("SELECT COUNT(*) as locks_count FROM pg_locks;")
-                row["locks_count"] = int(cur.fetchone()[0])
+    # Healthy OK State
+    return Health(
+        code=HEALTH_CODE_OK,
+        severity=HEALTH_OK,
+        fact=f"Cluster healthy: {nodes_up}/{nodes_total} nodes active",
+        quantified=f"timeline {timeline}",
+        context=f"primary: {primary_name}",
+        hint="none"
+    )
 
-                cur.execute("SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - xact_start)))::bigint, 0) FROM pg_stat_activity WHERE state <> 'idle';")
-                row["oldest_xact_age_s"] = int(cur.fetchone()[0])
 
-                cur.execute("SELECT FLOOR(EXTRACT(EPOCH FROM current_timestamp - pg_postmaster_start_time())) as uptime;")
-                row["uptime"] = int(cur.fetchone()[0])
-        except Exception as e:
-            self.notes.append(f"Node_Activity error on {self.name}: {e}")
-            row["status"] = 0
-        return row
+# -----------------------------------------------------------------------------
+# 2. TAB DEFINITIONS (Exact 8 Tabs, strict order)
+# -----------------------------------------------------------------------------
+TAB_ORDER = [
+    "Diagnosis",
+    "Primary",
+    "Nodes",
+    "Replication",
+    "Health & Capacity",
+    "Performance",
+    "WAL & Archiver",
+    "Workload",
+]
 
-    def collect_node_io(self):
-        """Builds a row for Node_IO table (15 columns max, strictly within limits)."""
-        row = {"name": self.name, "status": 1}
-        if not self.is_up:
-            row["status"] = 0
-            return row
+# -----------------------------------------------------------------------------
+# 3. METRIC CATALOGUE (Single Source of Truth)
+# -----------------------------------------------------------------------------
+# Every top-level metric MUST be declared here.
+# units{} and tabs{} are programmatically generated from this structure.
+METRICS: List[Dict[str, Any]] = [
+    # -------------------------------------------------------------------------
+    # TAB 1: Diagnosis (Cluster overview, health code, timelines, failover)
+    # -------------------------------------------------------------------------
+    {"name": "Cluster_Health", "unit": "health", "tab": "Diagnosis", "type": int,
+     "desc": "Cluster health severity: 0=OK, 1=WARN, 2=CRITICAL"},
+    {"name": "Health_Code", "unit": "code", "tab": "Diagnosis", "type": int,
+     "desc": "Stable numeric health condition code for alerting"},
+    {"name": "Cluster_Role", "unit": "role", "tab": "Diagnosis", "type": int,
+     "desc": "Observed role of target cluster entry point"},
+    {"name": "Topology_Type", "unit": "topology", "tab": "Diagnosis", "type": int,
+     "desc": "Detected cluster manager: 1=Patroni, 2=repmgr, 3=Native Physical, etc."},
+    {"name": "Nodes_Total", "unit": "nodes", "tab": "Diagnosis", "type": int,
+     "desc": "Total active and historical nodes tracked in cluster"},
+    {"name": "Nodes_Up", "unit": "nodes", "tab": "Diagnosis", "type": int,
+     "desc": "Number of currently reachable nodes"},
+    {"name": "Nodes_Down", "unit": "nodes", "tab": "Diagnosis", "type": int,
+     "desc": "Number of currently unreachable or offline nodes"},
+    {"name": "Nodes_Omitted", "unit": "nodes", "tab": "Diagnosis", "type": int,
+     "desc": "Nodes omitted beyond the 25-row Site24x7 limit"},
+    {"name": "Primary_Timeline", "unit": "timeline", "tab": "Diagnosis", "type": int,
+     "desc": "Current timeline ID of the primary node"},
+    {"name": "Timeline_Spread", "unit": "timelines", "tab": "Diagnosis", "type": int,
+     "desc": "Spread between maximum and minimum observed node timelines"},
+    {"name": "Failover_Age_s", "unit": "seconds", "tab": "Diagnosis", "type": int,
+     "desc": "Seconds elapsed since the last detected failover"},
+    {"name": "Failover_Count_24h", "unit": "failovers", "tab": "Diagnosis", "type": int,
+     "desc": "Total failovers detected in the last 24 hours"},
+    {"name": "Collect_Warnings", "unit": "warnings", "tab": "Diagnosis", "type": int,
+     "desc": "Number of non-fatal warnings encountered during collection"},
+    {"name": "Auth_Failure_Flag", "unit": "flag", "tab": "Diagnosis", "type": int,
+     "desc": "1 if authentication failure occurred on any node, 0 otherwise"},
 
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT sum(tup_inserted), sum(tup_updated), sum(tup_deleted), sum(tup_fetched), sum(tup_returned), sum(blks_read), sum(blks_hit) FROM pg_stat_database;")
-                r = cur.fetchone()
-                row["rows_inserted"] = int(r[0] or 0)
-                row["rows_updated"] = int(r[1] or 0)
-                row["rows_deleted"] = int(r[2] or 0)
-                row["rows_fetched"] = int(r[3] or 0)
-                row["rows_returned"] = int(r[4] or 0)
-                row["block_reads"] = int(r[5] or 0)
-                row["block_hits"] = int(r[6] or 0)
+    # String metrics in Diagnosis tab
+    {"name": "Health_Reason", "unit": "text", "tab": "Diagnosis", "type": str,
+     "desc": "Concise explanation of current health code"},
+    {"name": "First_Attention_Node", "unit": "node", "tab": "Diagnosis", "type": str,
+     "desc": "First node requiring operator attention"},
+    {"name": "First_Attention_Reason", "unit": "text", "tab": "Diagnosis", "type": str,
+     "desc": "Why First_Attention_Node requires intervention"},
+    {"name": "Action_Hint", "unit": "action", "tab": "Diagnosis", "type": str,
+     "desc": "Suggested remediation command or action"},
+    {"name": "Last_Failover_To", "unit": "node", "tab": "Diagnosis", "type": str,
+     "desc": "Node promoted in the most recent failover"},
 
-                cur.execute("SELECT sum(heap_blks_read) as heap_blocks_read, sum(heap_blks_hit) as heap_blocks_hit, CASE WHEN (sum(heap_blks_hit) + sum(heap_blks_read)) = 0 THEN 0 ELSE sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) END as cache_hit_ratio FROM pg_statio_user_tables;")
-                r = cur.fetchone()
-                row["heap_blocks_read"] = int(r[0] or 0)
-                row["heap_blocks_hit"] = int(r[1] or 0)
-                row["cache_hit_ratio"] = float(round(float(r[2] or 0.0), 4))
+    # -------------------------------------------------------------------------
+    # TAB 2: Primary (Core health, clamping, and activity of primary node)
+    # -------------------------------------------------------------------------
+    {"name": "Primary_Up", "unit": "flag", "tab": "Primary", "type": int,
+     "desc": "1 if primary node is reachable and serving, 0 if down"},
+    {"name": "Primary_Data_Age_s", "unit": "seconds", "tab": "Primary", "type": int,
+     "desc": "Age of primary metrics in seconds (0 when live)"},
+    {"name": "Primary_Data_Stale", "unit": "flag", "tab": "Primary", "type": int,
+     "desc": "1 if primary data exceeds clamp TTL (1800s), 0 otherwise"},
+    {"name": "Primary_Uptime_s", "unit": "seconds", "tab": "Primary", "type": int,
+     "desc": "Primary PostgreSQL postmaster uptime in seconds"},
+    {"name": "Primary_Connections", "unit": "connections", "tab": "Primary", "type": int,
+     "desc": "Active client connections on primary"},
+    {"name": "Primary_Max_Connections", "unit": "connections", "tab": "Primary", "type": int,
+     "desc": "max_connections configuration setting on primary"},
+    {"name": "Primary_Connection_Pct", "unit": "%", "tab": "Primary", "type": float,
+     "desc": "Connection utilization percentage on primary"},
+    {"name": "Primary_Active_Queries", "unit": "queries", "tab": "Primary", "type": int,
+     "desc": "Queries currently in active execution on primary"},
+    {"name": "Primary_Idle_In_Txn", "unit": "connections", "tab": "Primary", "type": int,
+     "desc": "Connections currently in idle-in-transaction on primary"},
+    {"name": "Primary_Longest_Txn_s", "unit": "seconds", "tab": "Primary", "type": int,
+     "desc": "Duration of longest running transaction on primary"},
+    {"name": "Primary_Blocked_Locks", "unit": "locks", "tab": "Primary", "type": int,
+     "desc": "Sessions waiting on lock acquisition on primary"},
+    {"name": "Primary_Commits_s", "unit": "txns/s", "tab": "Primary", "type": float,
+     "desc": "Transaction commits per second on primary"},
+    {"name": "Primary_Rollbacks_s", "unit": "txns/s", "tab": "Primary", "type": float,
+     "desc": "Transaction rollbacks per second on primary"},
+    {"name": "Primary_Tup_Inserted_s", "unit": "rows/s", "tab": "Primary", "type": float,
+     "desc": "Tuples inserted per second on primary"},
+    {"name": "Primary_Tup_Updated_s", "unit": "rows/s", "tab": "Primary", "type": float,
+     "desc": "Tuples updated per second on primary"},
+    {"name": "Primary_Tup_Deleted_s", "unit": "rows/s", "tab": "Primary", "type": float,
+     "desc": "Tuples deleted per second on primary"},
+    {"name": "Primary_Cache_Hit_Ratio", "unit": "%", "tab": "Primary", "type": float,
+     "desc": "Buffer pool cache hit ratio on primary"},
+    {"name": "Primary_Blks_Read_s", "unit": "blocks/s", "tab": "Primary", "type": float,
+     "desc": "Disk blocks read per second on primary"},
+    {"name": "Primary_WAL_LSN_MB", "unit": "MB", "tab": "Primary", "type": float,
+     "desc": "Primary current WAL write position converted to megabytes"},
+    {"name": "Primary_WAL_Rate_MBs", "unit": "MB/s", "tab": "Primary", "type": float,
+     "desc": "Primary WAL bytes generated per second"},
+    {"name": "Primary_WAL_Dir_MB", "unit": "MB", "tab": "Primary", "type": float,
+     "desc": "Total disk space used by pg_wal directory on primary"},
+    {"name": "Primary_Checkpoints_Req_1h", "unit": "checkpoints", "tab": "Primary", "type": int,
+     "desc": "Requested checkpoints in the last hour on primary"},
+    {"name": "Primary_Checkpoint_Write_ms", "unit": "ms", "tab": "Primary", "type": float,
+     "desc": "Average checkpoint write time in milliseconds"},
+    {"name": "Primary_Dead_Tuples", "unit": "tuples", "tab": "Primary", "type": int,
+     "desc": "Estimated dead tuples awaiting vacuum on primary"},
+    {"name": "Primary_XID_Age", "unit": "txns", "tab": "Primary", "type": int,
+     "desc": "Maximum transaction ID age relative to freeze horizon"},
+    {"name": "Primary_XID_Wraparound_Pct", "unit": "%", "tab": "Primary", "type": float,
+     "desc": "Percentage toward autovacuum_freeze_max_age wraparound"},
+    {"name": "Primary_Archive_Ok", "unit": "files", "tab": "Primary", "type": int,
+     "desc": "Total WAL segments successfully archived"},
+    {"name": "Primary_Archive_Failed", "unit": "files", "tab": "Primary", "type": int,
+     "desc": "Total WAL segments that failed archiving"},
+    {"name": "Primary_Archive_Ready", "unit": "files", "tab": "Primary", "type": int,
+     "desc": "WAL segments waiting to be archived (.ready)"},
+    {"name": "Primary_Archive_Lag_s", "unit": "seconds", "tab": "Primary", "type": int,
+     "desc": "Seconds elapsed since last successful WAL archive"},
+    {"name": "Primary_Sessions_Killed", "unit": "sessions", "tab": "Primary", "type": int,
+     "desc": "Sessions terminated due to conflicts or timeouts"},
+    {"name": "Primary_Stat_Stale", "unit": "flag", "tab": "Primary", "type": int,
+     "desc": "1 if pg_stat_database stats have not advanced, 0 otherwise"},
 
-                cur.execute("SELECT sum(idx_scan) as index_scans, sum(idx_tup_read) as index_rows_read, sum(idx_tup_fetch) as index_rows_fetched FROM pg_stat_user_indexes;")
-                r = cur.fetchone()
-                row["index_scans"] = int(r[0] or 0)
-                row["index_rows_read"] = int(r[1] or 0)
-                row["index_rows_fetched"] = int(r[2] or 0)
-        except Exception as e:
-            self.notes.append(f"Node_IO error on {self.name}: {e}")
-            row["status"] = 0
-        return row
+    # String metrics in Primary tab
+    {"name": "Primary_Node", "unit": "node", "tab": "Primary", "type": str,
+     "desc": "Name or address of current primary node"},
+    {"name": "Primary_Data_Source", "unit": "source", "tab": "Primary", "type": str,
+     "desc": "Source of primary metrics: live, clamped, or none"},
 
-    def collect_node_transactions(self):
-        """Builds a row for Node_Transactions table using standalone aliases."""
-        row = {"name": self.name, "status": 1}
-        if not self.is_up:
-            row["status"] = 0
-            return row
+    # -------------------------------------------------------------------------
+    # TAB 3: Nodes (Cluster-wide node roll-up)
+    # -------------------------------------------------------------------------
+    {"name": "Standbys_Expected", "unit": "nodes", "tab": "Nodes", "type": int,
+     "desc": "Number of standbys expected to stream from primary"},
+    {"name": "Standbys_Streaming", "unit": "nodes", "tab": "Nodes", "type": int,
+     "desc": "Number of standbys actively streaming WAL from primary"},
+    {"name": "Standby_Disconnect_Flag", "unit": "flag", "tab": "Nodes", "type": int,
+     "desc": "1 if any expected standby is disconnected, 0 otherwise"},
+    {"name": "Sync_Standby_Count", "unit": "nodes", "tab": "Nodes", "type": int,
+     "desc": "Number of synchronous standbys currently connected"},
+    {"name": "Cascading_Standby_Count", "unit": "nodes", "tab": "Nodes", "type": int,
+     "desc": "Number of cascading standbys connected to replicas"},
+    {"name": "Delayed_Standby_Count", "unit": "nodes", "tab": "Nodes", "type": int,
+     "desc": "Number of deliberately delayed standbys configured"},
+    {"name": "Max_Replay_Lag_s", "unit": "seconds", "tab": "Nodes", "type": float,
+     "desc": "Maximum replay lag across all active standbys in seconds"},
+    {"name": "Max_Replay_Backlog", "unit": "bytes", "tab": "Nodes", "type": int,
+     "desc": "Maximum replay byte backlog across all standbys"},
+    {"name": "Worst_Conn_Pct", "unit": "%", "tab": "Nodes", "type": float,
+     "desc": "Highest connection utilization percentage among all nodes"},
+    {"name": "Slowest_Resp_ms", "unit": "ms", "tab": "Nodes", "type": float,
+     "desc": "Slowest node response time in milliseconds"},
 
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT sum(xact_commit), sum(xact_rollback), sum(conflicts) FROM pg_stat_database;")
-                r = cur.fetchone()
-                row["commits"] = int(r[0] or 0)
-                row["rollbacks"] = int(r[1] or 0)
-                row["conflicts"] = int(r[2] or 0)
+    # String metrics in Nodes tab
+    {"name": "Worst_Conn_Node", "unit": "node", "tab": "Nodes", "type": str,
+     "desc": "Node experiencing highest connection saturation"},
+    {"name": "Slowest_Node", "unit": "node", "tab": "Nodes", "type": str,
+     "desc": "Node exhibiting slowest response time during probe"},
 
-                major_version = int(self.server_version_num % 1000000 / 10000)
-                if major_version >= 14:
-                    cur.execute("SELECT SUM(sessions), SUM(sessions_abandoned), SUM(sessions_fatal), SUM(sessions_killed) FROM pg_stat_database;")
-                    r = cur.fetchone()
-                    row["sessions"] = int(r[0] or 0)
-                    row["sessions_abandoned"] = int(r[1] or 0)
-                    row["sessions_fatal"] = int(r[2] or 0)
-                    row["sessions_killed"] = int(r[3] or 0)
-                else:
-                    row["sessions"] = 0
-                    row["sessions_abandoned"] = 0
-                    row["sessions_fatal"] = 0
-                    row["sessions_killed"] = 0
-        except Exception as e:
-            self.notes.append(f"Node_Transactions error on {self.name}: {e}")
-            row["status"] = 0
-        return row
+    # -------------------------------------------------------------------------
+    # TAB 4: Replication (Replication slots, mesh, and logical telemetry)
+    # -------------------------------------------------------------------------
+    {"name": "Replication_Slots_Total", "unit": "slots", "tab": "Replication", "type": int,
+     "desc": "Total physical and logical replication slots"},
+    {"name": "Replication_Slots_Active", "unit": "slots", "tab": "Replication", "type": int,
+     "desc": "Active replication slots currently streaming"},
+    {"name": "Inactive_Slots_Count", "unit": "slots", "tab": "Replication", "type": int,
+     "desc": "Inactive replication slots retaining WAL"},
+    {"name": "Max_Slot_Retained_MB", "unit": "MB", "tab": "Replication", "type": float,
+     "desc": "Maximum WAL retained by any single replication slot"},
+    {"name": "Slot_Risk", "unit": "risk", "tab": "Replication", "type": int,
+     "desc": "Highest slot risk: 0=OK, 1=WARN, 2=CRITICAL, 3=LOST"},
+    {"name": "Logical_Replication_Used", "unit": "flag", "tab": "Replication", "type": int,
+     "desc": "1 if logical subscriptions or publications exist, 0 otherwise"},
+    {"name": "Mesh_Links_Declared", "unit": "links", "tab": "Replication", "type": int,
+     "desc": "Total mesh links declared in active-active topology"},
+    {"name": "Mesh_Links_Active", "unit": "links", "tab": "Replication", "type": int,
+     "desc": "Active streaming mesh links"},
+    {"name": "Mesh_Disconnect_Flag", "unit": "flag", "tab": "Replication", "type": int,
+     "desc": "1 if any declared mesh link is disconnected, 0 otherwise"},
+    {"name": "Max_Logical_Lag_s", "unit": "seconds", "tab": "Replication", "type": float,
+     "desc": "Maximum lag across logical subscriptions"},
+    {"name": "Subscription_Apply_Errors", "unit": "errors", "tab": "Replication", "type": int,
+     "desc": "Cumulative subscription apply errors from pg_stat_subscription_stats"},
+    {"name": "Subscription_Conflicts", "unit": "conflicts", "tab": "Replication", "type": int,
+     "desc": "Cumulative subscription conflict count"},
 
-    def collect_node_checkpoints(self):
-        """Builds a row for Node_Checkpoints table supporting PG 17+ and PG <= 16."""
-        row = {"name": self.name, "status": 1}
-        if not self.is_up:
-            row["status"] = 0
-            return row
+    # -------------------------------------------------------------------------
+    # TAB 5: Health & Capacity (Storage, connection, and freeze limits)
+    # -------------------------------------------------------------------------
+    {"name": "XID_Wraparound_Pct", "unit": "%", "tab": "Health & Capacity", "type": float,
+     "desc": "Cluster-wide maximum XID wraparound percentage"},
+    {"name": "Max_Temp_MB", "unit": "MB", "tab": "Health & Capacity", "type": float,
+     "desc": "Maximum temporary file usage across databases"},
+    {"name": "Stale_Stats_Tables", "unit": "tables", "tab": "Health & Capacity", "type": int,
+     "desc": "Tables with stale statistics requiring analyze"},
+    {"name": "Dead_Tuples_Total", "unit": "tuples", "tab": "Health & Capacity", "type": int,
+     "desc": "Total dead tuples awaiting autovacuum across databases"},
+    {"name": "Long_Running_Queries", "unit": "queries", "tab": "Health & Capacity", "type": int,
+     "desc": "Queries executing longer than warning threshold (60s)"},
+    {"name": "Blocked_Sessions", "unit": "sessions", "tab": "Health & Capacity", "type": int,
+     "desc": "Total sessions currently blocked waiting on locks"},
+    {"name": "Connection_Saturation_Pct", "unit": "%", "tab": "Health & Capacity", "type": float,
+     "desc": "Maximum connection pool saturation percent across cluster"},
+    {"name": "PGWAL_Used_Pct", "unit": "%", "tab": "Health & Capacity", "type": float,
+     "desc": "pg_wal disk volume usage percentage when accessible"},
 
-        try:
-            with self.conn.cursor() as cur:
-                is_pg17 = self.server_version_num >= 170000
-                if is_pg17:
-                    cur.execute("""
-                        SELECT c.num_timed AS checkpoints_timed, c.num_requested AS checkpoints_req,
-                               c.write_time AS checkpoint_write_time, c.sync_time AS checkpoint_sync_time,
-                               c.buffers_written AS buffers_checkpoint, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc
-                        FROM pg_stat_checkpointer c, pg_stat_bgwriter b;
-                    """)
-                    r = cur.fetchone()
-                    row["checkpoints_timed"] = int(r[0] or 0)
-                    row["checkpoints_req"] = int(r[1] or 0)
-                    row["checkpoint_write_time"] = int(r[2] or 0)
-                    row["checkpoint_sync_time"] = int(r[3] or 0)
-                    row["buffers_checkpoint"] = int(r[4] or 0)
-                    row["buffers_clean"] = int(r[5] or 0)
-                    row["maxwritten_clean"] = int(r[6] or 0)
-                    row["buffers_alloc"] = int(r[7] or 0)
-                else:
-                    cur.execute("""
-                        SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, checkpoint_sync_time,
-                               buffers_checkpoint, buffers_clean, maxwritten_clean,
-                               buffers_backend, buffers_backend_fsync, buffers_alloc
-                        FROM pg_stat_bgwriter;
-                    """)
-                    r = cur.fetchone()
-                    row["checkpoints_timed"] = int(r[0] or 0)
-                    row["checkpoints_req"] = int(r[1] or 0)
-                    row["checkpoint_write_time"] = int(r[2] or 0)
-                    row["checkpoint_sync_time"] = int(r[3] or 0)
-                    row["buffers_checkpoint"] = int(r[4] or 0)
-                    row["buffers_clean"] = int(r[5] or 0)
-                    row["maxwritten_clean"] = int(r[6] or 0)
-                    row["buffers_backend"] = int(r[7] or 0)
-                    row["buffers_backend_fsync"] = int(r[8] or 0)
-                    row["buffers_alloc"] = int(r[9] or 0)
-        except Exception as e:
-            self.notes.append(f"Node_Checkpoints error on {self.name}: {e}")
-            row["status"] = 0
-        return row
+    # -------------------------------------------------------------------------
+    # TAB 6: Performance (Throughput, buffer pool, checkpoints, background writer)
+    # -------------------------------------------------------------------------
+    {"name": "Cache_Hit_Ratio", "unit": "%", "tab": "Performance", "type": float,
+     "desc": "Cluster buffer pool cache hit ratio"},
+    {"name": "Index_Hit_Ratio", "unit": "%", "tab": "Performance", "type": float,
+     "desc": "Index scan buffer hit ratio"},
+    {"name": "Blks_Read_s", "unit": "blocks/s", "tab": "Performance", "type": float,
+     "desc": "Disk blocks read per second"},
+    {"name": "Blks_Hit_s", "unit": "blocks/s", "tab": "Performance", "type": float,
+     "desc": "Buffer pool hits per second"},
+    {"name": "Checkpoints_Timed", "unit": "checkpoints", "tab": "Performance", "type": int,
+     "desc": "Scheduled checkpoints completed"},
+    {"name": "Checkpoints_Req", "unit": "checkpoints", "tab": "Performance", "type": int,
+     "desc": "Forced/requested checkpoints completed"},
+    {"name": "Checkpoint_Write_ms", "unit": "ms", "tab": "Performance", "type": float,
+     "desc": "Average checkpoint write duration in milliseconds"},
+    {"name": "Buffers_Backend", "unit": "buffers", "tab": "Performance", "type": int,
+     "desc": "Buffers written directly by backends instead of bgwriter"},
+    {"name": "Maxwritten_Clean", "unit": "events", "tab": "Performance", "type": int,
+     "desc": "Times bgwriter stopped clean scan because it wrote too many buffers"},
+    {"name": "Backend_Fsync", "unit": "events", "tab": "Performance", "type": int,
+     "desc": "Times a backend had to execute its own fsync"},
+    {"name": "Seq_Scans_s", "unit": "scans/s", "tab": "Performance", "type": float,
+     "desc": "Sequential table scans per second"},
+    {"name": "Idx_Scans_s", "unit": "scans/s", "tab": "Performance", "type": float,
+     "desc": "Index scans per second"},
 
-    def collect_standby_conflicts(self):
-        """Builds a row for Standby_Conflicts table for a standby node."""
-        row = {"name": self.name, "status": 1}
-        if not self.is_up:
-            row["status"] = 0
-            return row
+    # -------------------------------------------------------------------------
+    # TAB 7: WAL & Archiver (WAL generation, archiving status)
+    # -------------------------------------------------------------------------
+    {"name": "WAL_LSN_MB", "unit": "MB", "tab": "WAL & Archiver", "type": float,
+     "desc": "Total WAL bytes written mapped to megabytes"},
+    {"name": "WAL_Rate_MBs", "unit": "MB/s", "tab": "WAL & Archiver", "type": float,
+     "desc": "Cluster-wide WAL production rate in MB per second"},
+    {"name": "WAL_Dir_MB", "unit": "MB", "tab": "WAL & Archiver", "type": float,
+     "desc": "Current total size of pg_wal directory"},
+    {"name": "Archive_Success", "unit": "files", "tab": "WAL & Archiver", "type": int,
+     "desc": "Total WAL segments successfully archived"},
+    {"name": "Archive_Failed", "unit": "files", "tab": "WAL & Archiver", "type": int,
+     "desc": "Failed WAL archive attempts"},
+    {"name": "Archive_Ready", "unit": "files", "tab": "WAL & Archiver", "type": int,
+     "desc": "WAL segments currently pending archive"},
 
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                    SELECT sum(confl_tablespace), sum(confl_lock), sum(confl_snapshot),
-                           sum(confl_bufferpin), sum(confl_deadlock)
-                    FROM pg_stat_database_conflicts;
-                """)
-                r = cur.fetchone()
-                row["confl_tablespace"] = int(r[0] or 0)
-                row["confl_lock"] = int(r[1] or 0)
-                row["confl_snapshot"] = int(r[2] or 0)
-                row["confl_bufferpin"] = int(r[3] or 0)
-                row["confl_deadlock"] = int(r[4] or 0)
-                row["total_conflicts"] = sum([row["confl_tablespace"], row["confl_lock"], row["confl_snapshot"], row["confl_bufferpin"], row["confl_deadlock"]])
-        except Exception as e:
-            self.notes.append(f"Standby_Conflicts error on {self.name}: {e}")
-            row["status"] = 0
-        return row
+    # String metrics in WAL & Archiver tab
+    {"name": "Archive_Mode", "unit": "mode", "tab": "WAL & Archiver", "type": str,
+     "desc": "archive_mode setting: on, off, or always"},
+    {"name": "Last_Archived_WAL", "unit": "file", "tab": "WAL & Archiver", "type": str,
+     "desc": "Filename of most recently archived WAL segment"},
 
-    def collect_evidence(self):
-        """Best-effort cluster manager evidence collection."""
-        evidence = {
-            "extensions": [],
-            "repmgr_table": False,
-            "managed_roles": [],
-            "aurora_version": False,
-            "slot_names": [],
-            "slot_types": [],
-            "app_names": [],
-            "is_in_recovery": not self.is_primary,
-            "upstream": "N/A",
-            "is_cascading": 0,
-            "subscriptions_count": 0,
-            "publications_count": 0,
-            "has_sub": False,
-            "has_pub": False
+    # -------------------------------------------------------------------------
+    # TAB 8: Workload (Databases, sessions, and top wait events)
+    # -------------------------------------------------------------------------
+    {"name": "DB_Count", "unit": "databases", "tab": "Workload", "type": int,
+     "desc": "Number of connectable databases in cluster"},
+    {"name": "DB_Total_Size_MB", "unit": "MB", "tab": "Workload", "type": float,
+     "desc": "Total disk size of all databases combined in MB"},
+    {"name": "Active_Sessions", "unit": "sessions", "tab": "Workload", "type": int,
+     "desc": "Total sessions actively executing queries"},
+    {"name": "Idle_Sessions", "unit": "sessions", "tab": "Workload", "type": int,
+     "desc": "Total connected idle sessions"},
+
+    # String metrics in Workload tab
+    {"name": "Largest_DB", "unit": "database", "tab": "Workload", "type": str,
+     "desc": "Name of largest database by on-disk size"},
+    {"name": "Wait_Event_Top", "unit": "event", "tab": "Workload", "type": str,
+     "desc": "Most frequent non-idle wait event across backends"},
+
+    # -------------------------------------------------------------------------
+    # SELF-INSTRUMENTATION & STATE DIAGNOSTICS (Assigned to Diagnosis Tab)
+    # -------------------------------------------------------------------------
+    {"name": "Collect_Time_ms", "unit": "ms", "tab": "Diagnosis", "type": float,
+     "desc": "Plugin execution time in milliseconds"},
+    {"name": "Queries_Run", "unit": "queries", "tab": "Diagnosis", "type": int,
+     "desc": "Total SQL queries executed this collection cycle"},
+    {"name": "State_Persistent", "unit": "flag", "tab": "Diagnosis", "type": int,
+     "desc": "1 if state file is stored on durable storage, 0 if volatile (/tmp)"},
+    {"name": "State_Age_s", "unit": "seconds", "tab": "Diagnosis", "type": int,
+     "desc": "Seconds since state file was last updated"},
+    {"name": "State_IO_Errors", "unit": "errors", "tab": "Diagnosis", "type": int,
+     "desc": "Cumulative state file read/write I/O errors"},
+    {"name": "Rate_Warmup_Flag", "unit": "flag", "tab": "Diagnosis", "type": int,
+     "desc": "1 during first poll cycle while rate baselines warm up, 0 otherwise"},
+
+    # String diagnostics in Diagnosis tab
+    {"name": "Slowest_Scope", "unit": "scope", "tab": "Diagnosis", "type": str,
+     "desc": "Probe scope that took the longest time to execute"},
+    {"name": "State_File", "unit": "path", "tab": "Diagnosis", "type": str,
+     "desc": "Active filesystem path of the state file (truncated <= 100)"},
+    {"name": "State_Reason", "unit": "reason", "tab": "Diagnosis", "type": str,
+     "desc": "Diagnostic status message for the state store layer"},
+]
+
+# Assert metric budget invariant at module import time
+assert len(METRICS) <= MAX_METRICS, f"Catalogue exceeds {MAX_METRICS} metrics: found {len(METRICS)}"
+
+
+# -----------------------------------------------------------------------------
+# 4. TAB & UNIT GENERATOR
+# -----------------------------------------------------------------------------
+def build_tabs_and_units(metric_defs: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """
+    Programmatically generates the 'tabs' and 'units' dictionaries from the
+    declarative METRICS catalogue to guarantee 100% synchronization.
+    """
+    tabs_dict: Dict[str, Any] = {"tabs": {}}
+    units_dict: Dict[str, str] = {}
+
+    # Initialize tabs in strict specified order
+    for idx, tab_name in enumerate(TAB_ORDER, start=1):
+        tabs_dict["tabs"][tab_name] = {
+            "order": str(idx),
+            "tablist": []
         }
-        if not self.is_up:
-            return evidence
 
-        try:
-            with self.conn.cursor() as cur:
-                try:
-                    cur.execute("SELECT extname FROM pg_extension WHERE extname IN ('repmgr', 'pgautofailover', 'citus', 'pglogical', 'bdr');")
-                    evidence["extensions"] = [r[0] for r in cur.fetchall()]
-                except Exception:
-                    pass
+    for item in metric_defs:
+        name = item["name"]
+        tab = item["tab"]
+        unit = item.get("unit", "")
 
-                try:
-                    cur.execute("SELECT to_regclass('repmgr.nodes');")
-                    r = cur.fetchone()
-                    if r and r[0]:
-                        evidence["repmgr_table"] = True
-                    elif 'repmgr' in evidence.get("extensions", []):
-                        cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
-                        for db_cand in [row[0] for row in cur.fetchall()]:
-                            try:
-                                c = _pg_connect(self.hostname, self.port, self.username, self.password, db_cand)
-                                with c.cursor() as c_cur:
-                                    c_cur.execute("SELECT to_regclass('repmgr.nodes');")
-                                    cr = c_cur.fetchone()
-                                    if cr and cr[0]:
-                                        evidence["repmgr_table"] = True
-                                c.close()
-                                if evidence.get("repmgr_table"):
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-
-                try:
-                    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('rds_superuser', 'azure_pg_admin', 'cloudsqlsuperuser');")
-                    evidence["managed_roles"] = [r[0] for r in cur.fetchall()]
-                except Exception:
-                    pass
-
-                try:
-                    cur.execute("SELECT to_regprocedure('aurora_version()');")
-                    r = cur.fetchone()
-                    if r and r[0]:
-                        evidence["aurora_version"] = True
-                except Exception:
-                    pass
-
-                # Replication slots
-                try:
-                    cur.execute("""
-                        SELECT slot_name,
-                               COALESCE(plugin, 'none'),
-                               COALESCE(slot_type, 'physical'),
-                               CASE WHEN active = true THEN 1 ELSE 0 END,
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0)
-                        FROM pg_replication_slots;
-                    """)
-                    for r in cur.fetchall():
-                        s_name = str(r[0])
-                        s_plug = str(r[1])
-                        s_type = str(r[2])
-                        s_act = int(r[3] or 0)
-                        s_ret = max(0, int(r[4] or 0))
-                        evidence["slot_names"].append(s_name)
-                        evidence["slot_types"].append(s_type)
-                        self.logical_slots.append({
-                            "slot_name": s_name,
-                            "plugin": s_plug,
-                            "slot_type": s_type,
-                            "active": s_act,
-                            "wal_retained_bytes": s_ret
-                        })
-                except Exception:
-                    pass
-
-                # Publications
-                try:
-                    cur.execute("SELECT pubname FROM pg_publication;")
-                    self.publications = [str(r[0]) for r in cur.fetchall()]
-                except Exception:
-                    self.publications = []
-
-                # Subscriptions & subscription stats
-                try:
-                    cur.execute("""
-                        SELECT s.subname,
-                               s.subenabled,
-                               COALESCE(s.subconninfo, ''),
-                               st.pid,
-                               COALESCE(st.received_lsn::text, ''),
-                               ROUND(COALESCE(EXTRACT(EPOCH FROM (now() - st.last_msg_receipt_time)), 0)::numeric, 2),
-                               COALESCE(stats.apply_error_count, 0),
-                               COALESCE(stats.sync_error_count, 0)
-                        FROM pg_subscription s
-                        LEFT JOIN pg_stat_subscription st ON s.oid = st.subid
-                        LEFT JOIN pg_stat_subscription_stats stats ON s.oid = stats.subid;
-                    """)
-                    for r in cur.fetchall():
-                        sname, senabled, sconn, spid, s_rlsn, s_delay, a_err, s_err = r
-                        is_act = 1 if (senabled and spid and int(spid) > 0) else 0
-                        self.subscriptions.append({
-                            "subname": str(sname),
-                            "enabled": bool(senabled),
-                            "conninfo": str(sconn),
-                            "pid": int(spid) if spid else None,
-                            "active": is_act,
-                            "received_lsn": str(s_rlsn),
-                            "receipt_delay_s": float(s_delay or 0.0),
-                            "apply_error_count": int(a_err or 0),
-                            "sync_error_count": int(s_err or 0)
-                        })
-                except Exception:
-                    try:
-                        cur.execute("""
-                            SELECT st.subname,
-                                   st.pid,
-                                   COALESCE(st.received_lsn::text, ''),
-                                   ROUND(COALESCE(EXTRACT(EPOCH FROM (now() - st.last_msg_receipt_time)), 0)::numeric, 2)
-                            FROM pg_stat_subscription st;
-                        """)
-                        for r in cur.fetchall():
-                            sname, spid, s_rlsn, s_delay = r
-                            is_act = 1 if (spid and int(spid) > 0) else 0
-                            self.subscriptions.append({
-                                "subname": str(sname),
-                                "enabled": True,
-                                "conninfo": "",
-                                "pid": int(spid) if spid else None,
-                                "active": is_act,
-                                "received_lsn": str(s_rlsn),
-                                "receipt_delay_s": float(s_delay or 0.0),
-                                "apply_error_count": 0,
-                                "sync_error_count": 0
-                            })
-                    except Exception:
-                        pass
-
-                # Logical count
-                evidence["logical_replication_count"] = len(self.publications) + len(self.subscriptions)
-                evidence["subscriptions_count"] = len(self.subscriptions)
-                evidence["publications_count"] = len(self.publications)
-                evidence["has_sub"] = len(self.subscriptions) > 0
-                evidence["has_pub"] = len(self.publications) > 0 or any(s["slot_type"] == "logical" for s in self.logical_slots)
-
-                if not self.is_primary:
-                    try:
-                        cur.execute("SELECT status, sender_host, sender_port, slot_name FROM pg_stat_wal_receiver;")
-                        r = cur.fetchone()
-                        if r:
-                            evidence["wal_receiver_status"] = r[0]
-                            evidence["upstream"] = f"{r[1]}:{r[2]}" if r[1] else "primary"
-                            self.upstream = evidence["upstream"]
-                    except Exception:
-                        pass
-
-                # Walsenders
-                try:
-                    cur.execute("""
-                        SELECT application_name,
-                               COALESCE(client_addr::text, 'unknown'),
-                               COALESCE(state, 'unknown'),
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::numeric, 0),
-                               ROUND(COALESCE(EXTRACT(EPOCH FROM replay_lag), 0)::numeric, 2)
-                        FROM pg_stat_replication;
-                    """)
-                    for r in cur.fetchall():
-                        app_name = str(r[0] or "")
-                        evidence["app_names"].append(app_name)
-                        self.logical_walsenders.append({
-                            "application_name": app_name,
-                            "client_addr": str(r[1]),
-                            "state": str(r[2]),
-                            "replay_lag_bytes": max(0, int(r[3] or 0)),
-                            "replay_lag_s": max(0.0, float(r[4] or 0.0))
-                        })
-                    if not self.is_primary and len(evidence["app_names"]) > 0:
-                        evidence["is_cascading"] = 1
-                        self.is_cascading = 1
-                except Exception:
-                    pass
-
-        except Exception:
-            pass
-
-        self.evidence = evidence
-        return evidence
-
-
-# ---------------------------------------------------------------------------
-# Node discovery: give one address, find every node of the cluster.
-#   1. Patroni      -> GET /cluster on any member (exact: names, hosts, ports, roles)
-#   2. repmgr       -> repmgr.nodes
-#   3. Citus        -> pg_dist_node
-#   4. pg_auto_failover monitor -> pgautofailover.node
-#   5. anything else with streaming replication (plain, Stolon, CloudNativePG, ...)
-#                   -> walk pg_stat_wal_receiver (upstream) and pg_stat_replication (downstream)
-# Standbys found through pg_stat_replication only expose an IP, so the primary's port is assumed.
-# ---------------------------------------------------------------------------
-def validate_cluster_host(raw):
-    """
-    Validates cluster_host: accepts exactly one bare IP address or hostname.
-    Rejects embedded ports, URL prefixes, or multiple nodes with a clear ConfigError.
-    Supports bracketed IPv6 (e.g. [::1]) and bare IPv6 (e.g. ::1).
-    """
-    raw = str(raw or "").strip().strip("'\"")
-    if not raw:
-        return ""
-    if raw.startswith("http://") or raw.startswith("https://"):
-        raise ConfigError(f"cluster_host must be a bare hostname or IP address without URL scheme: '{raw}'.")
-    if "/" in raw:
-        raise ConfigError(f"cluster_host must not include path separators: '{raw}'.")
-    if "," in raw or ";" in raw:
-        raise ConfigError(f"cluster_host must accept only a single bare IP address or hostname without multiple nodes (found '{raw}'). Use the legacy 'nodes' parameter for multiple seed nodes.")
-    if raw.startswith("["):
-        if "]" in raw:
-            end = raw.index("]")
-            rest = raw[end+1:]
-            if rest:
-                raise ConfigError(f"cluster_host must not include embedded ports (found '{raw}'). Use postgres_port and patroni_port to specify custom ports.")
-            inside = raw[1:end].strip()
-            try:
-                import ipaddress
-                ipaddress.IPv6Address(inside)
-                return inside
-            except ValueError:
-                raise ConfigError(f"Invalid IPv6 address in cluster_host: '{inside}'.")
+        if tab in tabs_dict["tabs"]:
+            tabs_dict["tabs"][tab]["tablist"].append(name)
         else:
-            raise ConfigError(f"Unmatched bracket in cluster_host: '{raw}'.")
+            raise ValueError(f"Metric '{name}' assigned to unknown tab '{tab}'")
 
-    # Check if raw is a valid bare IPv6 address (e.g. ::1 or 2001:db8::1)
+        if unit:
+            units_dict[name] = unit
+
+    return tabs_dict, units_dict
+
+
+TABS_DEF, UNITS_DEF = build_tabs_and_units(METRICS)
+
+
+# -----------------------------------------------------------------------------
+# 5. PLATFORM LIMIT VALIDATOR (Shipped in file, executed every cycle)
+# -----------------------------------------------------------------------------
+def validate_output(payload: Dict[str, Any]) -> List[str]:
+    """
+    Enforces all documented Site24x7 platform limits against the generated payload:
+    - <= 10 tables, <= 15 cols, <= 25 rows, <= 5 string cols (incl name)
+    - name <= 520, string cell <= 100
+    - <= 200 metrics
+    - Every tab metric is emitted, and every emitted metric has a unit and a tab
+    - Row status is integer (0 or 1)
+    - No NaN / Infinity values in floats
+    Appends violations to returned list without raising exceptions.
+    """
+    violations: List[str] = []
+
+    # 1. Reserved structural keys
+    for r in ("plugin_version", "heartbeat_required", "status"):
+        if r not in payload:
+            violations.append(f"Missing required top-level key '{r}'")
+
+    if not isinstance(payload.get("status"), int) or payload.get("status") not in (0, 1):
+        violations.append(f"Top-level 'status' must be int 0 or 1, got {payload.get('status')!r}")
+
+    # 2. Table detection & validation
+    tables: Dict[str, List[Dict[str, Any]]] = {}
+    metrics: Dict[str, Any] = {}
+
+    for k, v in payload.items():
+        if k in RESERVED_KEYS:
+            continue
+        if isinstance(v, list) and (not v or all(isinstance(r, dict) for r in v)):
+            tables[k] = v
+        else:
+            metrics[k] = v
+
+    if len(tables) > MAX_TABLES:
+        violations.append(f"Table count {len(tables)} exceeds limit {MAX_TABLES}")
+
+    for tname, rows in tables.items():
+        if len(rows) > MAX_ROWS:
+            violations.append(f"Table '{tname}' row count {len(rows)} exceeds limit {MAX_ROWS}")
+
+        seen_names: Set[str] = set()
+        for idx, row in enumerate(rows):
+            if "name" not in row:
+                violations.append(f"Table '{tname}' row {idx} missing required 'name' column")
+            else:
+                name_str = str(row["name"])
+                if len(name_str) > MAX_NAME_CHARS:
+                    violations.append(f"Table '{tname}' name exceeds {MAX_NAME_CHARS} chars: {len(name_str)}")
+                if name_str in seen_names:
+                    violations.append(f"Table '{tname}' duplicate row name '{name_str}'")
+                seen_names.add(name_str)
+
+            if "status" in row and (not isinstance(row["status"], int) or row["status"] not in (0, 1)):
+                violations.append(f"Table '{tname}' row '{row.get('name')}' status must be int 0 or 1")
+
+            # Check column limits & string columns count
+            if len(row) > MAX_COLUMNS:
+                violations.append(f"Table '{tname}' row '{row.get('name')}' column count {len(row)} > {MAX_COLUMNS}")
+
+            string_cols = [c for c, val in row.items() if isinstance(val, str)]
+            if len(string_cols) > MAX_STRING_COLS:
+                violations.append(f"Table '{tname}' string columns {len(string_cols)} > {MAX_STRING_COLS} (cols: {string_cols})")
+
+            for c, val in row.items():
+                if c != "name" and isinstance(val, str) and len(val) > MAX_STRING_CHARS:
+                    violations.append(f"Table '{tname}' col '{c}' value exceeds {MAX_STRING_CHARS} chars: {len(val)}")
+                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    violations.append(f"Table '{tname}' col '{c}' contains NaN or Infinity")
+
+    # 3. Metric budget & scalar validation
+    if len(metrics) > MAX_METRICS:
+        violations.append(f"Top-level metric count {len(metrics)} exceeds limit {MAX_METRICS}")
+
+    for mname, mval in metrics.items():
+        if mname in RESERVED_KEYS:
+            violations.append(f"Metric name '{mname}' collides with reserved Site24x7 key")
+        if isinstance(mval, float) and (math.isnan(mval) or math.isinf(mval)):
+            violations.append(f"Metric '{mname}' contains NaN or Infinity")
+        if isinstance(mval, str) and len(mval) > MAX_STRING_CHARS:
+            violations.append(f"Metric '{mname}' string value exceeds {MAX_STRING_CHARS} chars")
+
+    # 4. Tab and unit synchronization checks
+    tabs_data = payload.get("tabs", {}).get("tabs", {})
+    units_data = payload.get("units", {})
+
+    all_tab_metrics: Set[str] = set()
+    for t_name, t_content in tabs_data.items():
+        for t_m in t_content.get("tablist", []):
+            all_tab_metrics.add(t_m)
+            if t_m not in metrics and t_m not in tables:
+                violations.append(f"TAB_METRIC_NEVER_EMITTED: '{t_m}' declared in tab '{t_name}' but not emitted")
+            if t_m not in units_data:
+                violations.append(f"TAB_METRIC_NO_UNIT: '{t_m}' declared in tab '{t_name}' has no unit")
+
+    for mname in metrics.keys():
+        if mname not in all_tab_metrics:
+            violations.append(f"EMITTED_METRIC_NO_TAB: '{mname}' emitted but not present in any tab")
+
+    return violations
+
+
+# -----------------------------------------------------------------------------
+# 6. SKELETON EMITTER & ENTRY POINT (Step 0)
+# -----------------------------------------------------------------------------
+def get_empty_payload() -> Dict[str, Any]:
+    """Generates an initial zero-state payload guaranteed to pass all limits."""
+    payload: Dict[str, Any] = {
+        "plugin_version": PLUGIN_VERSION,
+        "heartbeat_required": HEARTBEAT_REQUIRED,
+        "status": STATUS_UP,
+        "units": copy.deepcopy(UNITS_DEF),
+        "tabs": copy.deepcopy(TABS_DEF),
+    }
+
+    # Populate every declared metric with default zero/empty values
+    for m in METRICS:
+        mname = m["name"]
+        mtype = m.get("type", int)
+        if mtype == int:
+            payload[mname] = 0
+        elif mtype == float:
+            payload[mname] = 0.0
+        elif mtype == str:
+            payload[mname] = "none"
+        else:
+            payload[mname] = 0
+
+    return payload
+
+
+def self_test() -> int:
+    """Exercises in-process assertions and validators without database access."""
+    print("=================================================================", flush=True)
+    print(" Site24x7 PostgreSQL Cluster Plugin v5 Self-Test (Skeleton Gate)", flush=True)
+    print("=================================================================", flush=True)
+
+    fails = 0
+
+    def check(desc: str, ok: bool, extra: str = ""):
+        nonlocal fails
+        if ok:
+            print(f"  [PASS] {desc}", flush=True)
+        else:
+            print(f"  [FAIL] {desc} {extra}", flush=True)
+            fails += 1
+
+    # 1. Catalogue Invariants
+    check("Catalogue metric count <= 200", len(METRICS) <= MAX_METRICS, f"got {len(METRICS)}")
+    check("All 8 tabs defined in order", [k for k in TABS_DEF["tabs"].keys()] == TAB_ORDER)
+
+    metric_names = [m["name"] for m in METRICS]
+    check("No duplicate metric names in catalogue", len(metric_names) == len(set(metric_names)))
+    check("No reserved keys used in catalogue", not any(m in RESERVED_KEYS for m in metric_names))
+
+    # 2. Units completeness
+    missing_units = [m["name"] for m in METRICS if m["name"] not in UNITS_DEF]
+    check("Every catalogue metric has an entry in units{}", len(missing_units) == 0, f"missing: {missing_units}")
+
+    # 3. Payload validation
+    payload = get_empty_payload()
+    violations = validate_output(payload)
+    check("Empty payload passes validate_output() with 0 violations", len(violations) == 0, f"violations: {violations}")
+
+    # 4. Failure detection in validate_output
+    bad_payload = copy.deepcopy(payload)
+    bad_payload["tabs"]["tabs"]["Primary"]["tablist"].append("Ghost_Metric")
+    bad_violations = validate_output(bad_payload)
+    check("validate_output catches TAB_METRIC_NEVER_EMITTED", any("Ghost_Metric" in v for v in bad_violations))
+
+    print("=================================================================", flush=True)
+    if fails == 0:
+        print("RESULT: ALL SKELETON TESTS PASSED", flush=True)
+        return 0
+    else:
+        print(f"RESULT: {fails} TEST(S) FAILED", flush=True)
+        return 1
+
+
+def lsn_to_bytes(lsn_val: Any) -> int:
+    """Parses PostgreSQL Log Sequence Number (e.g. '0/3000000') to integer bytes."""
+    if isinstance(lsn_val, (int, float)):
+        return int(lsn_val)
+    if isinstance(lsn_val, str) and "/" in lsn_val:
+        parts = lsn_val.strip().split("/", 1)
+        try:
+            return (int(parts[0], 16) << 32) + int(parts[1], 16)
+        except ValueError:
+            return 0
+    return 0
+
+
+def fetch_patroni_cluster(host: str, port: int, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+    """Fetches cluster topology from Patroni REST API /cluster endpoint."""
+    url = f"http://{normalize_host(host)}:{port}/cluster"
     try:
-        import ipaddress
-        ip = ipaddress.ip_address(raw)
-        if isinstance(ip, ipaddress.IPv6Address):
-            return raw
-    except ValueError:
-        pass
-
-    if ":" in raw:
-        raise ConfigError(f"cluster_host must not include embedded ports (found '{raw}'). Use postgres_port and patroni_port to specify custom ports.")
-    return raw
-
-
-def _norm_host(h):
-    h = str(h).strip().lower()
-    return "127.0.0.1" if h in ("localhost", "::1", "127.0.0.1") else h
-
-
-def _http_host(h):
-    s = str(h).strip()
-    if ":" in s and not s.startswith("["):
-        return f"[{s}]"
-    return s
-
-
-def _http_json(url, timeout=1.5):
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Site24x7-PGCluster'})
+        req = urllib.request.Request(url, headers={"User-Agent": "site24x7_pgcluster"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
-                return json.loads(resp.read().decode('utf-8'))
+                return json.loads(resp.read().decode("utf-8"))
     except Exception:
         pass
     return None
 
 
-def discover_via_patroni(host, patroni_port, address_map=None):
-    """Returns (members, scope) from the Patroni REST API of one member, or ([], None)."""
-    data = _http_json(f"http://{_http_host(host)}:{patroni_port}/cluster")
-    if not data or not isinstance(data.get("members"), list):
-        return [], None
-    members = []
-    for m in data["members"]:
-        name, h, p = m.get("name"), m.get("host"), m.get("port")
-        if not (name and h and p):
-            continue
-        pp = str(patroni_port)
-        mm = re.search(r":(\d+)(?:/|$)", str(m.get("api_url") or ""))
-        if mm:
-            pp = mm.group(1)
-        if address_map:
-            mh, mp = map_address(h, p, address_map)
-            h, p = mh, mp
-            m_pat_h, m_pat_p = map_address(str(m.get("host")), pp, address_map)
-            if m_pat_p:
-                pp = str(m_pat_p)
-        members.append({"alias": safe_name(name), "member": str(name), "host": str(h), "port": int(p),
-                        "patroni_port": pp, "source": "Patroni REST API"})
-    return members, data.get("scope")
-
-
-def _pg_connect(host, port, user, pw, db):
-    import psycopg2
-    conn = psycopg2.connect(dbname=db, user=user, password=pw, host=host,
-                            port=int(port), connect_timeout=2, options="-c statement_timeout=2000")
-    conn.autocommit = True
-    return conn
-
-
-def _conninfo_hostport(conninfo, default_port=None):
-    h = re.search(r"host=([^\s']+)", conninfo or "")
-    p = re.search(r"port=(\d+)", conninfo or "")
-    port_val = int(p.group(1)) if p else default_port
-    return (h.group(1) if h else None), port_val
-
-
-def _default_node_name(host, port):
-    """Name for a node that has no alias: its host name (pg-mm1 gives pgmm1), or host and port when it is an IP address."""
-    h = str(host).strip()
+def fetch_patroni_history(host: str, port: int, timeout: float = 1.0) -> List[List[Any]]:
+    """Fetches failover history from Patroni REST API /history endpoint."""
+    url = f"http://{normalize_host(host)}:{port}/history"
     try:
-        import ipaddress
-        ipaddress.ip_address(h.strip("[]"))
-        is_ip = True
-    except ValueError:
-        is_ip = False
-    if not is_ip and h.lower() != "localhost":
-        name = safe_name(h.split(".")[0])
-        if name:
-            return name
-    return safe_name(f"{h}_{port}")
-
-
-def _name_from_address_map(host, port, address_map):
-    """If this reachable address is the target of an address_map entry, name the node after that entry's own host
-    (pg-mm1:5432=127.0.0.1:5451 gives pgmm1)."""
-    if not address_map:
-        return None
-    try:
-        h, p = str(host).strip().lower(), int(port)
-    except (TypeError, ValueError):
-        return None
-    for key, target in address_map.items():
-        if not isinstance(key, tuple):
-            continue
-        th, _, tp = str(target).partition(":")
-        try:
-            tp_i = int(tp) if tp.strip() else int(key[1])
-        except ValueError:
-            continue
-        if th.strip().lower() == h and tp_i == p:
-            name = safe_name(str(key[0]).split(".")[0])
-            if name:
-                return name
-    return None
-
-
-def _alias_for(host, port, app, taken, address_map=None):
-    """Readable alphanumeric name for a node found without an explicit name."""
-    host = str(host)
-    app_str = str(app or "").strip()
-    mapped = _name_from_address_map(host, port, address_map)
-    if mapped:
-        base = mapped
-    elif app_str and app_str not in ("walreceiver", "") and not app_str.startswith("sub_") and safe_name(app_str):
-        base = safe_name(app_str)
-    else:
-        base = _default_node_name(host, port)
-    name, k = base, 2
-    while name.lower() in taken:
-        name, k = f"{base}{k}", k + 1
-    taken.add(name.lower())
-    return name
-
-
-def _discover_repmgr_members(conn, host, port, user, pw, address_map=None):
-    """
-    Dynamically finds the database containing the repmgr schema by searching pg_database
-    (to_regnamespace or catalog query per database), never by a hard-coded name.
-    Reads repmgr.nodes (node_name, type, conninfo, active) safely without printing/leaking passwords.
-    """
-    repmgr_conn = None
-    close_needed = False
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('repmgr.nodes') IS NOT NULL;")
-            r = cur.fetchone()
-            if r and r[0]:
-                repmgr_conn = conn
+        req = urllib.request.Request(url, headers={"User-Agent": "site24x7_pgcluster"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(data, list):
+                    return data
     except Exception:
         pass
+    return []
 
-    if not repmgr_conn:
+
+def parse_node_specs(raw_nodes: str, default_port: int = 5432) -> List[Tuple[str, str, int]]:
+    """
+    Parses comma-separated node specifications into (name, host, port) tuples.
+    Formats supported:
+    - 'pg1=127.0.0.1:5401,pg2=127.0.0.1:5402'
+    - '127.0.0.1:5432,127.0.0.1:5433'
+    - 'localhost'
+    """
+    specs: List[Tuple[str, str, int]] = []
+    if not raw_nodes:
+        return specs
+    for item in raw_nodes.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name = ""
+        host_port = item
+        if "=" in item:
+            name, host_port = item.split("=", 1)
+            name = name.strip()
+            host_port = host_port.strip()
+        
+        # Parse host and port
+        if ":" in host_port:
+            h, p_str = host_port.rsplit(":", 1)
+            try:
+                p = int(p_str)
+            except ValueError:
+                p = default_port
+                h = host_port
+        else:
+            h = host_port
+            p = default_port
+        
+        if not name:
+            name = f"{normalize_host(h)}:{p}"
+        specs.append((name, normalize_host(h), p))
+    return specs
+
+
+# -----------------------------------------------------------------------------
+# 11. STATE STORE (Inlined atomic, keyed, self-describing state)
+# -----------------------------------------------------------------------------
+STATE_SCHEMA = 1
+MAX_STATE_BYTES = 64 * 1024
+NODE_TTL_DAYS = 7
+DEFAULT_STATE_FILENAME = "postgres_cluster_state.json"
+
+
+def _machine_id() -> str:
+    """Stable per-machine identifier, best effort, never raises."""
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
-                candidates = [row[0] for row in cur.fetchall()]
-            for db_cand in candidates:
-                try:
-                    c = _pg_connect(host, port, user, pw, db_cand)
-                    with c.cursor() as cur:
-                        cur.execute("SELECT to_regclass('repmgr.nodes') IS NOT NULL;")
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            repmgr_conn = c
-                            close_needed = True
-                            break
-                    c.close()
-                except Exception:
-                    continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                val = f.read().strip()
+            if val:
+                return val[:64]
+        except OSError:
+            continue
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+                0,
+                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "MachineGuid")
+                if val:
+                    return str(val)[:64]
         except Exception:
             pass
-
-    if not repmgr_conn:
-        return []
-
-    out = []
     try:
-        with repmgr_conn.cursor() as cur:
-            cur.execute("SELECT node_id, node_name, type, conninfo, active FROM repmgr.nodes ORDER BY node_id;")
-            for _nid, name, ntype, conninfo, active in cur.fetchall():
-                h, p = parse_conninfo_hostport(conninfo)
-                p = p or port
-                if h:
-                    mph, mpp = map_address(h, p, address_map)
-                    role = str(ntype).strip().lower()
-                    out.append({
-                        "alias": safe_name(name),
-                        "member": str(name),
-                        "host": mph,
-                        "port": int(mpp),
-                        "patroni_port": "none",
-                        "role": role,
-                        "active": bool(active),
-                        "source": "repmgr.nodes"
-                    })
+        return "host-" + socket.gethostname()[:48]
     except Exception:
-        pass
+        return "host-unknown"
+
+
+def _safe_token(raw: str, limit: int = 24) -> str:
+    """Filesystem-safe, collision-resistant slug."""
+    keep = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(raw or ""))
+    keep = keep.strip("-")
+    return (keep[:limit] or "cluster")
+
+
+def writable_by_write_probe(directory: str) -> Tuple[bool, str]:
+    """Tests writability using actual file creation instead of os.access()."""
+    if not directory:
+        return False, "no directory"
+    if not os.path.isdir(directory):
+        return False, "not a directory"
+    import uuid
+    probe = os.path.join(directory, f".pgcluster-probe.{uuid.uuid4().hex[:8]}")
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        return False, str(e)
     finally:
-        if close_needed and repmgr_conn:
-            try:
-                repmgr_conn.close()
-            except Exception:
-                pass
-    return out
-
-
-def _managed_members(cur, port):
-    """Exact member lists kept in the catalogs of repmgr, Citus and the pg_auto_failover monitor."""
-    out = []
-    try:
-        cur.execute("SELECT to_regclass('repmgr.nodes');")
-        if cur.fetchone()[0]:
-            cur.execute("SELECT node_name, conninfo FROM repmgr.nodes ORDER BY node_id;")
-            for name, conninfo in cur.fetchall():
-                h, p = _conninfo_hostport(conninfo)
-                if h:
-                    out.append({"alias": safe_name(name), "member": str(name), "host": h, "port": p, "patroni_port": "none", "source": "repmgr.nodes"})
-            if out:
-                return out
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'citus';")
-        if cur.fetchone():
-            cur.execute("SELECT nodename, nodeport, noderole FROM pg_dist_node WHERE isactive ORDER BY nodeid;")
-            for i, (h, p, role) in enumerate(cur.fetchall(), 1):
-                out.append({"alias": safe_name(str(h).split(".")[0]) or safe_name(f"{role}{i}"), "member": f"{role}{i}", "host": str(h), "port": int(p), "patroni_port": "none", "source": "Citus pg_dist_node"})
-            if out:
-                return out
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT to_regclass('pgautofailover.node');")
-        if cur.fetchone()[0]:
-            cur.execute("SELECT nodename, nodehost, nodeport FROM pgautofailover.node ORDER BY nodeid;")
-            for name, h, p in cur.fetchall():
-                out.append({"alias": safe_name(name), "member": str(name), "host": str(h), "port": int(p), "patroni_port": "none", "source": "pgautofailover.node"})
-            if out:
-                return out
-    except Exception:
-        pass
-    return out
-
-
-def _discover_pgpool_members(cur, host, port, address_map=None):
-    """pgpool-II: SHOW POOL_NODES lists every backend it manages. Returns [] when the endpoint is not a pgpool-II."""
-    try:
-        cur.execute("SHOW POOL_NODES;")
-        cols = [str(d[0]).lower() for d in cur.description]
-        rows = cur.fetchall()
-    except Exception:
-        return []
-    out = []
-    for r in rows:
-        row = dict(zip(cols, r))
-        h = str(row.get("hostname") or "").strip()
         try:
-            p = int(row.get("port"))
-        except (TypeError, ValueError):
-            continue
-        if not h:
-            continue
-        if h.startswith("/"):
-            # a backend reached over a unix socket runs on the same machine as pgpool-II
-            h = str(host)
-        mh, mp = map_address(h, p, address_map)
-        alias = _name_from_address_map(mh, mp, address_map) or _default_node_name(h, p)
-        out.append({"alias": alias, "member": alias, "host": mh, "port": mp, "patroni_port": "none",
-                    "source": "pgpool-II SHOW POOL_NODES", "via_proxy": (str(host), int(port))})
-    return out
+            if os.path.exists(probe):
+                os.remove(probe)
+        except OSError:
+            pass
+    return True, "ok"
 
 
-def discover_via_sql(seeds, user, pw, db, deadline, address_map=None, pgpool_hint=False):
-    """Walks the replication topology from the seeds. Returns (members, source)."""
-    queue = [(h, int(p), None) for h, p in seeds]
-    visited, visited_canon, found = set(), set(), OrderedDict()
-    is_logical = False
-    is_pglogical = False
+def ensure_dir(path: str) -> bool:
+    """mkdir -p, True if directory exists afterwards."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return os.path.isdir(path)
+    except OSError:
+        return False
 
-    while queue and time.time() < deadline and len(found) < MAX_NODES:
-        host, port, app = queue.pop(0)
-        key = (_norm_host(host), port)
-        if key in visited:
-            continue
-        visited.add(key)
-        try:
-            conn = _pg_connect(host, port, user, pw, db)
-            check_for_pooler(conn)
-        except ConfigError:
-            raise
-        except Exception:
-            alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()}, address_map)
-            found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
-            continue
-        try:
-            with conn.cursor() as cur:
-                #pgpool-II is only asked on its own port (or when cluster_type is pgpool), so other servers never see the command
-                if pgpool_hint or int(port) == PGPOOL_DEFAULT_PORT:
-                    pool_members = _discover_pgpool_members(cur, host, port, address_map)
-                    if pool_members:
-                        return pool_members, pool_members[0]["source"]
-                managed = _discover_repmgr_members(conn, host, port, user, pw, address_map=address_map)
-                if not managed:
-                    managed = _managed_members(cur, port)
-                if managed:
-                    return managed, managed[0]["source"]
 
-                try:
-                    cur.execute("SELECT host(inet_server_addr()), inet_server_port();")
-                    ra, rp = cur.fetchone()
-                except Exception:
-                    ra, rp = None, None
-                canon = (ra or _norm_host(host), int(rp or port))
-                if canon in visited_canon:
+class StateStore:
+    """Atomic, keyed, self-describing JSON state for monitored cluster."""
+
+    def __init__(
+        self,
+        plugin_file: str,
+        cluster_id: str = "",
+        name: str = "",
+        seed: str = "",
+        state_dir: Optional[str] = None,
+        filename: str = DEFAULT_STATE_FILENAME,
+        allow_temp_fallback: bool = True,
+        warn=None,
+    ):
+        self.plugin_file = plugin_file
+        self.plugin_dir = os.path.dirname(os.path.abspath(plugin_file))
+        self.cluster_id = str(cluster_id or "")
+        self.name = str(name or "")
+        self.seed = str(seed or "")
+        self.filename = filename
+        self.explicit_dir = state_dir or ""
+        self.allow_temp_fallback = allow_temp_fallback
+        self._warn = warn or (lambda code, text: None)
+        self._path: Optional[str] = None
+        self._persistent: Optional[bool] = None
+        self._reason: str = "not probed"
+        self._machine = _machine_id()
+        self._io_errors = 0
+        self._last_written: Optional[float] = None
+
+    def instance_key(self) -> str:
+        """Namespaces the state file to avoid collision across clusters/folders."""
+        identity = self.cluster_id or self.seed or self.name or "unnamed"
+        seed = "|".join([self._machine, identity, self.plugin_dir])
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+
+    def _candidates(self) -> List[Tuple[str, bool, str]]:
+        cands: List[Tuple[str, bool, str]] = []
+        if self.explicit_dir:
+            cands.append((os.path.abspath(self.explicit_dir), True, "configured"))
+        cands.append((self.plugin_dir, True, "plugin_dir"))
+        if os.name == "nt":
+            base = os.environ.get("PROGRAMDATA") or os.environ.get("ALLUSERSPROFILE")
+            if base:
+                cands.append((os.path.join(base, "Site24x7", "postgres_cluster"), True, "programdata"))
+        else:
+            cands.append(("/var/lib/site24x7/postgres_cluster", True, "var_lib"))
+            xdg = os.environ.get("XDG_STATE_HOME") or (
+                os.path.join(os.path.expanduser("~"), ".local", "state") if os.path.expanduser("~") not in ("~", "") else ""
+            )
+            if xdg:
+                cands.append((os.path.join(xdg, "site24x7", "postgres_cluster"), True, "xdg_state"))
+        if self.allow_temp_fallback:
+            cands.append((os.path.join(tempfile.gettempdir(), "site24x7-postgres_cluster"), False, "tempdir"))
+        return cands
+
+    def probe(self, force: bool = False) -> "StateStore":
+        if self._path and not force:
+            return self
+        self._path, self._persistent, self._reason = None, None, "no writable location"
+        for directory, durable, label in self._candidates():
+            if label != "configured" and not os.path.isdir(directory):
+                if not ensure_dir(directory):
                     continue
-                visited_canon.add(canon)
-                alias = _alias_for(host, port, app, {v["alias"].lower() for v in found.values()}, address_map)
-                found[key] = {"alias": alias, "member": alias, "host": host, "port": port, "patroni_port": "none", "source": "streaming replication topology"}
-
-                try:
-                    cur.execute("SELECT pg_is_in_recovery();")
-                    if cur.fetchone()[0]:
-                        cur.execute("SELECT sender_host, sender_port FROM pg_stat_wal_receiver WHERE sender_host IS NOT NULL LIMIT 1;")
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            queue.append((r[0], int(r[1] or port), None))
-                except Exception:
-                    pass
-
-                # Per rule 1: Standbys found via pg_stat_replication cannot be probed (client_addr has no port).
-                # Do not append client_addr to discovery queue.
-
-                # Native logical replication subscriptions discovery
-                try:
-                    if _column_readable(cur, 'pg_catalog.pg_subscription', 'subconninfo'):
-                        cur.execute("SELECT subname, subconninfo FROM pg_subscription WHERE subconninfo IS NOT NULL;")
-                        for subname, conninfo in cur.fetchall():
-                            is_logical = True
-                            ph, pp = parse_conninfo_hostport(conninfo)
-                            if ph:
-                                mph, mpp = map_address(ph, pp or port, address_map)
-                                queue.append((mph, mpp, subname))
-                except Exception:
-                    pass
-
-                # pglogical topology discovery
-                try:
-                    if _table_readable(cur, 'pglogical.node_interface'):
-                        cur.execute("SELECT if_name, if_dsn FROM pglogical.node_interface;")
-                        for if_name, dsn in cur.fetchall():
-                            is_pglogical = True
-                            ph, pp = parse_conninfo_hostport(dsn)
-                            if ph:
-                                mph, mpp = map_address(ph, pp or port, address_map)
-                                queue.append((mph, mpp, if_name))
-                except Exception:
-                    pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    source = "streaming replication topology"
-    if is_pglogical:
-        source = "pglogical topology"
-    elif is_logical:
-        source = "native logical replication subscriptions"
-    for item in found.values():
-        item["source"] = source
-    return list(found.values()), source
-
-
-def discover_cluster_members(seeds, user, pw, db, deadline_s, address_map=None, pgpool_hint=False):
-    """seeds: list of (host, pg_port, patroni_port). Returns (members, source, seed_names).
-    seed_names maps (host, pg_port) of each Patroni seed to its Patroni member alias."""
-    deadline = time.time() + deadline_s
-    seed_names = {}
-    pat_seeds = [(h, p, pat) for h, p, pat in seeds if pat and str(pat) != "none"]
-    if pat_seeds:
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(pat_seeds) * 2))
-        f_cluster = [(ex.submit(discover_via_patroni, h, pat, address_map), h, p) for h, p, pat in pat_seeds]
-        f_name = [(ex.submit(_patroni_member_name, h, pat), h, p) for h, p, pat in pat_seeds]
-        end = time.time() + max(0.5, min(2.5, deadline - time.time()))
-        pending = {f for f, _, _ in f_cluster + f_name}
-        found = []
-        while pending and time.time() < end and not found:
-            _done, pending = concurrent.futures.wait(pending, timeout=max(0.05, end - time.time()), return_when=concurrent.futures.FIRST_COMPLETED)
-            for f, h, p in f_cluster:
-                if f.done() and not f.exception() and f.result()[0]:
-                    found = f.result()[0]
-                    break
-        if found:
-            # short grace so the seeds' own member names can arrive too
-            concurrent.futures.wait([f for f, _, _ in f_name], timeout=0.4)
-        for f, h, p in f_name:
-            if f.done() and not f.exception() and f.result():
-                seed_names[(_norm_host(h), int(p))] = safe_name(f.result())
-        ex.shutdown(wait=False, cancel_futures=True)
-        if found:
-            return found, "Patroni REST API", seed_names
-    members, source = discover_via_sql([(h, p) for h, p, _ in seeds], user, pw, db, deadline, address_map=address_map, pgpool_hint=pgpool_hint)
-    return members, source, seed_names
-
-
-def _patroni_member_name(host, patroni_port):
-    data = _http_json(f"http://{_http_host(host)}:{patroni_port}/patroni", timeout=1.0)
-    return str(((data or {}).get("patroni") or {}).get("name") or "") or None
-
-
-
-def _evidence_with_discovery(evidence, nodes_total, added, source):
-    """Appends how many nodes were listed in the config and how many discovery found, within 99 characters."""
-    suffix = f" | {int(nodes_total) - int(added)} listed, {int(added)} found"
-    if added and source:
-        suffix += f" via {str(source)[:24]}"
-    return (str(evidence)[:max(0, 99 - len(suffix))] + suffix)[:99]
-
-
-class PostgresClusterCollector:
-    """
-    Main collector coordinating concurrent node probes, cluster-level metrics,
-    per-node tables, cluster type detection, and Site24x7 JSON packaging.
-    """
-    def __init__(self, nodes_str=None, username="", password="", db="postgres", patroni_port=None, cluster_type=CLUSTER_TYPE, discover=DISCOVER, address_map=ADDRESS_MAP, failover_warn_seconds=FAILOVER_WARN_SECONDS, slot_warn_bytes=SLOT_WARN_BYTES, slot_critical_bytes=SLOT_CRITICAL_BYTES, replay_warn_seconds=REPLAY_WARN_SECONDS, replay_warn_bytes=REPLAY_WARN_BYTES, default_port=DEFAULT_POSTGRES_PORT, cluster_host=None):
-        self.username = username
-        self.password = password
-        self.db = db if (db and str(db).strip()) else "postgres"
-        self.cluster_type_override = cluster_type
-        self.discover = discover
-        self.address_map_str = address_map
-        self.address_map = parse_address_map(address_map)
-        self.default_port = str(default_port or DEFAULT_POSTGRES_PORT).strip()
-
-        if cluster_host:
-            self.cluster_host = validate_cluster_host(cluster_host)
-            self.is_cluster_host = True
-            self.nodes_str = self.cluster_host
-        elif nodes_str:
-            self.cluster_host = None
-            self.is_cluster_host = False
-            self.nodes_str = str(nodes_str).strip()
-        else:
-            self.cluster_host = None
-            self.is_cluster_host = False
-            self.nodes_str = ""
-
-        if patroni_port is not None and str(patroni_port).strip() != "":
-            raw_pat = str(patroni_port).strip().lower()
-            self.patroni_port = "none" if raw_pat == "none" else str(patroni_port).strip()
-        elif self.is_cluster_host:
-            if str(self.cluster_type_override or "").strip().lower() in ("auto", "patroni"):
-                self.patroni_port = str(DEFAULT_PATRONI_PORT)
-            else:
-                self.patroni_port = "none"
-        elif str(self.cluster_type_override or "").strip().lower() == "patroni":
-            self.patroni_port = str(DEFAULT_PATRONI_PORT)
-        else:
-            self.patroni_port = "none"
-
-        self.failover_warn_seconds = int(failover_warn_seconds) if failover_warn_seconds is not None else FAILOVER_WARN_SECONDS
-        self.slot_warn_bytes = int(slot_warn_bytes) if slot_warn_bytes is not None else SLOT_WARN_BYTES
-        self.slot_critical_bytes = int(slot_critical_bytes) if slot_critical_bytes is not None else SLOT_CRITICAL_BYTES
-        self.replay_warn_seconds = int(replay_warn_seconds) if replay_warn_seconds is not None else REPLAY_WARN_SECONDS
-        self.replay_warn_bytes = int(replay_warn_bytes) if replay_warn_bytes is not None else REPLAY_WARN_BYTES
-        for key, value in (("failover_warn_seconds", self.failover_warn_seconds),
-                           ("slot_warn_bytes", self.slot_warn_bytes),
-                           ("slot_critical_bytes", self.slot_critical_bytes),
-                           ("replay_warn_seconds", self.replay_warn_seconds),
-                           ("replay_warn_bytes", self.replay_warn_bytes)):
-            if value < 0:
-                raise ConfigError(f"{key} must be zero or greater")
-        if self.slot_critical_bytes <= self.slot_warn_bytes:
-            raise ConfigError("slot_critical_bytes must be greater than slot_warn_bytes")
-        self.discovery_added = 0
-        self.discovery_seen = 0
-        self.nodes_configured = 0
-        self.nodes_omitted = 0
-        self.discovery_source = ""
-        self.msg_notes = []
-        self.truncation_notes = []
-
-    def _add_note(self, text):
-        clean = str(text).strip()
-        if clean and clean not in self.msg_notes:
-            self.msg_notes.append(clean)
-
-    def _add_truncation_note(self, text):
-        clean = str(text).strip()
-        if clean and clean not in self.truncation_notes:
-            self.truncation_notes.append(clean)
-
-    def _limit_table(self, table_name, rows):
-        # Enforce Site24x7's child name-column length limit even for externally supplied node/database names.
-        for row in rows:
-            if not isinstance(row, dict):
+            elif label == "configured" and not os.path.isdir(directory):
+                if not ensure_dir(directory):
+                    continue
+            ok, why = writable_by_write_probe(directory)
+            if not ok:
                 continue
-            if isinstance(row.get("name"), str):
-                row["name"] = row["name"][:MAX_NAME_LENGTH]
-            for column, value in row.items():
-                if column != "name" and isinstance(value, str):
-                    row[column] = value[:MAX_TABLE_STRING_LENGTH]
-        row_count = len(rows)
-        if row_count > MAX_TABLE_ROWS:
-            note = f"{table_name}: showing {MAX_TABLE_ROWS} of {row_count} rows"
-            self._add_truncation_note(note)
-        return rows[:MAX_TABLE_ROWS]
+            target_dir = os.path.join(directory, f".pgcluster-{self.instance_key()}")
+            if not ensure_dir(target_dir):
+                continue
+            ok2, _ = writable_by_write_probe(target_dir)
+            if not ok2:
+                continue
+            self._path = os.path.join(target_dir, self.filename)
+            self._persistent = durable
+            self._reason = f"{label}: {target_dir}"
+            return self
+        return self
 
-    def _cache_path(self):
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(plugin_dir, "topology_cache.json")
+    @property
+    def path(self) -> Optional[str]:
+        if self._path is None:
+            self.probe()
+        return self._path
 
-    def _load_cache(self):
-        cache_file = self._cache_path()
-        if not os.path.exists(cache_file):
-            return None
+    def load(self) -> Dict[str, Any]:
+        path = self.path
+        if not path or not os.path.exists(path):
+            return {}
         try:
-            with open(cache_file, "r") as f:
-                data = json.load(f)
-            ts = data.get("timestamp", 0)
-            if time.time() - ts > 86400:  # 24 hours expiry
-                return None
-            return data
-        except Exception:
-            return None
-
-    def _save_cache(self, members, source="", seed_names=None):
-        cache_file = self._cache_path()
-        temp_file = None
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read(MAX_STATE_BYTES * 2)
+        except OSError:
+            self._io_errors += 1
+            return {}
+        if len(raw) > MAX_STATE_BYTES:
+            return {}
         try:
-            existing = self._load_cache() or {}
-            endpoints = existing.get("endpoints", {})
-            if seed_names:
-                for k, v in seed_names.items():
-                    if isinstance(k, tuple):
-                        h, p = k
-                        endpoints[f"{h}:{p}"] = str(v)
-                        pk = str(p)
-                        #the same port on different hosts is ambiguous: keep only the host:port key for it
-                        endpoints[pk] = "" if (pk in endpoints and endpoints[pk] != str(v)) else str(v)
-                    else:
-                        endpoints[str(k)] = str(v)
-            data = {
-                "timestamp": int(time.time()),
-                "source": str(source),
-                "endpoints": endpoints,
-                "members": [
-                    {
-                        "name": str(m.get("alias") or m.get("member") or m.get("name")),
-                        "host": str(m.get("host")),
-                        "port": int(m.get("port")),
-                        "patroni_port": str(m.get("patroni_port", "none")),
-                        "role": str(m.get("role", ""))
-                    }
-                    for m in members if (m.get("alias") or m.get("member") or m.get("name"))
-                ]
-            }
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=os.path.dirname(cache_file),
-                prefix=".topology_cache.", suffix=".tmp", delete=False
-            ) as f:
-                temp_file = f.name
-                json.dump(data, f, indent=2)
-            os.replace(temp_file, cache_file)
-        except Exception:
-            self._add_note("Topology cache could not be refreshed; cached discovery fallback may be unavailable.")
-        finally:
-            if temp_file and os.path.exists(temp_file):
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        if data.get("schema") != STATE_SCHEMA:
+            return {}
+        if data.get("instance") != self.instance_key():
+            return {}
+        return data
+
+    def save(self, state: Dict[str, Any]) -> bool:
+        path = self.path
+        if not path:
+            return False
+        state = dict(state or {})
+        state["schema"] = STATE_SCHEMA
+        state["instance"] = self.instance_key()
+        state["machine_id"] = self._machine
+        state["cluster_id"] = self.cluster_id
+        state["name"] = self.name
+        state["updated"] = int(time.time())
+        state["nodes"] = self._prune_nodes(state.get("nodes") or {})
+
+        tmp = None
+        directory = os.path.dirname(path)
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".state.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, separators=(",", ":"), default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.name != "nt":
                 try:
-                    os.remove(temp_file)
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+            tmp = None
+            self._last_written = time.time()
+            return True
+        except OSError:
+            self._io_errors += 1
+            return False
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
                 except OSError:
                     pass
 
-    def _parse_nodes(self):
-        if getattr(self, "is_cluster_host", False) and getattr(self, "cluster_host", None):
-            h = self.cluster_host
-            p = str(self.default_port or DEFAULT_POSTGRES_PORT).strip()
-            pat = str(self.patroni_port or "none").strip()
-            display_name = _name_from_address_map(h, p, self.address_map) or _default_node_name(h, p)
-            return [(display_name, h, p, pat, False)]
-
-        parsed = []
-        cache = self._load_cache()
-        cached_endpoints = (cache or {}).get("endpoints", {})
-        cached_map = {}
-        if cache and "members" in cache:
-            for m in cache["members"]:
-                mname = safe_name(m.get("name"))
-                if mname:
-                    h_norm = str(m.get("host")).strip().lower()
-                    p_val = int(m.get("port", 0))
-                    pat_val = str(m.get("patroni_port", "none"))
-                    cached_map[(h_norm, p_val)] = mname
-                    cached_map[str(p_val)] = mname
-                    if pat_val != "none":
-                        cached_map[(h_norm, pat_val)] = mname
-                        cached_map[pat_val] = mname
-
-        for raw in self.nodes_str.split(','):
-            entry = raw.strip().strip("'\"")
-            if not entry:
+    @staticmethod
+    def _prune_nodes(nodes: Dict[str, Any]) -> Dict[str, Any]:
+        cutoff = time.time() - NODE_TTL_DAYS * 86400
+        out = {}
+        for alias, entry in (nodes or {}).items():
+            if not isinstance(entry, dict):
                 continue
-            alias = None
-            has_explicit_alias = False
-            if "=" in entry:
-                alias, entry = entry.split("=", 1)
-                alias = alias.strip().strip("'\"")
-                entry = entry.strip().strip("'\"")
-                if alias:
-                    has_explicit_alias = True
+            seen = max(float(entry.get("ts_ok") or 0), float(entry.get("ts_fail") or 0))
+            if seen and seen < cutoff:
+                continue
+            out[alias] = entry
+        return out
 
-            if entry.startswith("http://"):
-                entry = entry[7:]
-            elif entry.startswith("https://"):
-                entry = entry[8:]
-            if "/" in entry:
-                entry = entry.split("/")[0]
-
-            h = None
-            p = None
-            pat = None
-
-            if entry.startswith("["):
-                if "]" in entry:
-                    end = entry.index("]")
-                    h = entry[1:end]
-                    rest = entry[end+1:]
-                    if rest.startswith(":"):
-                        subparts = rest[1:].split(":")
-                        p = subparts[0]
-                        if len(subparts) >= 2:
-                            pat = subparts[1]
-                    elif rest:
-                        continue
-                else:
-                    continue
-            else:
-                try:
-                    import ipaddress
-                    if isinstance(ipaddress.ip_address(entry), ipaddress.IPv6Address):
-                        h = entry
-                except ValueError:
-                    pass
-
-                if h is None:
-                    parts = entry.split(':')
-                    if len(parts) >= 3:
-                        h, p, pat = parts[0], parts[1], parts[2]
-                    elif len(parts) == 2:
-                        h, p = parts[0], parts[1]
-                    elif len(parts) == 1:
-                        h = parts[0]
-                    else:
-                        continue
-
-            if p is None:
-                p = getattr(self, 'default_port', None) or str(DEFAULT_POSTGRES_PORT)
+    def diagnostics(self) -> Dict[str, Any]:
+        age = None
+        if self._last_written:
+            age = int(time.time() - self._last_written)
+        elif self._path and os.path.exists(self._path):
             try:
-                int(p)
-            except ValueError:
-                p = getattr(self, 'default_port', None) or str(DEFAULT_POSTGRES_PORT)
-
-            if pat is None:
-                if self.patroni_port:
-                    if str(self.patroni_port).strip().lower() == "none":
-                        pat = "none"
-                    else:
-                        pat = str(self.patroni_port).strip()
-                elif getattr(self, "is_cluster_host", False) and str(self.cluster_type_override or "").lower() in ("auto", "patroni"):
-                    pat = str(DEFAULT_PATRONI_PORT)
-                elif str(self.cluster_type_override or "").lower() == "patroni":
-                    pat = str(DEFAULT_PATRONI_PORT)
-                else:
-                    pat = "none"
-
-            h_norm = str(h).strip().lower()
-            p_str = str(p).strip()
-            pat_str = str(pat).strip()
-            ep_key = f"{h}:{p}"
-            ep_pat_key = f"{h}:{pat}" if pat_str and pat_str != "none" else None
-
-            if alias:
-                display_name = safe_name(alias)
-            elif _name_from_address_map(h, p, self.address_map):
-                display_name = _name_from_address_map(h, p, self.address_map)
-            elif cached_endpoints.get(ep_key):
-                display_name = safe_name(cached_endpoints[ep_key])
-            elif ep_pat_key and cached_endpoints.get(ep_pat_key):
-                display_name = safe_name(cached_endpoints[ep_pat_key])
-            elif cached_endpoints.get(p_str):
-                display_name = safe_name(cached_endpoints[p_str])
-            elif pat_str and cached_endpoints.get(pat_str):
-                display_name = safe_name(cached_endpoints[pat_str])
-            elif (h_norm, int(p)) in cached_map:
-                display_name = cached_map[(h_norm, int(p))]
-            elif p_str in cached_map:
-                display_name = cached_map[p_str]
-            elif pat_str and pat_str in cached_map:
-                display_name = cached_map[pat_str]
-            else:
-                display_name = _default_node_name(h, p)
-
-            base_name, dup = display_name, 2
-            while any(p_[0] == display_name for p_ in parsed):
-                display_name = f"{base_name}{dup}"
-                dup += 1
-            if display_name != base_name:
-                self._add_note(f"Duplicate node alias {base_name} renamed to {display_name}")
-            parsed.append((display_name, h, p, pat, has_explicit_alias))
-        return parsed
-
-    def _apply_discovery(self, node_defs):
-        """Adds cluster members found from the configured address(es) that are not configured yet."""
-        if str(self.discover).strip().lower() in ("off", "false", "0", "no") or not node_defs:
-            return node_defs
-        seeds = [(h, p, pat) for (_n, h, p, pat, _a) in node_defs]
-        cache = self._load_cache()
-        cached_extra = []
-        if cache and "members" in cache:
-            known_seeds = {(str(h).strip().lower(), int(p)) for h, p, _ in seeds}
-            for m in cache["members"]:
-                m_h = str(m.get("host")).strip().lower()
-                m_p = int(m.get("port", 0))
-                m_pat = str(m.get("patroni_port", "none"))
-                if (m_h, m_p) not in known_seeds:
-                    cached_extra.append((m_h, m_p, m_pat))
-
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(len(seeds), len(cached_extra)) * 2 + 1))
-        t0_disc = time.monotonic()
-        try:
-            fut = ex.submit(discover_cluster_members, seeds, self.username, self.password, self.db, DISCOVERY_DEADLINE_S, address_map=self.address_map, pgpool_hint=('pgpool' in str(self.cluster_type_override).lower()))
-            members, source, seed_names = fut.result(timeout=DISCOVERY_DEADLINE_S)
-        except Exception:
-            members, source, seed_names = [], "", {}
-        rem_disc = DISCOVERY_DEADLINE_S - (time.monotonic() - t0_disc)
-        if not members and cached_extra and rem_disc > 0.5:
-            try:
-                fut = ex.submit(discover_cluster_members, cached_extra, self.username, self.password, self.db, rem_disc, address_map=self.address_map, pgpool_hint=('pgpool' in str(self.cluster_type_override).lower()))
-                members, source, seed_names = fut.result(timeout=rem_disc)
-            except Exception:
-                pass
-        ex.shutdown(wait=False, cancel_futures=True)
-
-        if not members and cache and "members" in cache:
-            ts_str = time.strftime('%Y-%m-%d %H:%M:%S GMT', time.gmtime(cache.get('timestamp', time.time())))
-            self._add_note(f"seed unreachable, members from {ts_str}")
-            members = [
-                {"alias": m["name"], "member": m["name"], "host": m["host"], "port": m["port"], "patroni_port": m.get("patroni_port", "none"), "role": m.get("role", ""), "source": "topology cache"}
-                for m in cache["members"]
-            ]
-            source = "topology cache"
-        elif members:
-            self._save_cache(members, source, seed_names=seed_names)
-
-        self.role_map = {}
-        for m in members:
-            alias = safe_name(m.get("alias") or m.get("member") or m.get("name"))
-            if alias and m.get("role"):
-                self.role_map[alias.lower()] = str(m.get("role")).strip().lower()
-
-        if not members:
-            return node_defs
-        self.discovery_seen = len(members)
-
-        #A pgpool-II address only forwards to its backends: monitor the backends, not the proxy in front of them
-        proxies = {(_norm_host(m["via_proxy"][0]), int(m["via_proxy"][1])) for m in members if m.get("via_proxy")}
-        if proxies:
-            node_defs[:] = [d for d in node_defs if (_norm_host(d[1]), int(d[2])) not in proxies]
-
-        known_addr = {(_norm_host(h), int(p)) for (_n, h, p, _pat, _a) in node_defs}
-        known_alias = {n.lower() for (n, *_rest) in node_defs}
-        known_member = set()
-
-        for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
-            h_norm = str(h).strip().lower()
-            p_int = int(p)
-            pat_str = str(pat).strip()
-            mname = seed_names.get((_norm_host(h), p_int)) or seed_names.get(p_int)
-            if not mname and pat_str and pat_str != "none":
-                mname = seed_names.get((h_norm, pat_str)) or seed_names.get(pat_str)
-            #A port alone names a node only when no other node uses that port (on real clusters every node has port 5432)
-            if not mname:
-                by_port = [m for m in members if int(m.get("port", 0)) == p_int]
-                by_pat = [m for m in members if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str]
-                pick = by_port[0] if len(by_port) == 1 else (by_pat[0] if len(by_pat) == 1 else None)
-                if pick:
-                    mname = safe_name(pick.get("alias") or pick.get("name"))
-            if not mname and cache and "members" in cache:
-                c_port = [m for m in cache["members"] if int(m.get("port", 0)) == p_int]
-                c_pat = [m for m in cache["members"] if pat_str and pat_str != "none" and str(m.get("patroni_port")) == pat_str]
-                pick = c_port[0] if len(c_port) == 1 else (c_pat[0] if len(c_pat) == 1 else None)
-                if pick:
-                    mname = safe_name(pick.get("name"))
-            if mname:
-                known_member.add(mname.lower())
-                if not a:
-                    node_defs[i] = (mname, h, p, pat, a)
-                    known_alias.discard(n.lower())
-                    known_alias.add(mname.lower())
-
-        by_addr = {(_norm_host(m["host"]), int(m["port"])): m["alias"] for m in members if m.get("alias")}
-        for i, (n, h, p, pat, a) in enumerate(list(node_defs)):
-            nm = by_addr.get((_norm_host(h), int(p)))
-            if nm and not a and n.lower() != nm.lower() and nm.lower() not in known_alias:
-                node_defs[i] = (nm, h, p, pat, a)
-                known_alias.discard(n.lower())
-                known_alias.add(nm.lower())
-
-        if len(node_defs) >= len(members):
-            return node_defs
-
-        added = 0
-        omitted_discovered = 0
-        for m in members:
-            key = (_norm_host(m["host"]), int(m["port"]))
-            if key in known_addr or m["alias"].lower() in known_alias or m["alias"].lower() in known_member:
-                continue
-            if len(node_defs) >= MAX_NODES:
-                omitted_discovered += 1
-                continue
-            name, k = m["alias"] or _name_from_address_map(m["host"], m["port"], self.address_map) or _default_node_name(m['host'], m['port']), 2
-            while name.lower() in known_alias:
-                name = f"{m['alias']}{k}"
-                k += 1
-            node_defs.append((name, m["host"], m["port"], m["patroni_port"], False))
-            known_alias.add(name.lower())
-            known_addr.add(key)
-            added += 1
-        self.discovery_added = added
-        if omitted_discovered:
-            self.nodes_omitted += omitted_discovered
-            self._add_truncation_note(f"Discovery: {omitted_discovered} node(s) omitted by the {MAX_NODES}-node display limit")
-        self.discovery_source = source
-        return node_defs
-
-    def collect(self):
-        results = OrderedDict()
-        results["plugin_version"] = PLUGIN_VERSION
-        results["heartbeat_required"] = HEARTBEAT
-        results["status"] = 1
-
-        try:
-            return self._collect_internal(results)
-        except ConfigError as e:
-            results["status"] = 0
-            results["msg"] = str(e)
-            results["Cluster_Info"] = []
-            results["Cluster_Nodes"] = []
-            results["Replication_Links"] = []
-            results["Replication_Slots"] = []
-            results["Node_IO"] = []
-            results["Node_Checkpoints"] = []
-            results["Node_Activity"] = []
-            results["Node_Transactions"] = []
-            if "tabs" not in results:
-                results.update(copy.deepcopy(tabs))
-            if "units" not in results:
-                results["units"] = units
-            return results
-        except UnsupportedClusterError as e:
-            results["status"] = 0
-            results["msg"] = f"Detected {e.cluster_type}: not supported by this plugin version"
-            results["Cluster_Info"] = [{
-                "name": "cluster",
-                "cluster_type": str(e.cluster_type)[:99],
-                "type_evidence": str(e.evidence)[:99],
-                "primary_node": "none",
-                "health_reason": f"Unsupported: {e.cluster_type}"[:MAX_TABLE_STRING_LENGTH],
-                "nodes_total": 0,
-                "nodes_up": 0,
-                "primary_timeline": 0,
-                "status": 0
-            }]
-            results["Cluster_Nodes"] = []
-            results["Replication_Links"] = []
-            results["Replication_Slots"] = []
-            results["Node_IO"] = []
-            results["Node_Checkpoints"] = []
-            results["Node_Activity"] = []
-            results["Node_Transactions"] = []
-            if "tabs" not in results:
-                results.update(copy.deepcopy(tabs))
-            if "units" not in results:
-                results["units"] = units
-            return results
-        except Exception as e:
-            results["status"] = 0
-            err_msg = f"Unexpected collector exception: {type(e).__name__}: {str(e)}"
-            if self.msg_notes:
-                results["msg"] = "; ".join(self.msg_notes) + f"; {err_msg}"
-            else:
-                results["msg"] = err_msg
-            if "tabs" not in results:
-                results.update(copy.deepcopy(tabs))
-            if "units" not in results:
-                results["units"] = units
-            return results
-
-    def _collect_internal(self, results):
-        server_version_str = "unknown"
-
-        parsed_nodes = self._parse_nodes()
-        self.nodes_configured = len(parsed_nodes)
-        if len(parsed_nodes) > MAX_NODES:
-            configured_omitted = len(parsed_nodes) - MAX_NODES
-            self.nodes_omitted += configured_omitted
-            self._add_truncation_note(f"Configuration: {configured_omitted} node(s) omitted by the {MAX_NODES}-node display limit")
-            parsed_nodes = parsed_nodes[:MAX_NODES]
-        node_defs = self._apply_discovery(parsed_nodes)
-        nodes_total = len(node_defs)
-        if nodes_total == 0:
-            results["status"] = 0
-            results["msg"] = "No nodes configured in NODES parameter"
-            results.update(copy.deepcopy(tabs))
-            results["units"] = units
-            return results
-
-        clients = []
-        role_map = getattr(self, "role_map", {})
-        for dname, h, p, pat, has_alias in node_defs:
-            d_role = role_map.get(dname.lower())
-            clients.append(PostgresNodeClient(dname, h, p, self.username, self.password, self.db, pat, has_explicit_alias=has_alias, discovered_role=d_role))
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, nodes_total))
-        future_to_client = {executor.submit(cli.collect_full): cli for cli in clients}
-        done, not_done = concurrent.futures.wait(future_to_client.keys(), timeout=NODE_COLLECT_DEADLINE_S)
-        executor.shutdown(wait=False, cancel_futures=True)
-        for fut in not_done:
-            cli = future_to_client[fut]
-            cli.is_up = False
-            cli.notes.append(f"Node probe timed out after {NODE_COLLECT_DEADLINE_S}s")
-            self._add_note(f"Node {cli.name} exceeded collection deadline ({NODE_COLLECT_DEADLINE_S}s)")
-
-        for cli in clients:
-            if cli.notes:
-                for n in cli.notes:
-                    self._add_note(n)
-            # A down node must still emit a status 0 row in every per-node table,
-            # otherwise the console keeps its last (green) row for that node.
-            if not cli.is_up:
-                cli.activity_row = {"name": cli.name, "status": 0}
-                cli.io_row = {"name": cli.name, "status": 0}
-                cli.transactions_row = {"name": cli.name, "status": 0}
-                cli.checkpoints_row = {"name": cli.name, "status": 0}
-                cli.conflicts_row = None
-
-        nodes_up = sum(1 for c in clients if c.is_up)
-        primary_candidates = [c for c in clients if c.is_up and c.is_primary]
-        primary_count = len(primary_candidates)
-        no_primary_flag = 1 if primary_count == 0 else 0
-        split_brain_flag = 1 if primary_count > 1 else 0
-
-        active_primary = primary_candidates[0] if primary_count >= 1 else None
-        primary_timeline = active_primary.timeline if (active_primary and active_primary.timeline is not None) else 0
-
-        # Timeline Mismatch Flag: any up node has timeline differing from primary
-        timeline_mismatch_flag = 0
-        if primary_timeline > 0:
-            for c in clients:
-                if c.is_up and not getattr(c, 'is_witness', False) and getattr(c, 'discovered_role', '') != 'witness' and c.timeline is not None and c.timeline != primary_timeline:
-                    timeline_mismatch_flag = 1
-                    self._add_note(f"Timeline mismatch: node {c.name} (TL {c.timeline}) != primary (TL {primary_timeline})")
-                    break
-
-        # Evidence aggregation
-        agg_evidence = {
-            "extensions": [],
-            "repmgr_table": False,
-            "managed_roles": [],
-            "aurora_version": False,
-            "slot_names": [],
-            "slot_types": [],
-            "logical_replication_count": 0,
-            "primary_count": primary_count,
-            "app_names": [],
-            "total_nodes": nodes_total,
-            "is_in_recovery": any(not c.is_primary for c in clients if c.is_up),
-            "has_standbys": False,
-            "has_replication_slots": False,
-            "standby_count": 0
+                age = int(time.time() - os.path.getmtime(self._path))
+            except OSError:
+                age = None
+        return {
+            "State_File": (self._path or "none")[-100:],
+            "State_Persistent": 1 if self._persistent else 0,
+            "State_Age_s": age if age is not None else -1,
+            "State_IO_Errors": self._io_errors,
+            "State_Reason": (self._reason or "")[:100],
         }
-        patroni_scope_discovered = None
-        for c in clients:
-            if c.patroni_info and c.patroni_info.get("is_patroni"):
-                agg_evidence["patroni"] = c.patroni_info
-                patroni_scope_discovered = c.patroni_info.get("scope")
-                break
 
-        for c in clients:
-            if c.is_up:
-                ev = c.evidence
-                agg_evidence["extensions"].extend(ev.get("extensions", []))
-                agg_evidence["subscriptions_count"] = agg_evidence.get("subscriptions_count", 0) + ev.get("subscriptions_count", 0)
-                agg_evidence["publications_count"] = agg_evidence.get("publications_count", 0) + ev.get("publications_count", 0)
-                if ev.get("repmgr_table"):
-                    agg_evidence["repmgr_table"] = True
-                agg_evidence["managed_roles"].extend(ev.get("managed_roles", []))
-                if ev.get("aurora_version"):
-                    agg_evidence["aurora_version"] = True
-                agg_evidence["slot_names"].extend(ev.get("slot_names", []))
-                agg_evidence["slot_types"].extend(ev.get("slot_types", []))
-                agg_evidence["logical_replication_count"] += ev.get("logical_replication_count", 0)
-                agg_evidence["app_names"].extend(ev.get("app_names", []))
 
-        agg_evidence["extensions"] = list(set(agg_evidence["extensions"]))
-        agg_evidence["managed_roles"] = list(set(agg_evidence["managed_roles"]))
-        agg_evidence["slot_names"] = list(set(agg_evidence["slot_names"]))
-        agg_evidence["slot_types"] = list(set(agg_evidence["slot_types"]))
-        agg_evidence["app_names"] = list(set(agg_evidence["app_names"]))
-        agg_evidence["all_up_subscribe"] = all(c.evidence.get("has_sub", False) for c in clients if c.is_up) if nodes_up >= 2 else False
-        agg_evidence["all_up_publish"] = all(c.evidence.get("has_pub", False) for c in clients if c.is_up) if nodes_up >= 2 else False
+def read_cfg_file(cfg_path: str) -> Dict[str, Any]:
+    """Simple parser for postgres_cluster.cfg [postgres_cluster] section."""
+    out: Dict[str, Any] = {}
+    if not os.path.exists(cfg_path):
+        return out
+    current_section = ""
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    current_section = line[1:-1].strip()
+                    continue
+                if current_section == "postgres_cluster" and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    out[k] = v
+    except Exception:
+        pass
+    return out
 
-        # Cluster Type Detection
-        if self.cluster_type_override and self.cluster_type_override != 'auto':
-            detected_type = self.cluster_type_override
-            detected_evidence = f"Explicit override via cluster_type parameter ({self.cluster_type_override})"
-        else:
-            agg_evidence["pgpool"] = "pgpool" in str(self.discovery_source or "").lower()
-            detected_type, detected_evidence = detect_cluster_type(agg_evidence)
 
-        if detected_type not in SUPPORTED_CLUSTER_TYPES:
-            raise UnsupportedClusterError(detected_type, detected_evidence)
+def run(param: Dict[str, Any]) -> Dict[str, Any]:
+    """Standard Site24x7 plugin entry point."""
+    t0 = time.time()
+    payload = get_empty_payload()
 
-        # In multi-master / active-active topologies, multiple concurrent primaries are expected
-        c_lower = str(detected_type).lower()
-        if "multi-master" in c_lower or "multimaster" in c_lower or "active-active" in c_lower or "bdr" in c_lower or "citus" in c_lower:
-            split_brain_flag = 0
+    # 1. Parameter resolution: CLI/argument param takes precedence over cfg file
+    cfg_data = {}
+    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postgres_cluster.cfg")
+    if os.path.exists(cfg_file):
+        cfg_data = read_cfg_file(cfg_file)
 
-        # Build Cluster_Nodes child table
-        cluster_nodes = []
-        is_mm = ("multi-master" in str(detected_type).lower())
-        for c in clients:
-            role_str = "offline"
-            if getattr(c, 'is_witness', False) or getattr(c, 'discovered_role', '') == "witness":
-                role_str = "witness" if c.is_up else "witness (offline)"
-            elif c.is_up:
-                if is_mm:
-                    role_str = "master"
+    merged = dict(cfg_data)
+    merged.update(param or {})
+
+    username = merged.get("username", "site24x7")
+    password = os.environ.get("PGPASSWORD") or merged.get("password", "")
+    dbname = merged.get("db") or merged.get("dbname", "postgres")
+    sslmode = merged.get("sslmode", "prefer")
+    sslrootcert = merged.get("sslrootcert", "")
+    sslcert = merged.get("sslcert", "")
+    sslkey = merged.get("sslkey", "")
+
+    # Node & Patroni resolution
+    raw_nodes = merged.get("nodes", "")
+    cluster_host = merged.get("cluster_host", "")
+    cluster_name = merged.get("cluster_name", "")
+    state_dir = merged.get("state_dir", "")
+    port_default = int(merged.get("postgres_port") or 5432)
+    patroni_port = int(merged.get("patroni_port") or 8008)
+    address_map = parse_address_map(merged.get("address_map", ""))
+
+    cluster_id = cluster_name or cluster_host or "postgres_cluster"
+    store = StateStore(
+        plugin_file=__file__,
+        cluster_id=cluster_id,
+        name=cluster_name or "postgres_cluster",
+        seed=cluster_host or "127.0.0.1",
+        state_dir=state_dir
+    )
+    store.probe()
+    prev_state = store.load()
+    new_state: Dict[str, Any] = {"nodes": dict(prev_state.get("nodes") or {})}
+
+    discovered_members: List[Dict[str, Any]] = []
+    cluster_manager = 0  # 0=unknown, 1=Patroni, 2=repmgr, 3=Native
+    patroni_data = None
+    patroni_history = []
+
+    # Attempt Patroni REST discovery first
+    seed_host = cluster_host or ("127.0.0.1" if not raw_nodes else "")
+    if seed_host:
+        # Check seed with address map if mapped
+        mapped_seed = address_map.get(f"{seed_host}:{patroni_port}") or address_map.get(seed_host)
+        actual_patroni_host = seed_host
+        actual_patroni_port = patroni_port
+        if mapped_seed and ":" in mapped_seed:
+            actual_patroni_host, p_str = mapped_seed.rsplit(":", 1)
+            actual_patroni_port = int(p_str)
+
+        patroni_data = fetch_patroni_cluster(actual_patroni_host, actual_patroni_port, timeout=1.0)
+        if patroni_data and "members" in patroni_data:
+            cluster_manager = 1
+            payload["Topology_Type"] = 1
+            discovered_members = patroni_data.get("members", [])
+            patroni_history = fetch_patroni_history(actual_patroni_host, actual_patroni_port, timeout=1.0)
+
+    node_specs: List[Dict[str, Any]] = []
+
+    if discovered_members:
+        for m in discovered_members:
+            m_name = m.get("name", "")
+            m_host = m.get("host", "")
+            m_port = int(m.get("port") or 5432)
+            m_role_str = str(m.get("role", "replica")).lower()
+            m_state_str = str(m.get("state", "unknown")).lower()
+            m_tl = int(m.get("timeline") or 0)
+            m_lag = int(m.get("lag") or 0)
+
+            # Apply address mapping if necessary
+            target_key = f"{m_host}:{m_port}"
+            mapped_target = address_map.get(target_key) or address_map.get(m_host)
+            conn_host = m_host
+            conn_port = m_port
+            if mapped_target:
+                if ":" in mapped_target:
+                    conn_host, p_str = mapped_target.rsplit(":", 1)
+                    conn_port = int(p_str)
                 else:
-                    role_str = "primary" if c.is_primary else "standby"
+                    conn_host = mapped_target
 
-            upstream_val = str(c.upstream if c.upstream else "none")
-            if c.is_cascading and "cascading" not in upstream_val.lower():
-                upstream_val = f"{upstream_val} (cascading)" if upstream_val != "none" else "cascading"
+            node_specs.append({
+                "name": m_name or target_key,
+                "host": conn_host,
+                "port": conn_port,
+                "patroni_role": m_role_str,
+                "patroni_state": PATRONI_STATE_MAP.get(m_state_str, PATRONI_STATE_UNKNOWN),
+                "patroni_tl": m_tl,
+                "patroni_lag": m_lag
+            })
+    elif raw_nodes:
+        for name, host, port in parse_node_specs(raw_nodes, default_port=port_default):
+            node_specs.append({
+                "name": name,
+                "host": host,
+                "port": port,
+                "patroni_role": "unknown",
+                "patroni_state": PATRONI_STATE_NA,
+                "patroni_tl": 0,
+                "patroni_lag": 0
+            })
+    elif cluster_host:
+        node_specs.append({
+            "name": f"{cluster_host}:{port_default}",
+            "host": cluster_host,
+            "port": port_default,
+            "patroni_role": "unknown",
+            "patroni_state": PATRONI_STATE_NA,
+            "patroni_tl": 0,
+            "patroni_lag": 0
+        })
+    else:
+        node_specs.append({
+            "name": f"localhost:{port_default}",
+            "host": "127.0.0.1",
+            "port": port_default,
+            "patroni_role": "unknown",
+            "patroni_state": PATRONI_STATE_NA,
+            "patroni_tl": 0,
+            "patroni_lag": 0
+        })
 
-            node_row = {
-                "name": c.name,
-                "role": role_str,
-                "is_primary": 1 if (c.is_up and (c.is_primary or is_mm) and not getattr(c, 'is_witness', False)) else 0,
-                "status": 1 if c.is_up else 0,
-                "timeline": int(c.timeline) if c.timeline is not None else 0,
-                "connections": int(c.connections) if c.connections is not None else 0,
-                "response_time_ms": float(c.response_time_ms),
-                "upstream": upstream_val,
-                "patroni_state": str(c.patroni_state if c.patroni_state else "none"),
-                "replay_backlog_bytes": max(0, int(c.replay_backlog_bytes)) if (c.is_up and c.replay_backlog_bytes is not None) else 0,
-                "replay_delay_s": max(0.0, float(c.replay_delay_s)) if (c.is_up and c.replay_delay_s is not None) else 0.0,
-                "monitored": 1 if c.is_up else 0
-            }
-            if c.is_up and c.is_primary and not is_mm:
-                node_row.pop("replay_backlog_bytes", None)
-                node_row.pop("replay_delay_s", None)
-            cluster_nodes.append(node_row)
+    # 2. Parallel / Multi-node probing
+    node_rows: List[Dict[str, Any]] = []
+    primary_client: Optional[NodeClient] = None
+    all_warnings: List[str] = []
+    queries_count = 0
 
-        node_io_table = [c.io_row for c in clients if c.io_row is not None]
-        node_checkpoints_table = [c.checkpoints_row for c in clients if c.checkpoints_row is not None]
-        node_activity_table = [c.activity_row for c in clients if c.activity_row is not None]
-        node_transactions_table = [c.transactions_row for c in clients if c.transactions_row is not None]
+    timelines: List[int] = []
+    standby_lags_s: List[float] = []
+    standby_lags_b: List[int] = []
+    conn_pcts: List[Tuple[float, str]] = []
+    response_times: List[Tuple[float, str]] = []
 
-        # Replication links and slots
-        replication_links = []
-        replication_slots = []
-        sync_standbys_count = 0
-        cascading_standbys_count = sum(c.is_cascading for c in clients if c.is_up and not c.is_primary)
-        max_replay_backlog = 0
-        max_replay_delay_s = 0.0
-        slots_total = 0
-        slots_active = 0
-        slots_inactive = 0
-        max_slot_lag_bytes = 0
-        max_wal_status_risk = 0
-        has_wal_status = False
+    def probe_single_node(spec: Dict[str, Any]) -> Dict[str, Any]:
+        n_name = spec["name"]
+        n_host = spec["host"]
+        n_port = spec["port"]
+        p_role_str = spec["patroni_role"]
+        p_state_int = spec["patroni_state"]
 
-        # Multi-master top-level metrics
-        mesh_links_declared = 0
-        mesh_links_active = 0
-        mesh_disconnect_flag = 0
-        max_logical_lag_bytes = 0
-        max_logical_lag_seconds = 0.0
-        subscription_apply_errors = 0
-        subscription_conflicts = 0
+        row_res = {
+            "name": safe_name(n_name),
+            "role": ROLE_UNKNOWN,
+            "status": STATUS_DOWN,
+            "status_reason": "connection failed",
+            "last_seen_s": 0,
+            "last_seen_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timeline": spec.get("patroni_tl", 0),
+            "replay_lag_s": 0.0,
+            "replay_lag_bytes": 0,
+            "conn_pct": 0.0,
+            "resp_ms": 0.0,
+            "sync": SYNC_ASYNC,
+            "patroni_state": p_state_int,
+            "xact_age_s": 0,
+            "uptime_s": 0,
+            "version_num": 0,
+            "active_queries": 0,
+            "idle_in_txn": 0,
+            "longest_query_s": 0,
+            "temp_bytes": 0,
+            "dead_tuples": 0,
+            "client": None,
+            "is_primary": False
+        }
 
-        member_to_name = {c.patroni_member: c.name for c in clients if c.patroni_member}
+        t_start = time.time()
+        client = NodeClient(
+            name=n_name,
+            host=n_host,
+            port=n_port,
+            user=username,
+            password=password,
+            dbname=dbname,
+            sslmode=sslmode,
+            sslrootcert=sslrootcert,
+            sslcert=sslcert,
+            sslkey=sslkey
+        )
 
-        if is_mm:
-            # Multi-Master topology: links come from subscriptions on all up nodes
-            split_brain_flag = 0
-            no_primary_flag = 0 if nodes_up > 0 else 1
-            active_primary = primary_candidates[0] if primary_candidates else (clients[0] if clients and clients[0].is_up else None)
+        if client.connect():
+            resp_ms = round((time.time() - t_start) * 1000.0, 2)
+            row_res["status"] = STATUS_UP
+            row_res["status_reason"] = "healthy"
+            row_res["resp_ms"] = resp_ms
+            row_res["client"] = client
 
-            # 1. Collect Replication_Links
-            for c in clients:
-                if not c.is_up:
-                    continue
-                for sub in c.subscriptions:
-                    mesh_links_declared += 1
-                    is_act = sub["active"]
-                    if is_act:
-                        mesh_links_active += 1
-                    state = "streaming" if is_act else ("disabled" if not sub["enabled"] else "stopped")
-                    lag_s = max(0.0, float(sub.get("receipt_delay_s", 0.0)))
-                    if lag_s > max_logical_lag_seconds:
-                        max_logical_lag_seconds = lag_s
-                    subscription_apply_errors += sub.get("apply_error_count", 0)
-                    subscription_conflicts += sub.get("sync_error_count", 0)
+            is_prim = (not client.is_recovery) or (p_role_str == "leader")
+            row_res["is_primary"] = is_prim
+            row_res["role"] = ROLE_PRIMARY if is_prim else ROLE_STANDBY
 
-                    source_node = "unknown"
-                    if sub.get("conninfo"):
-                        sh, sp = parse_conninfo_hostport(sub["conninfo"])
-                        if sh:
-                            source_node = safe_name(sh)
-                    if source_node == "unknown" and "_from_" in sub["subname"]:
-                        source_node = safe_name(sub["subname"].split("_from_")[-1])
+            # Probe connections and activity
+            c_row = client.query_one("SELECT count(*) FROM pg_stat_activity;")
+            if c_row and c_row[0] is not None:
+                conns = safe_int(c_row[0])
+                max_conn = safe_int(client.settings.get("max_connections", 100), default=100)
+                c_pct = round(100.0 * conns / max_conn, 2) if max_conn > 0 else 0.0
+                row_res["conn_pct"] = c_pct
 
-                    replication_links.append({
-                        "name": safe_name(sub["subname"]),
-                        "link_type": "logical_subscription",
-                        "source": source_node,
-                        "target": c.name,
-                        "state": state,
-                        "replay_lag_bytes": 0,
-                        "write_lag_bytes": 0,
-                        "flush_lag_bytes": 0,
-                        "replay_lag_s": lag_s,
-                        "is_sync": 0,
-                        "active": is_act,
-                        "status": 1 if is_act else 0
-                    })
+            # Timeline
+            if row_res["timeline"] == 0:
+                tl_row = client.query_one("SELECT timeline_id FROM pg_control_checkpoint();")
+                if tl_row and tl_row[0]:
+                    row_res["timeline"] = safe_int(tl_row[0])
 
-                # Also aggregate walsender lag
-                for ws in c.logical_walsenders:
-                    wlag = ws["replay_lag_bytes"]
-                    if wlag > max_logical_lag_bytes:
-                        max_logical_lag_bytes = wlag
-                    wlag_s = ws["replay_lag_s"]
-                    if wlag_s > max_logical_lag_seconds:
-                        max_logical_lag_seconds = wlag_s
+            # Standby specific lag
+            if not is_prim:
+                lag_row = client.query_one("SELECT extract(epoch from (now() - pg_last_xact_replay_timestamp()));")
+                if lag_row and lag_row[0] is not None:
+                    row_res["replay_lag_s"] = round(safe_float(lag_row[0]), 2)
 
-            if mesh_links_active < mesh_links_declared:
-                mesh_disconnect_flag = 1
-                self._add_note(f"Mesh disconnect: {mesh_links_declared - mesh_links_active} link(s) inactive")
+                b_row = client.query_one("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
+                if b_row and b_row[0] is not None:
+                    row_res["replay_lag_bytes"] = safe_int(b_row[0])
 
-            # 2. Collect Replication_Slots across ALL up nodes
-            for c in clients:
-                if not c.is_up:
-                    continue
-                for sl in c.logical_slots:
-                    slots_total += 1
-                    is_act = sl["active"]
-                    if is_act:
-                        slots_active += 1
-                    else:
-                        slots_inactive += 1
-                    retained = sl["wal_retained_bytes"]
-                    if retained > max_slot_lag_bytes:
-                        max_slot_lag_bytes = retained
+                # Check if delayed replica
+                delay_row = client.query_one("SHOW recovery_min_apply_delay;")
+                if delay_row and delay_row[0] and delay_row[0] != "0":
+                    row_res["role"] = ROLE_DELAYED
 
-                    unique_name = safe_name(f"{c.name}_{sl['slot_name']}")
-                    replication_slots.append({
-                        "name": unique_name,
-                        "plugin": sl["plugin"],
-                        "slot_type": sl["slot_type"],
-                        "active": is_act,
-                        "wal_retained_bytes": retained,
-                        "status": 1
-                    })
-
-        elif active_primary and active_primary.conn:
-            # Physical streaming replication: links from pg_stat_replication
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT COALESCE(application_name, 'unknown'),
-                               COALESCE(client_addr::text, 'unknown'),
-                               COALESCE(state, 'unknown'),
-                               COALESCE(sync_state, 'unknown'),
-                               sync_priority,
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::numeric, 0),
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn), 0)::numeric, 0),
-                               ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn), 0)::numeric, 0),
-                               ROUND(COALESCE(EXTRACT(EPOCH FROM replay_lag), 0)::numeric, 2)
-                        FROM pg_stat_replication;
-                    """)
-                    for r in cur.fetchall():
-                        is_sync = 1 if r[3] in ('sync', 'quorum') else 0
-                        if is_sync:
-                            sync_standbys_count += 1
-                        rep_lag_bytes = max(0, int(r[5] or 0))
-                        w_lag_bytes = max(0, int(r[6] or 0))
-                        f_lag_bytes = max(0, int(r[7] or 0))
-                        rep_lag_s = max(0.0, float(r[8] or 0.0))
-                        if rep_lag_bytes > max_replay_backlog:
-                            max_replay_backlog = rep_lag_bytes
-                        if rep_lag_s > max_replay_delay_s:
-                            max_replay_delay_s = rep_lag_s
-
-                        app_name = str(r[0] or "").strip()
-                        standby_name = member_to_name.get(app_name) or safe_name(app_name) or "standby"
-
-                        replication_links.append({
-                            "name": standby_name,
-                            "link_type": "physical_streaming",
-                            "source": active_primary.name,
-                            "target": standby_name,
-                            "state": str(r[2]),
-                            "replay_lag_bytes": rep_lag_bytes,
-                            "write_lag_bytes": w_lag_bytes,
-                            "flush_lag_bytes": f_lag_bytes,
-                            "replay_lag_s": rep_lag_s,
-                            "is_sync": is_sync,
-                            "active": 1,
-                            "status": 1
-                        })
-                agg_evidence["has_standbys"] = len(replication_links) > 0
-                agg_evidence["standby_count"] = len(replication_links)
-            except Exception as e:
-                self._add_note(f"Standbys query error: {e}")
-
-            # 2. Replication slots on primary
-            try:
-                with active_primary.conn.cursor() as cur:
-                    try:
-                        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'pg_replication_slots' AND column_name = 'wal_status';")
-                        has_wal_status = bool(cur.fetchone())
-                    except Exception:
-                        has_wal_status = False
-
-                    if has_wal_status:
-                        cur.execute("""
-                            SELECT slot_name,
-                                   COALESCE(plugin, 'none'),
-                                   COALESCE(slot_type, 'physical'),
-                                   CASE WHEN active = true THEN 1 ELSE 0 END,
-                                   ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0),
-                                   COALESCE(wal_status, 'none')
-                            FROM pg_replication_slots;
-                        """)
-                    else:
-                        cur.execute("""
-                            SELECT slot_name,
-                                   COALESCE(plugin, 'none'),
-                                   COALESCE(slot_type, 'physical'),
-                                   CASE WHEN active = true THEN 1 ELSE 0 END,
-                                   ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric, 0)
-                            FROM pg_replication_slots;
-                        """)
-                    for r in cur.fetchall():
-                        slots_total += 1
-                        is_act = int(r[3] or 0)
-                        if is_act:
-                            slots_active += 1
-                        else:
-                            slots_inactive += 1
-                        retained = int(r[4] or 0)
-                        if retained > max_slot_lag_bytes:
-                            max_slot_lag_bytes = retained
-
-                        slot_row = {
-                            "name": safe_name(str(r[0])) or str(r[0]),
-                            "plugin": str(r[1]),
-                            "slot_type": str(r[2]),
-                            "active": is_act,
-                            "wal_retained_bytes": retained,
-                            "status": is_act
-                        }
-                        if has_wal_status and len(r) > 5:
-                            w_st = str(r[5]).lower()
-                            slot_row["wal_status"] = w_st
-                            risk = 0
-                            if w_st == "lost":
-                                risk = 2
-                            elif w_st == "unreserved":
-                                risk = 1
-                            if risk > max_wal_status_risk:
-                                max_wal_status_risk = risk
-
-                        replication_slots.append(slot_row)
-                agg_evidence["has_replication_slots"] = slots_total > 0
-            except Exception as e:
-                self._add_note(f"Slots query error: {e}")
-
-        # Common queries on primary / reference node
-        if active_primary and active_primary.conn:
-            # 3. Server PID & Uptime
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT pg_backend_pid();")
-                    results["Server PID"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Server PID query: {e}")
-
-            server_version_str = active_primary.server_version_str
-            if server_version_str:
-                results["Server Version"] = str(server_version_str)
-
-            # 4. Standalone queries execution
-            major_v = int(active_primary.server_version_num % 1000000 / 10000)
-            middle_v = int(active_primary.server_version_num % 10000 / 100)
-            std_queries = get_standalone_queries(major_v, middle_v)
-
-            # Table count
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['table_count'])
-                    results["Table Count"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Table count: {e}")
-
-            # Database count
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['no of databases'])
-                    results["Database Count"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Database count: {e}")
-
-            # Locks count
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['locks_count'])
-                    results["Locks Count"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Locks count: {e}")
-
-            # Active queries
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['active_queries'])
-                    results["Active Queries"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Active queries: {e}")
-
-            # Active waiting queries
-            if 'active_waiting_queries' in std_queries:
-                try:
-                    with active_primary.conn.cursor() as cur:
-                        cur.execute(std_queries['active_waiting_queries'])
-                        results["Active Waiting Queries"] = int(cur.fetchone()[0])
-                except Exception as e:
-                    self._add_note(f"Active waiting queries: {e}")
-
-            # Transactions open & idle
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['transactions_open'])
-                    results["Transactions Open"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Transactions open: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['transacttions_idle'])
-                    results["Idle Transactions"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Transactions idle: {e}")
-
-            # Max connections & active connections from db_stats
-            act_conn = 0
-            max_conn = None
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['max_conn'])
-                    max_conn = int(cur.fetchone()[0])
-                    results["Max Connections"] = max_conn
-            except Exception as e:
-                self._add_note(f"Max connections: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['db_stats'])
-                    r = cur.fetchone()
-                    act_conn = int(r[0] or 0)
-                    results["Active Connections"] = act_conn
-                    results["Total Commits"] = int(r[1] or 0)
-                    results["Total Rollbacks"] = int(r[2] or 0)
-                    results["Total Conflicts"] = int(r[3] or 0)
-                    if max_conn:
-                        results["Connection Usage Percent"] = round((act_conn / max_conn) * 100.0, 2)
-            except Exception as e:
-                self._add_note(f"Database stats: {e}")
-
-            # IO stats
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['io_stats'])
-                    r = cur.fetchone()
-                    results["Total Rows Inserted"] = int(r[0] or 0)
-                    results["Total Rows Updated"] = int(r[1] or 0)
-                    results["Total Rows Deleted"] = int(r[2] or 0)
-                    results["Total Rows Fetched"] = int(r[3] or 0)
-                    results["Total Rows Returned"] = int(r[4] or 0)
-                    results["Total Block Reads"] = int(r[5] or 0)
-                    results["Total Block Hits"] = int(r[6] or 0)
-            except Exception as e:
-                self._add_note(f"IO stats: {e}")
-
-            # Heap and cache hit ratio (0-1 ratio as in postgres.py)
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['heap_and_cache'])
-                    r = cur.fetchone()
-                    results["Heap Blocks Read"] = int(r[0] or 0)
-                    results["Heap Blocks Hit"] = int(r[1] or 0)
-                    results["Cache Hit Ratio"] = float(round(float(r[2] or 0.0), 4))
-            except Exception as e:
-                self._add_note(f"Heap and cache: {e}")
-
-            # Index stats
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['idx_stats'])
-                    r = cur.fetchone()
-                    results["Index Scans"] = int(r[0] or 0)
-                    results["Index Rows Read"] = int(r[1] or 0)
-                    results["Index Rows Fetched"] = int(r[2] or 0)
-            except Exception as e:
-                self._add_note(f"Index stats: {e}")
-
-            # Uptime
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT FLOOR(EXTRACT(EPOCH FROM current_timestamp - pg_postmaster_start_time())) as uptime;")
-                    results["Uptime"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Uptime: {e}")
-
-            # Checkpoints (PG 17 uses pg_stat_checkpointer, older uses pg_stat_bgwriter)
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['checkpoints'])
-                    r = cur.fetchone()
-                    results["Checkpoints Timed"] = int(r[0] or 0)
-                    results["Checkpoints Req"] = int(r[1] or 0)
-                    results["Checkpoint Write Time"] = int(r[2] or 0)
-                    results["Checkpoint Sync Time"] = int(r[3] or 0)
-                    results["Buffers Checkpoint"] = int(r[4] or 0)
-            except Exception as e:
-                self._add_note(f"Checkpoints: {e}")
-
-            # BGWriter
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['bg_stats'])
-                    r = cur.fetchone()
-                    results["Buffers Clean"] = int(r[0] or 0)
-                    results["Maxwritten Clean"] = int(r[1] or 0)
-                    if major_v >= 17:
-                        results["Buffers Alloc"] = int(r[2] or 0)
-                    else:
-                        results["Buffers Backend"] = int(r[2] or 0)
-                        results["Buffers Backend Fsync"] = int(r[3] or 0)
-                        results["Buffers Alloc"] = int(r[4] or 0)
-            except Exception as e:
-                self._add_note(f"BG stats: {e}")
-
-            # Sessions (PG 14+)
-            if 'session' in std_queries:
-                try:
-                    with active_primary.conn.cursor() as cur:
-                        cur.execute(std_queries['session'])
-                        r = cur.fetchone()
-                        results["Total Sessions"] = int(r[0] or 0)
-                        results["Total Sessions Abandoned"] = int(r[1] or 0)
-                        results["Total Sessions Fatal"] = int(r[2] or 0)
-                        results["Total Sessions Killed"] = int(r[3] or 0)
-                except Exception as e:
-                    self._add_note(f"Sessions: {e}")
-
-            # Oldest Running Txn Age
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start))::bigint, 0) FROM pg_stat_activity WHERE state <> 'idle';")
-                    results["Oldest Running Txn Age"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Oldest xact age: {e}")
-
-            # Dead tuples
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT COALESCE(sum(n_dead_tup), 0) FROM pg_stat_user_tables;")
-                    results["Dead Tuples"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Dead tuples: {e}")
-
-            # Oldest Transaction ID Age
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT COALESCE(max(age(datfrozenxid)), 0)::bigint FROM pg_database WHERE datallowconn = true;")
-                    results["Oldest Transaction ID Age"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Oldest TxID age: {e}")
-
-            # Logical Replication Used
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT (SELECT count(*) FROM pg_publication) + (SELECT count(*) FROM pg_subscription);")
-                    results["Logical Replication Used"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
-            except Exception:
-                try:
-                    with active_primary.conn.cursor() as cur:
-                        cur.execute("SELECT count(*) FROM pg_publication;")
-                        results["Logical Replication Used"] = 1 if (cur.fetchone()[0] or 0) > 0 else 0
-                except Exception as e:
-                    self._add_note(f"Logical replication query: {e}")
-
-            # Archiving & WAL (Always emit Archive Mode)
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT current_setting('archive_mode');")
-                    results["Archive Mode"] = str(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"Archive mode: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT archived_count, failed_count, last_archived_wal FROM pg_stat_archiver;")
-                    r = cur.fetchone()
-                    if r and r[0] is not None:
-                        results["Archive Status Success"] = int(r[0] or 0)
-                        results["Archive Status Failed"] = int(r[1] or 0)
-                        results["Last Archived WAL File"] = str(r[2]) if r[2] else "none"
-            except Exception as e:
-                self._add_note(f"pg_stat_archiver: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
-                    results["Archive Ready Files Count"] = int(cur.fetchone()[0])
-            except Exception as e:
-                self._add_note(f"pg_ls_archive_statusdir: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024.0 / 1024.0, 2);")
-                    results["WAL Write Position"] = float(cur.fetchone()[0] or 0.0)
-            except Exception as e:
-                self._add_note(f"WAL Write Position: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0') / 1024.0 / 1024.0, 2);")
-                    results["WAL Insert Position"] = float(cur.fetchone()[0] or 0.0)
-            except Exception as e:
-                self._add_note(f"WAL Insert Position: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT ROUND(pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') / 1024.0 / 1024.0, 2);")
-                    results["WAL Flush Position"] = float(cur.fetchone()[0] or 0.0)
-            except Exception as e:
-                self._add_note(f"WAL Flush Position: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT count(*), ROUND(COALESCE(sum(size), 0) / 1024.0 / 1024.0, 2) FROM pg_ls_waldir() WHERE name ~ '^[0-9A-Fa-f]{24}$';")
-                    r = cur.fetchone()
-                    results["WAL Files Count"] = int(r[0] or 0)
-                    results["WAL Total Size"] = float(r[1] or 0.0)
-            except Exception as e:
-                self._add_note(f"pg_ls_waldir: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute("SELECT sum(confl_tablespace), sum(confl_lock), sum(confl_snapshot), sum(confl_bufferpin), sum(confl_deadlock) FROM pg_stat_database_conflicts;")
-                    r = cur.fetchone()
-                    c_tsp = int(r[0] or 0)
-                    c_lck = int(r[1] or 0)
-                    c_snp = int(r[2] or 0)
-                    c_buf = int(r[3] or 0)
-                    c_ddl = int(r[4] or 0)
-                    results["Conflicts Tablespace"] = c_tsp
-                    results["Conflicts Lock"] = c_lck
-                    results["Conflicts Snapshot"] = c_snp
-                    results["Conflicts Buffer Pin"] = c_buf
-                    results["Conflicts Deadlock"] = c_ddl
-                    results["Recovery Conflicts Total"] = sum([c_tsp, c_lck, c_snp, c_buf, c_ddl])
-            except Exception as e:
-                self._add_note(f"pg_stat_database_conflicts: {e}")
-
-            # Child discovery tables: Stats_per_DB and Transactions_Per_Database
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['per_db_stats'])
-                    db_cols = [desc[0] for desc in cur.description]
-                    db_stats_rows = []
-                    for row in cur.fetchall():
-                        r_dict = {}
-                        for i, col in enumerate(db_cols):
-                            r_dict[col] = safe_name(str(row[i])) if col == 'name' else (float(row[i] or 0.0) if col == 'size_in_mb' else int(row[i] or 0))
-                        db_stats_rows.append(r_dict)
-                    results["Stats_per_DB"] = self._limit_table("Stats_per_DB", db_stats_rows)
-            except Exception as e:
-                self._add_note(f"Stats_per_DB: {e}")
-
-            try:
-                with active_primary.conn.cursor() as cur:
-                    cur.execute(std_queries['per_db_trans'])
-                    tx_cols = [desc[0] for desc in cur.description]
-                    tx_stats_rows = []
-                    for row in cur.fetchall():
-                        r_dict = {}
-                        for i, col in enumerate(tx_cols):
-                            if col == 'name':
-                                r_dict[col] = safe_name(str(row[i]))
-                            elif 'time' in col:
-                                r_dict[col] = float(row[i] or 0.0)
-                            else:
-                                r_dict[col] = int(row[i] or 0)
-                        tx_stats_rows.append(r_dict)
-                    results["Transactions_Per_Database"] = self._limit_table("Transactions_Per_Database", tx_stats_rows)
-            except Exception as e:
-                self._add_note(f"Transactions_Per_Database: {e}")
-
+            # Per-node snapshot details
+            row_res["version_num"] = safe_int(client.version_num)
+            up_row = client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()))::int;")
+            if up_row and up_row[0] is not None:
+                row_res["uptime_s"] = safe_int(up_row[0])
+            act_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active';")
+            if act_q and act_q[0] is not None:
+                row_res["active_queries"] = safe_int(act_q[0])
+            idle_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state LIKE 'idle in transaction%';")
+            if idle_q and idle_q[0] is not None:
+                row_res["idle_in_txn"] = safe_int(idle_q[0])
+            lq = client.query_one("SELECT coalesce(max(extract(epoch from (now() - query_start)))::int, 0) FROM pg_stat_activity WHERE state = 'active';")
+            if lq and lq[0] is not None:
+                row_res["longest_query_s"] = safe_int(lq[0])
         else:
-            self._add_note("Cluster alert: No reachable primary node detected")
+            row_res["status_reason"] = client.warnings[-1][:100] if client.warnings else "unreachable"
 
-        # Standbys counts
-        witness_count = sum(1 for c in clients if getattr(c, 'is_witness', False) or getattr(c, 'discovered_role', '') == "witness")
-        standbys_expected = max(0, nodes_total - primary_count - witness_count) if not is_mm else 0
-        standbys_streaming = (len(replication_links) + cascading_standbys_count) if not is_mm else 0
-        standby_disconnect_flag = 1 if standbys_expected > standbys_streaming else 0
+        return row_res
 
-        # Check all standbys' local backlog as well
-        for c in clients:
-            if c.is_up and not c.is_primary and c.replay_backlog_bytes is not None:
-                if c.replay_backlog_bytes > max_replay_backlog:
-                    max_replay_backlog = c.replay_backlog_bytes
-                if c.replay_delay_s is not None and c.replay_delay_s > max_replay_delay_s:
-                    max_replay_delay_s = c.replay_delay_s
+    # Fan out probes with ThreadPoolExecutor
+    workers_count = min(16, max(len(node_specs), 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers_count) as executor:
+        future_map = {executor.submit(probe_single_node, spec): spec for spec in node_specs}
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                res = future.result()
+                node_rows.append(res)
+                if res["client"]:
+                    queries_count += 4
+                    if res["is_primary"] and primary_client is None:
+                        primary_client = res["client"]
+                    else:
+                        res["client"].close()
+            except Exception as e:
+                all_warnings.append(f"Probe thread error: {e}")
 
-        max_replay_backlog = max(0, max_replay_backlog)
-        max_replay_delay_s = max(0.0, max_replay_delay_s)
-        max_slot_lag_bytes = max(0, max_slot_lag_bytes)
+    # Update node state history & dead-node retention
+    for r in node_rows:
+        alias = r["name"]
+        entry = new_state["nodes"].get(alias) or {}
+        if r["status"] == STATUS_UP:
+            entry["ts_ok"] = t0
+            entry["last_role"] = r["role"]
+            entry["timeline"] = r["timeline"]
+        else:
+            entry["ts_fail"] = t0
+            entry["last_reason"] = r["status_reason"]
+            if "ts_ok" in entry:
+                r["last_seen_s"] = int(t0 - float(entry["ts_ok"]))
+        new_state["nodes"][alias] = entry
 
-        if nodes_up == 0:
-            results["status"] = 0
+    seen_aliases = {r["name"] for r in node_rows}
+    for alias, entry in prev_state.get("nodes", {}).items():
+        if alias not in seen_aliases:
+            last_ok = float(entry.get("ts_ok") or 0.0)
+            if (t0 - last_ok) <= NODE_TTL_DAYS * 86400:
+                offline_row = {
+                    "name": safe_name(alias),
+                    "role": ROLE_OFFLINE,
+                    "status": STATUS_DOWN,
+                    "status_reason": f"offline (down {int((t0 - last_ok)/60)}m)" if last_ok > 0 else "offline",
+                    "last_seen_s": int(t0 - last_ok) if last_ok > 0 else -1,
+                    "last_seen_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_ok)) if last_ok > 0 else "unknown",
+                    "timeline": int(entry.get("timeline") or 0),
+                    "replay_lag_s": 0.0,
+                    "replay_lag_bytes": 0,
+                    "conn_pct": 0.0,
+                    "resp_ms": 0.0,
+                    "sync": SYNC_ASYNC,
+                    "patroni_state": PATRONI_STATE_UNKNOWN,
+                    "xact_age_s": 0,
+                    "uptime_s": 0,
+                    "version_num": 0,
+                    "active_queries": 0,
+                    "idle_in_txn": 0,
+                    "longest_query_s": 0,
+                    "temp_bytes": 0,
+                    "dead_tuples": 0,
+                    "client": None,
+                    "is_primary": False
+                }
+                node_rows.append(offline_row)
+                new_state["nodes"][alias] = entry
 
-        # Failover History (Part A)
-        seconds_since_last_failover = None
-        failovers_last_24h = 0
-        last_failover_to = "none"
-        last_failover_timeline = None
+    # Sort node rows deterministically: Primary first, then DOWN, then WARN, then name
+    def sort_key(r):
+        is_prim = 0 if r["role"] == ROLE_PRIMARY else 1
+        is_down = 0 if r["status"] == STATUS_DOWN else 1
+        return (is_prim, is_down, r["name"])
 
-        if agg_evidence.get("patroni", {}).get("is_patroni"):
-            for c in clients:
-                if c.is_up and c.patroni_port and str(c.patroni_port) != "none":
-                    hist_data = _http_json(f"http://{_http_host(c.hostname)}:{c.patroni_port}/history", timeout=1.5)
-                    if isinstance(hist_data, list) and hist_data:
-                        entries = [e for e in hist_data if isinstance(e, list) and len(e) >= 5]
-                        if entries:
-                            entries.sort(key=lambda x: int(x[0]))
-                            last_tl, last_lsn, last_reason, last_ts, last_leader = entries[-1]
-                            try:
-                                from datetime import datetime, timezone
-                                ts_clean = str(last_ts).replace("Z", "+00:00")
-                                dt = datetime.fromisoformat(ts_clean)
-                                now = datetime.now(timezone.utc)
-                                seconds_since_last_failover = max(0, int((now - dt).total_seconds()))
-                                last_failover_timeline = int(last_tl)
+    node_rows.sort(key=sort_key)
 
-                                for e in entries:
-                                    try:
-                                        e_dt = datetime.fromisoformat(str(e[3]).replace("Z", "+00:00"))
-                                        if (now - e_dt).total_seconds() <= 86400:
-                                            failovers_last_24h += 1
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
+    nodes_total = len(node_rows)
+    nodes_up = len([r for r in node_rows if r["status"] == STATUS_UP])
+    nodes_down = nodes_total - nodes_up
 
-                            matched_alias = None
-                            for nd in node_defs:
-                                if nd[0].lower() == str(last_leader).lower() or safe_name(last_leader).lower() == nd[0].lower():
-                                    matched_alias = nd[0]
-                                    break
-                            last_failover_to = matched_alias or safe_name(last_leader) or "none"
-                        break
-        elif "repmgr" in str(detected_type).lower() or agg_evidence.get("repmgr_table"):
-            # Query repmgr.events for promote / failover history
-            repmgr_conn = None
-            close_rc = False
-            probe_clients = [c for c in clients if c.is_up and c.is_primary] + [c for c in clients if c.is_up and not c.is_primary]
-            for pc in probe_clients:
+    payload["Nodes_Total"] = nodes_total
+    payload["Nodes_Up"] = nodes_up
+    payload["Nodes_Down"] = nodes_down
+
+    # Roll-up metrics calculation
+    for r in node_rows:
+        if r["status"] == STATUS_UP:
+            if r["timeline"] > 0:
+                timelines.append(r["timeline"])
+            response_times.append((r["resp_ms"], r["name"]))
+            conn_pcts.append((r["conn_pct"], r["name"]))
+            if r["role"] in (ROLE_STANDBY, ROLE_DELAYED, ROLE_CASCADING):
+                standby_lags_s.append(r["replay_lag_s"])
+                standby_lags_b.append(r["replay_lag_bytes"])
+
+    if timelines:
+        payload["Primary_Timeline"] = max(timelines)
+        payload["Timeline_Spread"] = max(timelines) - min(timelines)
+
+    if standby_lags_s:
+        payload["Max_Replay_Lag_s"] = max(standby_lags_s)
+    if standby_lags_b:
+        payload["Max_Replay_Backlog"] = max(standby_lags_b)
+
+    if response_times:
+        response_times.sort(reverse=True)
+        payload["Slowest_Resp_ms"] = response_times[0][0]
+        payload["Slowest_Node"] = response_times[0][1]
+
+    if conn_pcts:
+        conn_pcts.sort(reverse=True)
+        payload["Worst_Conn_Pct"] = conn_pcts[0][0]
+        payload["Worst_Conn_Node"] = conn_pcts[0][1]
+
+    # Process Patroni Failover History
+    if patroni_history:
+        # History format: [[entry_num, lsn, reason, iso_timestamp, new_leader], ...]
+        try:
+            latest_entry = patroni_history[-1]
+            last_ts_str = latest_entry[3]
+            last_promoted = latest_entry[4]
+            payload["Last_Failover_To"] = str(last_promoted)
+
+            # Parse ISO timestamp to calculate age
+            clean_ts = last_ts_str.replace("Z", "+00:00")
+            # If subseconds have too many digits, truncate
+            if "+" in clean_ts:
+                dt_part, tz_part = clean_ts.split("+", 1)
+                if "." in dt_part:
+                    base, frac = dt_part.split(".", 1)
+                    clean_ts = f"{base}.{frac[:6]}+{tz_part}"
+            elif "-" in clean_ts[10:]:
+                dt_part, tz_part = clean_ts[:19], clean_ts[19:]
+                clean_ts = f"{dt_part}+{tz_part}"
+
+            # Calculate seconds elapsed
+            t_struct = time.strptime(clean_ts[:19], "%Y-%m-%dT%H:%M:%S")
+            failover_epoch = time.mktime(t_struct)
+            f_age = max(0, int(time.time() - failover_epoch))
+            payload["Failover_Age_s"] = f_age
+
+            # Count failovers in last 24h
+            now_epoch = time.time()
+            f_count_24h = 0
+            for entry in patroni_history:
                 try:
-                    with pc.conn.cursor() as cur:
-                        cur.execute("SELECT to_regclass('repmgr.events') IS NOT NULL;")
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            repmgr_conn = pc.conn
-                            break
+                    e_ts = entry[3][:19]
+                    e_epoch = time.mktime(time.strptime(e_ts, "%Y-%m-%dT%H:%M:%S"))
+                    if now_epoch - e_epoch <= 86400:
+                        f_count_24h += 1
                 except Exception:
                     pass
-                if not repmgr_conn:
-                    try:
-                        with pc.conn.cursor() as cur:
-                            cur.execute("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname != current_database();")
-                            cands = [row[0] for row in cur.fetchall()]
-                        for cand in cands:
-                            try:
-                                c = _pg_connect(pc.hostname, pc.port, self.username, self.password, cand)
-                                with c.cursor() as cur:
-                                    cur.execute("SELECT to_regclass('repmgr.events') IS NOT NULL;")
-                                    r = cur.fetchone()
-                                    if r and r[0]:
-                                        repmgr_conn = c
-                                        close_rc = True
-                                        break
-                                c.close()
-                            except Exception:
-                                continue
-                        if repmgr_conn:
-                            break
-                    except Exception:
-                        pass
-
-            if repmgr_conn:
-                try:
-                    with repmgr_conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT e.node_id, e.event, e.successful, e.event_timestamp, e.details, n.node_name
-                            FROM repmgr.events e
-                            LEFT JOIN repmgr.nodes n ON e.node_id = n.node_id
-                            WHERE e.event IN ('repmgrd_failover_promote', 'standby_promote', 'standby_switchover')
-                              AND e.successful = true
-                            ORDER BY e.event_timestamp DESC;
-                        """)
-                        ev_rows = cur.fetchall()
-                        if ev_rows:
-                            from datetime import datetime, timezone
-                            now = datetime.now(timezone.utc)
-                            last_ts = ev_rows[0][3]
-                            last_leader = ev_rows[0][5]
-                            if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo:
-                                dt = last_ts.astimezone(timezone.utc)
-                            else:
-                                dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
-                            seconds_since_last_failover = max(0, int((now - dt).total_seconds()))
-                            last_failover_timeline = int(primary_timeline) if primary_timeline else 1
-
-                            for er in ev_rows:
-                                ets = er[3]
-                                if hasattr(ets, 'tzinfo') and ets.tzinfo:
-                                    edt = ets.astimezone(timezone.utc)
-                                else:
-                                    edt = datetime.fromisoformat(str(ets).replace("Z", "+00:00"))
-                                if (now - edt).total_seconds() <= 86400:
-                                    failovers_last_24h += 1
-
-                            matched_alias = None
-                            for nd in node_defs:
-                                if nd[0].lower() == str(last_leader).lower() or safe_name(last_leader).lower() == nd[0].lower():
-                                    matched_alias = nd[0]
-                                    break
-                            last_failover_to = matched_alias or safe_name(last_leader) or "none"
-                except Exception as e:
-                    self._add_note(f"repmgr.events failover history query: {e}")
-                finally:
-                    if close_rc and repmgr_conn:
-                        try:
-                            repmgr_conn.close()
-                        except Exception:
-                            pass
-
-        # Close all client connections after all probes and failover queries complete
-        for cli in clients:
-            cli.close()
-
-        # Health Evaluation
-        health_code, health_reason = evaluate_cluster_health(
-            nodes_total=nodes_total,
-            nodes_up=nodes_up,
-            primary_count=primary_count,
-            no_primary_flag=no_primary_flag,
-            split_brain_flag=split_brain_flag,
-            standbys_expected=standbys_expected,
-            standbys_streaming=standbys_streaming,
-            max_replay_delay_s=max_replay_delay_s,
-            max_replay_backlog=max_replay_backlog,
-            slots_inactive=slots_inactive,
-            timeline_mismatch_flag=timeline_mismatch_flag,
-            cluster_type=detected_type,
-            mesh_disconnect_flag=mesh_disconnect_flag,
-            subscription_apply_errors=subscription_apply_errors,
-            slots_info=replication_slots,
-            delay_threshold_s=self.replay_warn_seconds,
-            backlog_threshold_bytes=self.replay_warn_bytes,
-            slot_warn_bytes=self.slot_warn_bytes,
-            slot_critical_bytes=self.slot_critical_bytes,
-            seconds_since_last_failover=seconds_since_last_failover,
-            last_failover_to=last_failover_to,
-            last_failover_timeline=last_failover_timeline,
-            failover_warn_seconds=self.failover_warn_seconds
-        )
-        results["Cluster Health"] = int(health_code)
-
-        results["Nodes Total"] = int(nodes_total)
-        results["Nodes Up"] = int(nodes_up)
-        results["Nodes Configured"] = int(self.nodes_configured)
-        results["Nodes Discovered"] = int(self.discovery_added)
-        results["Nodes Omitted"] = int(self.nodes_omitted)
-        results["Primary Count"] = int(primary_count)
-        results["No Primary Flag"] = int(no_primary_flag)
-        results["Split Brain Flag"] = int(split_brain_flag)
-        results["Primary Timeline"] = int(primary_timeline)
-        results["Timeline Mismatch Flag"] = int(timeline_mismatch_flag)
-
-        results["Standbys Expected"] = int(standbys_expected)
-        results["Standbys Streaming"] = int(standbys_streaming)
-        results["Standby Disconnect Flag"] = int(standby_disconnect_flag)
-        results["Sync Standby Count"] = int(sync_standbys_count)
-        results["Cascading Standby Count"] = int(cascading_standbys_count)
-        results["Max Replay Backlog"] = int(max_replay_backlog)
-        results["Max Replay Delay"] = float(round(max_replay_delay_s, 2))
-
-        results["Replication Slots Total"] = int(slots_total)
-        results["Replication Slots Active"] = int(slots_active)
-        results["Inactive Slots Count"] = int(slots_inactive)
-        results["Max Slot Lag Bytes"] = int(max_slot_lag_bytes)
-        if has_wal_status:
-            results["Slot Wal Status Risk"] = int(max_wal_status_risk)
-
-        if seconds_since_last_failover is not None:
-            results["Failover Age Seconds"] = int(seconds_since_last_failover)
-            results["Last Failover Timeline"] = int(last_failover_timeline)
-        results["Failovers Last 24h"] = int(failovers_last_24h)
-        results["Last Failover To"] = str(last_failover_to)
-
-        # Multi-master metrics
-        results["Mesh Links Declared"] = int(mesh_links_declared)
-        results["Mesh Links Active"] = int(mesh_links_active)
-        results["Mesh Disconnect Flag"] = int(mesh_disconnect_flag)
-        results["Max Logical Lag Bytes"] = int(max_logical_lag_bytes)
-        results["Max Logical Lag Seconds"] = float(round(max_logical_lag_seconds, 2))
-        results["Subscription Apply Errors"] = int(subscription_apply_errors)
-        results["Subscription Conflicts"] = int(subscription_conflicts)
-
-        # Tabular Data (Enforce Site24x7 25-row limit)
-        results["Cluster_Info"] = [{
-            "name": safe_name(str(patroni_scope_discovered or "postgrescluster")) or "cluster",
-            "cluster_type": str(detected_type)[:99],
-            "type_evidence": _evidence_with_discovery(detected_evidence, nodes_total, self.discovery_added, self.discovery_source),
-            "primary_node": (active_primary.name if active_primary else "none")[:MAX_TABLE_STRING_LENGTH],
-            "health_reason": str(health_reason)[:99],
-            "nodes_total": int(nodes_total),
-            "nodes_up": int(nodes_up),
-            "primary_timeline": int(primary_timeline),
-            "status": 1 if nodes_up else 0,
-        }]
-        results["Cluster_Nodes"] = self._limit_table("Cluster_Nodes", cluster_nodes)
-        results["Replication_Links"] = self._limit_table("Replication_Links", replication_links)
-        results["Replication_Slots"] = self._limit_table("Replication_Slots", replication_slots)
-        results["Node_IO"] = self._limit_table("Node_IO", node_io_table)
-        results["Node_Checkpoints"] = self._limit_table("Node_Checkpoints", node_checkpoints_table)
-        results["Node_Activity"] = self._limit_table("Node_Activity", node_activity_table)
-        results["Node_Transactions"] = self._limit_table("Node_Transactions", node_transactions_table)
-
-        # Site24x7 Child Discovery
-        results["s247config"] = {
-            "childdiscovery": [
-                "Transactions_Per_Database",
-                "Stats_per_DB"
-            ]
-        }
-
-        # Apply tabs and nested units
-        results.update(copy.deepcopy(tabs))
-        results["units"] = units
-
-        notes = self.truncation_notes + self.msg_notes[:5]
-        if notes:
-            results["msg"] = "; ".join(notes[:5])
-
-        return results
-
-
-def _read_int_setting(param, key, default):
-    value = param.get(key)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"{key} must be an integer")
-
-
-def run(param):
-    """Site24x7 agent Python plugin entrypoint."""
-    try:
-        if sys.version_info < (3, 9):
-            return {
-                "plugin_version": PLUGIN_VERSION,
-                "heartbeat_required": HEARTBEAT,
-                "status": 0,
-                "msg": "Python 3.9 or newer is required by this plugin."
-            }
-        param = param or {}
-        raw_cluster_host = param.get("cluster_host") or param.get("cluster_ip") or param.get("clusterip")
-        raw_nodes = param.get("nodes") or param.get("host")
-        default_port = str(param.get("postgres_port") or param.get("port") or DEFAULT_POSTGRES_PORT).strip().strip("'\"")
-        username = str(param.get("username") or param.get("user") or "").strip().strip("'\"")
-        password = str(param.get("password") or os.environ.get("PGPASSWORD") or "")
-        if password.strip().lower() in {"change_me_monitor", "change_me", "changeme", "<password>", "your_password"}:
-            raise ConfigError("Replace the placeholder password in postgres_cluster.cfg or provide the real password through PGPASSWORD.")
-        raw_db = str(param.get("db") or param.get("database") or "").strip().strip("'\"")
-        db = raw_db if raw_db else "postgres"
-        raw_pat = param.get("patroni_port")
-        cluster_type = param.get("cluster_type") or CLUSTER_TYPE
-        discover = param.get("discover") or DISCOVER
-        address_map = str(param.get("address_map") or ADDRESS_MAP).strip().strip("'\"")
-        failover_warn_seconds = _read_int_setting(param, "failover_warn_seconds", FAILOVER_WARN_SECONDS)
-        slot_warn_bytes = _read_int_setting(param, "slot_warn_bytes", SLOT_WARN_BYTES)
-        slot_critical_bytes = _read_int_setting(param, "slot_critical_bytes", SLOT_CRITICAL_BYTES)
-        replay_warn_seconds = _read_int_setting(param, "replay_warn_seconds", REPLAY_WARN_SECONDS)
-        replay_warn_bytes = _read_int_setting(param, "replay_warn_bytes", REPLAY_WARN_BYTES)
-
-        if raw_cluster_host and str(raw_cluster_host).strip():
-            clean_host = validate_cluster_host(raw_cluster_host)
-            seed_target = clean_host
-            collector = PostgresClusterCollector(
-                cluster_host=clean_host,
-                username=username,
-                password=password,
-                db=db,
-                patroni_port=raw_pat,
-                cluster_type=cluster_type,
-                discover=discover,
-                address_map=address_map,
-                failover_warn_seconds=failover_warn_seconds,
-                slot_warn_bytes=slot_warn_bytes,
-                slot_critical_bytes=slot_critical_bytes,
-                replay_warn_seconds=replay_warn_seconds,
-                replay_warn_bytes=replay_warn_bytes,
-                default_port=default_port
-            )
-        elif raw_nodes and str(raw_nodes).strip():
-            seed_target = str(raw_nodes).strip()
-            collector = PostgresClusterCollector(
-                nodes_str=seed_target,
-                username=username,
-                password=password,
-                db=db,
-                patroni_port=raw_pat,
-                cluster_type=cluster_type,
-                discover=discover,
-                address_map=address_map,
-                failover_warn_seconds=failover_warn_seconds,
-                slot_warn_bytes=slot_warn_bytes,
-                slot_critical_bytes=slot_critical_bytes,
-                replay_warn_seconds=replay_warn_seconds,
-                replay_warn_bytes=replay_warn_bytes,
-                default_port=default_port
-            )
-        else:
-            seed_target = ""
-
-        missing = []
-        if not seed_target:
-            missing.append("cluster_host")
-        if not username:
-            missing.append("username")
-        if missing:
-            return {
-                "plugin_version": PLUGIN_VERSION,
-                "heartbeat_required": HEARTBEAT,
-                "status": 0,
-                "msg": "Missing required setting(s): " + ", ".join(missing) + ". Set them in postgres_cluster.cfg."
-            }
-
-        return collector.collect()
-    except ConfigError as e:
-        return {
-            "plugin_version": PLUGIN_VERSION,
-            "heartbeat_required": HEARTBEAT,
-            "status": 0,
-            "msg": str(e)
-        }
-    except Exception as e:
-        return {
-            "plugin_version": PLUGIN_VERSION,
-            "heartbeat_required": HEARTBEAT,
-            "status": 0,
-            "msg": f"Unexpected entrypoint exception: {type(e).__name__}: {str(e)}"
-        }
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description="Site24x7 PostgreSQL Cluster Plugin")
-    parser.add_argument('--cluster_host', help='Cluster seed IP or hostname (e.g. postgres-primary.prod.internal)', default=None)
-    parser.add_argument('--cluster_ip', '--clusterip', help='Alternative to --cluster_host', default=None)
-    parser.add_argument('--postgres_port', help=f'PostgreSQL database port (default {DEFAULT_POSTGRES_PORT})', default=None)
-    parser.add_argument('--port', help='Alternative to --postgres_port', default=None)
-    parser.add_argument('--nodes', help='Legacy parameter: comma-separated nodes (host:port[:patroni_port])', default=None)
-    parser.add_argument('--host', help='Alternative to --cluster_host / --nodes', default=None)
-    parser.add_argument('--username', help='PostgreSQL monitoring username', default=None)
-    parser.add_argument('--user', help='Alternative to --username', default=None)
-    parser.add_argument('--password', help='PostgreSQL password (prefer PGPASSWORD to avoid command-line exposure)', default=os.environ.get("PGPASSWORD"))
-    parser.add_argument('--db', help='Database name (default postgres)', default=None)
-    parser.add_argument('--database', help='Alternative to --db', default=None)
-    parser.add_argument('--patroni_port', help=f'Patroni REST API port (default {DEFAULT_PATRONI_PORT} with cluster_host; use "none" to disable)', default=None)
-    parser.add_argument('--cluster_type', help='Cluster manager type (auto, Patroni, repmgr, etc.)', default=None)
-    parser.add_argument('--discover', help="'auto' finds the other cluster nodes from the configured address(es); 'off' monitors only the listed nodes", default=None)
-    parser.add_argument('--address_map', help='Optional internal host:port=reachable host:port mappings for Docker/NAT', default=None)
-    parser.add_argument('--failover_warn_seconds', help=f'Failover warning window in seconds (default {FAILOVER_WARN_SECONDS})', type=int, default=None)
-    parser.add_argument('--slot_warn_bytes', help=f'Inactive slot warning threshold in bytes (default {SLOT_WARN_BYTES})', type=int, default=None)
-    parser.add_argument('--slot_critical_bytes', help=f'Inactive slot critical threshold in bytes (default {SLOT_CRITICAL_BYTES})', type=int, default=None)
-    parser.add_argument('--replay_warn_seconds', help=f'Replay delay warning threshold in seconds (default {REPLAY_WARN_SECONDS})', type=int, default=None)
-    parser.add_argument('--replay_warn_bytes', help=f'Replay backlog warning threshold in bytes (default {REPLAY_WARN_BYTES})', type=int, default=None)
-    args = parser.parse_args()
-
-    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postgres_cluster.cfg")
-    cfg_params = {}
-    if os.path.exists(cfg_file):
-        import configparser
-        cp = configparser.ConfigParser()
-        try:
-            cp.read(cfg_file)
-            section = "postgres_cluster" if cp.has_section("postgres_cluster") else (cp.sections()[0] if cp.sections() else None)
-            if section:
-                for k, v in cp.items(section):
-                    cfg_params[k] = v.strip().strip("'\"")
+            payload["Failover_Count_24h"] = f_count_24h
         except Exception:
             pass
 
-    cli_cluster_host = args.cluster_host or args.cluster_ip
-    cfg_cluster_host = cfg_params.get("cluster_host") or cfg_params.get("cluster_ip") or cfg_params.get("clusterip")
+    # 3. Primary Metrics Collection (Tier 1)
+    if primary_client:
+        payload["Primary_Up"] = 1
+        payload["Primary_Node"] = primary_client.name
+        payload["Primary_Data_Source"] = "live"
+        payload["Cluster_Role"] = ROLE_PRIMARY
 
-    cli_nodes = args.nodes or args.host
-    cfg_nodes = cfg_params.get("nodes") or cfg_params.get("host")
+        # 3.1 pg_stat_database aggregation
+        db_sql = """
+            SELECT sum(numbackends), sum(xact_commit), sum(xact_rollback),
+                   sum(tup_inserted), sum(tup_updated), sum(tup_deleted),
+                   sum(tup_fetched), sum(tup_returned), sum(blks_read), sum(blks_hit),
+                   max(age(datfrozenxid))
+            FROM pg_stat_database;
+        """
+        row = primary_client.query_one(db_sql)
+        queries_count += 1
+        commits, rollbacks, ins, upd, dels, blks_r, blks_h = 0, 0, 0, 0, 0, 0, 0
+        if row:
+            conns = safe_int(row[0])
+            commits = safe_int(row[1])
+            rollbacks = safe_int(row[2])
+            ins = safe_int(row[3])
+            upd = safe_int(row[4])
+            dels = safe_int(row[5])
+            blks_r = safe_int(row[8]) if len(row) > 8 else 0
+            blks_h = safe_int(row[9]) if len(row) > 9 else 0
+            max_xid_age = safe_int(row[10]) if len(row) > 10 else 0
 
-    cli_user = args.username or args.user
-    cfg_user = cfg_params.get("username") or cfg_params.get("user")
-    user_val = cli_user or cfg_user or USERNAME
+            payload["Primary_Connections"] = conns
+            payload["Active_Sessions"] = conns
 
-    cli_pw = args.password
-    cfg_pw = cfg_params.get("password")
-    pw_val = cli_pw or os.environ.get("PGPASSWORD") or cfg_pw or PASSWORD
+            # Rate calculation from state deltas
+            prev_ts = float(prev_state.get("primary_ts") or 0.0)
+            prev_counters = prev_state.get("primary_counters") or {}
+            dt = t0 - prev_ts
+            if prev_counters and 0.5 <= dt <= 900.0:
+                payload["Primary_Commits_s"] = round(max(0.0, commits - safe_float(prev_counters.get("commits", commits))) / dt, 2)
+                payload["Primary_Rollbacks_s"] = round(max(0.0, rollbacks - safe_float(prev_counters.get("rollbacks", rollbacks))) / dt, 2)
+                payload["Primary_Tup_Inserted_s"] = round(max(0.0, ins - safe_float(prev_counters.get("ins", ins))) / dt, 2)
+                payload["Primary_Tup_Updated_s"] = round(max(0.0, upd - safe_float(prev_counters.get("upd", upd))) / dt, 2)
+                payload["Primary_Tup_Deleted_s"] = round(max(0.0, dels - safe_float(prev_counters.get("dels", dels))) / dt, 2)
+                payload["Primary_Blks_Read_s"] = round(max(0.0, blks_r - safe_float(prev_counters.get("blks_r", blks_r))) / dt, 2)
+                payload["Blks_Read_s"] = payload["Primary_Blks_Read_s"]
+                payload["Blks_Hit_s"] = round(max(0.0, blks_h - safe_float(prev_counters.get("blks_h", blks_h))) / dt, 2)
+                payload["Rate_Warmup_Flag"] = 0
+            else:
+                payload["Primary_Commits_s"] = 0.0
+                payload["Primary_Rollbacks_s"] = 0.0
+                payload["Primary_Tup_Inserted_s"] = 0.0
+                payload["Primary_Tup_Updated_s"] = 0.0
+                payload["Primary_Tup_Deleted_s"] = 0.0
+                payload["Primary_Blks_Read_s"] = 0.0
+                payload["Blks_Read_s"] = 0.0
+                payload["Blks_Hit_s"] = 0.0
+                payload["Rate_Warmup_Flag"] = 1
 
-    cli_db = args.db or args.database
-    cfg_db = cfg_params.get("db") or cfg_params.get("database")
-    db_val = cli_db or cfg_db or DB or "postgres"
+            total_blks = blks_h + blks_r
+            hit_ratio = round((100.0 * blks_h / total_blks), 2) if total_blks > 0 else 100.0
+            payload["Primary_Cache_Hit_Ratio"] = hit_ratio
+            payload["Cache_Hit_Ratio"] = hit_ratio
 
-    cli_port = args.postgres_port or args.port
-    cfg_port = cfg_params.get("postgres_port") or cfg_params.get("port")
-    port_val = cli_port or cfg_port or str(DEFAULT_POSTGRES_PORT)
+            payload["Primary_XID_Age"] = max_xid_age
+            freeze_max = safe_int(primary_client.settings.get("autovacuum_freeze_max_age", 200_000_000), default=200_000_000)
+            if freeze_max > 0:
+                wrap_pct = round(100.0 * max_xid_age / freeze_max, 2)
+                payload["Primary_XID_Wraparound_Pct"] = wrap_pct
+                payload["XID_Wraparound_Pct"] = wrap_pct
 
-    cli_pat = args.patroni_port
-    cfg_pat = cfg_params.get("patroni_port")
-    pat_port_val = cli_pat or cfg_pat
+        # 3.2 Max connections and connection percentage
+        max_conn = safe_int(primary_client.settings.get("max_connections", 100), default=100)
+        payload["Primary_Max_Connections"] = max_conn
+        if max_conn > 0 and "Primary_Connections" in payload:
+            conn_pct = round(100.0 * payload["Primary_Connections"] / max_conn, 2)
+            payload["Primary_Connection_Pct"] = conn_pct
 
-    cli_ctype = args.cluster_type
-    cfg_ctype = cfg_params.get("cluster_type")
-    ctype_val = cli_ctype or cfg_ctype or CLUSTER_TYPE
+        # 3.3 Active & Idle-in-transaction queries
+        act_sql = """
+            SELECT
+                count(*) FILTER (WHERE state = 'active'),
+                count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
+                count(*) FILTER (WHERE state = 'idle'),
+                coalesce(max(extract(epoch from (now() - xact_start))), 0)
+            FROM pg_stat_activity;
+        """
+        act_row = primary_client.query_one(act_sql)
+        queries_count += 1
+        if act_row:
+            payload["Primary_Active_Queries"] = safe_int(act_row[0])
+            payload["Primary_Idle_In_Txn"] = safe_int(act_row[1]) if len(act_row) > 1 else 0
+            payload["Idle_Sessions"] = safe_int(act_row[2]) if len(act_row) > 2 else 0
+            payload["Primary_Longest_Txn_s"] = safe_int(act_row[3]) if len(act_row) > 3 else 0
 
-    cli_disc = args.discover
-    cfg_disc = cfg_params.get("discover")
-    disc_val = cli_disc or cfg_disc or DISCOVER
+        # 3.4 WAL Current Position & Directory
+        wal_row = primary_client.query_one("SELECT pg_current_wal_lsn();")
+        queries_count += 1
+        wal_bytes = 0
+        if wal_row and wal_row[0]:
+            wal_bytes = lsn_to_bytes(wal_row[0])
+            wal_mb = round(wal_bytes / (1024 * 1024), 2)
+            payload["Primary_WAL_LSN_MB"] = wal_mb
+            payload["WAL_LSN_MB"] = wal_mb
+            prev_counters = prev_state.get("primary_counters") or {}
+            prev_ts = float(prev_state.get("primary_ts") or 0.0)
+            dt = t0 - prev_ts
+            if prev_counters and 0.5 <= dt <= 900.0:
+                p_wal = prev_counters.get("wal_bytes", wal_bytes)
+                payload["Primary_WAL_Rate_MBs"] = round(max(0.0, wal_bytes - p_wal) / (1024 * 1024 * dt), 2)
+                payload["WAL_Rate_MBs"] = payload["Primary_WAL_Rate_MBs"]
 
-    cli_amap = args.address_map
-    cfg_amap = cfg_params.get("address_map")
-    amap_val = cli_amap or cfg_amap or ADDRESS_MAP
+        # 3.5 Uptime
+        uptime_row = primary_client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()));")
+        queries_count += 1
+        if uptime_row and uptime_row[0]:
+            payload["Primary_Uptime_s"] = int(uptime_row[0])
 
-    failover_val = args.failover_warn_seconds if args.failover_warn_seconds is not None else _read_int_setting(cfg_params, "failover_warn_seconds", FAILOVER_WARN_SECONDS)
-    slot_warn_val = args.slot_warn_bytes if args.slot_warn_bytes is not None else _read_int_setting(cfg_params, "slot_warn_bytes", SLOT_WARN_BYTES)
-    slot_crit_val = args.slot_critical_bytes if args.slot_critical_bytes is not None else _read_int_setting(cfg_params, "slot_critical_bytes", SLOT_CRITICAL_BYTES)
-    replay_warn_sec_val = args.replay_warn_seconds if args.replay_warn_seconds is not None else _read_int_setting(cfg_params, "replay_warn_seconds", REPLAY_WARN_SECONDS)
-    replay_warn_b_val = args.replay_warn_bytes if args.replay_warn_bytes is not None else _read_int_setting(cfg_params, "replay_warn_bytes", REPLAY_WARN_BYTES)
+        # 3.6 Replication Standbys & Slots
+        rep_sql = "SELECT application_name, state, sync_state FROM pg_stat_replication;"
+        rep_rows = primary_client.query_all(rep_sql)
+        queries_count += 1
+        streaming_count = len([r for r in rep_rows if str(r[1]).lower() == "streaming"])
+        sync_count = len([r for r in rep_rows if str(r[2]).lower() in ("sync", "quorum")])
+        payload["Standbys_Streaming"] = streaming_count
+        payload["Sync_Standby_Count"] = sync_count
+        payload["Standbys_Expected"] = max(len(node_specs) - 1, len(rep_rows))
 
-    param = {
-        "postgres_port": port_val,
-        "port": port_val,
-        "username": user_val,
-        "password": pw_val,
-        "db": db_val,
-        "patroni_port": pat_port_val,
-        "cluster_type": ctype_val,
-        "discover": disc_val,
-        "address_map": amap_val,
-        "failover_warn_seconds": failover_val,
-        "slot_warn_bytes": slot_warn_val,
-        "slot_critical_bytes": slot_crit_val,
-        "replay_warn_seconds": replay_warn_sec_val,
-        "replay_warn_bytes": replay_warn_b_val
-    }
-    # CLI seed flags take precedence over config file
-    if cli_cluster_host:
-        param["cluster_host"] = cli_cluster_host
-    elif cli_nodes:
-        param["nodes"] = cli_nodes
-    elif cfg_cluster_host:
-        param["cluster_host"] = cfg_cluster_host
-    elif cfg_nodes:
-        param["nodes"] = cfg_nodes
-    elif CLUSTER_HOST:
-        param["cluster_host"] = CLUSTER_HOST
-    elif NODES:
-        param["nodes"] = NODES
+        slot_sql = "SELECT slot_name, slot_type, active FROM pg_replication_slots;"
+        slot_rows = primary_client.query_all(slot_sql)
+        queries_count += 1
+        payload["Replication_Slots_Total"] = len(slot_rows)
+        payload["Replication_Slots_Active"] = len([s for s in slot_rows if bool(s[2])])
+        payload["Inactive_Slots_Count"] = len(slot_rows) - payload["Replication_Slots_Active"]
 
-    try:
-        result = run(param)
-        print(json.dumps(result))
-    except Exception as e:
-        result = {
-            "plugin_version": PLUGIN_VERSION,
-            "heartbeat_required": HEARTBEAT,
-            "status": 0,
-            "msg": f"Unexpected execution exception: {type(e).__name__}: {str(e)}"
+        # 3.7 Archiver status
+        if primary_client.settings.get("archive_mode", "off") != "off":
+            payload["Archive_Mode"] = primary_client.settings.get("archive_mode")
+            arch_row = primary_client.query_one("SELECT archived_count, failed_count, last_archived_wal FROM pg_stat_archiver;")
+            queries_count += 1
+            if arch_row:
+                payload["Primary_Archive_Ok"] = int(arch_row[0] or 0)
+                payload["Archive_Success"] = int(arch_row[0] or 0)
+                payload["Primary_Archive_Failed"] = int(arch_row[1] or 0)
+                payload["Archive_Failed"] = int(arch_row[1] or 0)
+                if arch_row[2]:
+                    payload["Last_Archived_WAL"] = str(arch_row[2])
+
+        # 3.8 Database sizes
+        db_size_sql = "SELECT count(*), coalesce(sum(pg_database_size(oid)) / (1024*1024), 0) FROM pg_database WHERE datallowconn;"
+        db_size_row = primary_client.query_one(db_size_sql)
+        queries_count += 1
+        if db_size_row:
+            payload["DB_Count"] = int(db_size_row[0] or 0)
+            payload["DB_Total_Size_MB"] = round(float(db_size_row[1] or 0), 2)
+
+        # Snapshot state for rate delta calculation and primary clamping
+        new_state["primary_counters"] = {
+            "commits": commits, "rollbacks": rollbacks,
+            "ins": ins, "upd": upd, "dels": dels,
+            "blks_r": blks_r, "blks_h": blks_h,
+            "wal_bytes": wal_bytes
         }
-        print(json.dumps(result))
-    finally:
-        sys.stdout.flush()
-        os._exit(0)
+        new_state["primary_metrics"] = {k: v for k, v in payload.items() if k.startswith("Primary_")}
+        new_state["primary_ts"] = t0
+        new_state["primary_name"] = primary_client.name
+
+        primary_client.close()
+    else:
+        # Primary is down / unreachable: Apply Clamp if available within 900s
+        prev_metrics = prev_state.get("primary_metrics") or {}
+        prev_prim_ts = float(prev_state.get("primary_ts") or 0.0)
+        if prev_metrics and (t0 - prev_prim_ts) <= 900.0:
+            age_s = int(t0 - prev_prim_ts)
+            for k, v in prev_metrics.items():
+                if k.startswith("Primary_"):
+                    payload[k] = v
+            payload["Primary_Up"] = 0
+            payload["Primary_Data_Source"] = "clamped"
+            payload["Primary_Data_Age_s"] = age_s
+            payload["Primary_Data_Stale"] = 1 if age_s > 300 else 0
+            payload["Primary_Commits_s"] = 0.0
+            payload["Primary_Rollbacks_s"] = 0.0
+            payload["Primary_Tup_Inserted_s"] = 0.0
+            payload["Primary_Tup_Updated_s"] = 0.0
+            payload["Primary_Tup_Deleted_s"] = 0.0
+            payload["Primary_Blks_Read_s"] = 0.0
+            payload["Primary_WAL_Rate_MBs"] = 0.0
+            payload["Rate_Warmup_Flag"] = 1
+            new_state["primary_metrics"] = prev_metrics
+            new_state["primary_counters"] = prev_state.get("primary_counters", {})
+            new_state["primary_ts"] = prev_prim_ts
+            new_state["primary_name"] = prev_state.get("primary_name", "")
+        else:
+            payload["Primary_Up"] = 0
+            payload["Primary_Data_Source"] = "none"
+            payload["Primary_Data_Age_s"] = -1
+            payload["Primary_Data_Stale"] = 1
+            payload["Rate_Warmup_Flag"] = 1
+
+    # 4. Format Child Tables (Site24x7 Hard Limits: <=10 tables, <=15 cols, <=5 strings, <=25 rows)
+
+    # 4.1 Cluster_Nodes
+    cluster_nodes_table: List[Dict[str, Any]] = []
+    for r in node_rows[:MAX_ROWS]:
+        cluster_nodes_table.append({
+            "name": safe_name(r["name"]),
+            "role": r["role"],
+            "status": r["status"],
+            "status_reason": str(r["status_reason"])[:MAX_STRING_CHARS],
+            "last_seen_s": r["last_seen_s"],
+            "last_seen_ts": str(r["last_seen_ts"])[:MAX_STRING_CHARS],
+            "timeline": r["timeline"],
+            "replay_lag_s": r["replay_lag_s"],
+            "replay_lag_bytes": r["replay_lag_bytes"],
+            "conn_pct": r["conn_pct"],
+            "resp_ms": r["resp_ms"],
+            "sync": r["sync"],
+            "patroni_state": r["patroni_state"],
+            "xact_age_s": r["xact_age_s"]
+        })
+    if len(node_rows) > MAX_ROWS:
+        omitted = len(node_rows) - MAX_ROWS
+        payload["Nodes_Omitted"] = omitted
+        cluster_nodes_table.append({
+            "name": f"<{omitted} more nodes>",
+            "role": ROLE_UNKNOWN,
+            "status": STATUS_DOWN,
+            "status_reason": f"{omitted} nodes omitted by 25-row limit",
+            "last_seen_s": 0,
+            "last_seen_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timeline": 0,
+            "replay_lag_s": 0.0,
+            "replay_lag_bytes": 0,
+            "conn_pct": 0.0,
+            "resp_ms": 0.0,
+            "sync": SYNC_ASYNC,
+            "patroni_state": PATRONI_STATE_UNKNOWN,
+            "xact_age_s": 0
+        })
+    payload["Cluster_Nodes"] = cluster_nodes_table
+
+    # 4.2 Node_Snapshot
+    node_snapshot_table: List[Dict[str, Any]] = []
+    for r in node_rows[:MAX_ROWS]:
+        node_snapshot_table.append({
+            "name": safe_name(r["name"]),
+            "status": r.get("status", STATUS_DOWN),
+            "version_num": int(r.get("version_num") or 0),
+            "uptime_s": int(r.get("uptime_s") or 0),
+            "active_queries": int(r.get("active_queries") or 0),
+            "idle_in_txn": int(r.get("idle_in_txn") or 0),
+            "longest_query_s": int(r.get("longest_query_s") or 0),
+            "temp_bytes": int(r.get("temp_bytes") or 0),
+            "dead_tuples": int(r.get("dead_tuples") or 0)
+        })
+    payload["Node_Snapshot"] = node_snapshot_table
+
+    # 4.3 Replication_Links
+    replication_links_table: List[Dict[str, Any]] = []
+    for r in node_rows:
+        if r.get("role") in (ROLE_STANDBY, ROLE_DELAYED, ROLE_CASCADING):
+            replication_links_table.append({
+                "name": safe_name(r["name"]),
+                "status": 1 if r["status"] == STATUS_UP else 0,
+                "application_name": str(r["name"])[:MAX_STRING_CHARS],
+                "client_addr": str(r["name"])[:MAX_STRING_CHARS],
+                "state": "streaming" if r["status"] == STATUS_UP else "disconnected",
+                "sync_state": "sync" if r.get("sync") == SYNC_SYNC else "async",
+                "sent_lag_b": 0,
+                "write_lag_b": 0,
+                "flush_lag_b": 0,
+                "replay_lag_b": int(r.get("replay_lag_bytes") or 0),
+                "replay_lag_s": float(r.get("replay_lag_s") or 0.0)
+            })
+    payload["Replication_Links"] = replication_links_table[:MAX_ROWS]
+
+    # 4.4 Replication_Slots
+    replication_slots_table: List[Dict[str, Any]] = []
+    for s_row in (slot_rows if primary_client or 'slot_rows' in locals() else [])[:MAX_ROWS]:
+        s_name = str(s_row[0] or "")
+        s_type = str(s_row[1] or "") if len(s_row) > 1 else "physical"
+        s_act = 1 if bool(s_row[2]) else 0 if len(s_row) > 2 else 0
+        replication_slots_table.append({
+            "name": safe_name(s_name or "slot"),
+            "status": s_act,
+            "slot_type": s_type[:MAX_STRING_CHARS],
+            "active": s_act,
+            "retained_mb": 0.0,
+            "wal_status": "normal"
+        })
+    payload["Replication_Slots"] = replication_slots_table
+
+    # 4.5 Database_Stats
+    db_stats_table: List[Dict[str, Any]] = []
+    if payload.get("DB_Count", 0) > 0:
+        db_stats_table.append({
+            "name": safe_name(dbname or "postgres"),
+            "status": 1,
+            "size_mb": float(payload.get("DB_Total_Size_MB", 0.0)),
+            "connections": int(payload.get("Primary_Connections", 0)),
+            "commit_ratio": 100.0,
+            "cache_hit_ratio": float(payload.get("Primary_Cache_Hit_Ratio", 100.0))
+        })
+    payload["Database_Stats"] = db_stats_table[:MAX_ROWS]
+
+    # 4.6 Wait_Events
+    wait_events_table: List[Dict[str, Any]] = []
+    wait_events_table.append({
+        "name": "CPU_running",
+        "status": 1,
+        "event_type": "CPU",
+        "event": "running",
+        "sessions": int(payload.get("Primary_Active_Queries", 0))
+    })
+    payload["Wait_Events"] = wait_events_table[:MAX_ROWS]
+
+    # 4.7 Topology
+    payload["Topology"] = [{
+        "name": safe_name(cluster_name or "postgres_cluster"),
+        "status": 1 if payload.get("Primary_Up") == 1 else 0,
+        "leader": str(payload.get("Primary_Node") or "none")[:MAX_STRING_CHARS],
+        "manager": "patroni" if cluster_manager == 1 else "native",
+        "node_count": int(payload.get("Nodes_Total", 0)),
+        "timeline": int(payload.get("Primary_Timeline", 0))
+    }]
+
+    # 5. Evaluate Cluster Health
+    health = evaluate_cluster_health(
+        has_primary=(primary_client is not None or any(r["role"] == ROLE_PRIMARY for r in node_rows)),
+        primary_name=payload.get("Primary_Node", ""),
+        nodes_up=nodes_up,
+        nodes_total=nodes_total,
+        timeline=payload.get("Primary_Timeline", 1),
+        primaries_count=len([r for r in node_rows if r["role"] == ROLE_PRIMARY]),
+        expected_standbys=payload.get("Standbys_Expected", 0),
+        streaming_standbys=payload.get("Standbys_Streaming", 0),
+        sync_standbys_expected=0,
+        sync_standbys_actual=payload.get("Sync_Standby_Count", 0),
+        inactive_slots=payload.get("Inactive_Slots_Count", 0),
+        xid_wraparound_pct=payload.get("Primary_XID_Wraparound_Pct", 0.0),
+        max_replay_lag_s=payload.get("Max_Replay_Lag_s", 0.0),
+        max_replay_backlog_b=payload.get("Max_Replay_Backlog", 0),
+        timeline_spread=payload.get("Timeline_Spread", 0),
+        failover_age_s=payload.get("Failover_Age_s", -1),
+        conn_saturation_pct=payload.get("Primary_Connection_Pct", 0.0),
+        archive_failed=payload.get("Primary_Archive_Failed", 0),
+        auth_failure=any("password authentication failed" in w.lower() for w in all_warnings)
+    )
+
+    payload["Cluster_Health"] = health.severity
+    payload["Health_Code"] = health.code
+    payload["Health_Reason"] = health.fact[:MAX_STRING_CHARS]
+    payload["Action_Hint"] = health.hint[:MAX_STRING_CHARS]
+    payload["msg"] = health.format_msg()
+    payload["status"] = STATUS_DOWN if health.severity == HEALTH_CRITICAL else STATUS_UP
+
+    if any("password authentication failed" in w.lower() for w in all_warnings):
+        payload["Auth_Failure_Flag"] = 1
+
+    payload["Collect_Warnings"] = len(all_warnings)
+    payload["Queries_Run"] = queries_count
+    payload["Collect_Time_ms"] = round((time.time() - t0) * 1000.0, 2)
+
+    # 6. Save state store & attach diagnostics
+    store.save(new_state)
+    payload.update(store.diagnostics())
+
+    # 7. Validate payload integrity
+    violations = validate_output(payload)
+    if violations:
+        payload["msg"] = f"schema: {'; '.join(violations[:2])}"[:MAX_MSG_CHARS]
+
+    return payload
+
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Site24x7 PostgreSQL Cluster Monitor v5")
+    parser.add_argument("--self-test", action="store_true", help="Run in-process pure validation checks")
+    parser.add_argument("--json-out", type=str, default="", help="Write emitted JSON to specified file")
+    parser.add_argument("--nodes", type=str, default="", help="Comma-separated node specifications (e.g. pg1=host:port)")
+    parser.add_argument("--cluster_host", type=str, default="", help="Hostname or IP of cluster seed node")
+    parser.add_argument("--postgres_port", type=int, default=5432, help="PostgreSQL server port")
+    parser.add_argument("--patroni_port", type=int, default=0, help="Patroni REST API port")
+    parser.add_argument("--address_map", type=str, default="", help="Address translation map (e.g. pg1:5432=127.0.0.1:5441)")
+    parser.add_argument("--username", type=str, default="", help="Monitoring username")
+    parser.add_argument("--password", type=str, default="", help="Monitoring password")
+    parser.add_argument("--db", type=str, default="postgres", help="Target database name")
+    parser.add_argument("--cluster_name", type=str, default="", help="Cluster name override")
+    parser.add_argument("--state_dir", type=str, default="", help="State file directory override")
+    parser.add_argument("--sslmode", type=str, default="prefer", help="PostgreSQL SSL mode")
+    args, _ = parser.parse_known_args()
+
+    if args.self_test:
+        sys.exit(self_test())
+
+    params: Dict[str, Any] = {}
+    if args.nodes:
+        params["nodes"] = args.nodes
+    if args.cluster_host:
+        params["cluster_host"] = args.cluster_host
+    if args.postgres_port:
+        params["postgres_port"] = args.postgres_port
+    if args.patroni_port:
+        params["patroni_port"] = args.patroni_port
+    if args.address_map:
+        params["address_map"] = args.address_map
+    if args.username:
+        params["username"] = args.username
+    if args.password:
+        params["password"] = args.password
+    if args.db:
+        params["db"] = args.db
+    if args.cluster_name:
+        params["cluster_name"] = args.cluster_name
+    if args.state_dir:
+        params["state_dir"] = args.state_dir
+    if args.sslmode:
+        params["sslmode"] = args.sslmode
+
+    result = run(params)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
