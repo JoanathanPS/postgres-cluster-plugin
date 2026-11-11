@@ -1,0 +1,68 @@
+# =============================================================================
+# Datadog PostgreSQL Check Configuration
+# Target destination on Windows: C:\ProgramData\Datadog\conf.d\postgres.d\conf.yaml
+# =============================================================================
+
+init_config:
+
+instances:
+  # ---------------------------------------------------------------------------
+  # Instance 1: Primary / Seed Node
+  # ---------------------------------------------------------------------------
+  - host: 127.0.0.1
+    port: 5432
+    username: datadog
+    password: "datadog"
+    dbname: postgres
+
+    # Collect statistics across databases
+    collect_default_database: true
+    collect_count_metrics: true
+    collect_activity_metrics: true
+
+    # Tag instance with cluster & environment metadata
+    tags:
+      - env:development
+      - cluster:pg-cluster
+      - node:pg-node1
+
+    # Database Monitoring (DBM) Features
+    dbm: true
+    query_samples:
+      enabled: true
+    query_activity:
+      enabled: true
+    query_metrics:
+      enabled: true
+
+    # Replication & Relations options
+    tag_replication_role: true
+    relations:
+      - relation_regex: ".*"
+        schemas:
+          - public
+
+  # ---------------------------------------------------------------------------
+  # Additional Cluster Nodes (uncomment if running multi-node Patroni / replica)
+  # ---------------------------------------------------------------------------
+  # - host: 127.0.0.1
+  #   port: 5442
+  #   username: datadog
+  #   password: "datadog"
+  #   dbname: postgres
+  #   tags:
+  #     - env:development
+  #     - cluster:pg-cluster
+  #     - node:pg-node2
+  #   tag_replication_role: true
+
+  # - host: 127.0.0.1
+  #   port: 5443
+  #   username: datadog
+  #   password: "datadog"
+  #   dbname: postgres
+  #   tags:
+  #     - env:development
+  #     - cluster:pg-cluster
+  #     - node:pg-node3
+  #   tag_replication_role: true
