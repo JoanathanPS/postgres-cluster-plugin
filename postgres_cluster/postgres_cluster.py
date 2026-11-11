@@ -35,7 +35,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # 0. PLATFORM CONSTANTS & ABSOLUTE LIMITS (Site24x7 Enforced)
 # -----------------------------------------------------------------------------
-PLUGIN_VERSION = 5
+PLUGIN_VERSION = 6
 HEARTBEAT_REQUIRED = True
 
 MAX_TABLES = 10
@@ -1567,7 +1567,7 @@ class StateStore:
 
 
 def read_cfg_file(cfg_path: str) -> Dict[str, Any]:
-    """Simple parser for postgres_cluster.cfg [postgres_cluster] section."""
+    """Parser for plugin .cfg file supporting standard and versioned section headers."""
     out: Dict[str, Any] = {}
     if not os.path.exists(cfg_path):
         return out
@@ -1581,7 +1581,7 @@ def read_cfg_file(cfg_path: str) -> Dict[str, Any]:
                 if line.startswith("[") and line.endswith("]"):
                     current_section = line[1:-1].strip()
                     continue
-                if current_section == "postgres_cluster" and "=" in line:
+                if current_section and current_section != "global_configurations" and "=" in line:
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip('"').strip("'")
@@ -1598,7 +1598,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
     # 1. Parameter resolution: CLI/argument param takes precedence over cfg file
     cfg_data = {}
-    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postgres_cluster.cfg")
+    script_base = os.path.splitext(os.path.basename(__file__))[0]
+    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{script_base}.cfg")
+    if not os.path.exists(cfg_file):
+        cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postgres_cluster.cfg")
     if os.path.exists(cfg_file):
         cfg_data = read_cfg_file(cfg_file)
 
