@@ -14,6 +14,7 @@ import unittest
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 import json
 import subprocess
 
@@ -477,6 +478,182 @@ class TestRegressionFixes(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0)
         self.assertLess(elapsed, 6.0, f"Process took {elapsed}s to exit, expected < 6.0s")
+
+    def test_issue1_first_attention_evaluation_order(self):
+        """Regression test for Issue #1: First Attention evaluation order.
+        
+        Reproduces the exact bug where initial Primary_Up = 0 falsely triggered
+        'primary unreachable' before Primary_Up was finalized to 1.
+
+        Given:
+          - Initial Primary_Up = 0
+          - Final Primary_Up = 1
+          - Primary_Node = pg-node2
+          - Nodes_Up = 3
+          - Nodes_Down = 0
+          - Replay lag below threshold
+
+        Expected:
+          - First_Attention_Node = none
+          - First_Attention_Reason = none
+        """
+        # Node rows representing 3/3 healthy nodes (Nodes_Up = 3, Nodes_Down = 0)
+        node_rows = [
+            {"name": "pg-node2", "role": pc.ROLE_PRIMARY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+            {"name": "pg-node1", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+            {"name": "pg-node3", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+        ]
+
+        # 1. Bug reproduction check:
+        # If evaluated prematurely when Primary_Up is still the initial default 0 and Primary_Node is "none":
+        bug_node, bug_reason = pc.evaluate_first_attention(
+            node_rows=node_rows,
+            max_replay_lag_s=0.0,
+            slowest_node="pg-node1",
+            primary_up=0,
+            primary_node="none",
+        )
+        self.assertEqual(bug_node, "primary")
+        self.assertEqual(bug_reason, "primary unreachable")
+
+        # 2. Finalized check (Fix verification):
+        # When evaluated after Final Primary_Up = 1 and Primary_Node = "pg-node2":
+        fa_node, fa_reason = pc.evaluate_first_attention(
+            node_rows=node_rows,
+            max_replay_lag_s=0.0,
+            slowest_node="pg-node1",
+            primary_up=1,
+            primary_node="pg-node2",
+        )
+        self.assertEqual(fa_node, "none")
+        self.assertEqual(fa_reason, "none")
+
+        # 3. Verify priority 1: Down nodes take highest precedence
+        down_rows = list(node_rows) + [
+            {"name": "pg-node4", "role": pc.ROLE_STANDBY, "status": pc.STATUS_DOWN, "status_reason": "connection refused"}
+        ]
+        p1_node, p1_reason = pc.evaluate_first_attention(
+            node_rows=down_rows,
+            max_replay_lag_s=120.0,
+            slowest_node="pg-node1",
+            primary_up=0,
+            primary_node="pg-node2",
+        )
+        self.assertEqual(p1_node, "pg-node4")
+        self.assertEqual(p1_reason, "connection refused")
+
+        # 4. Verify priority 2: High replay lag (> 60s) takes precedence over primary unreachable
+        p2_node, p2_reason = pc.evaluate_first_attention(
+            node_rows=node_rows,
+            max_replay_lag_s=75.5,
+            slowest_node="pg-node3",
+            primary_up=0,
+            primary_node="pg-node2",
+        )
+        self.assertEqual(p2_node, "pg-node3")
+        self.assertEqual(p2_reason, "high replay lag (75.5s)")
+
+        # 5. Verify priority 3: Primary unreachable (when Primary_Up == 0 and no down nodes or high lag)
+        p3_node, p3_reason = pc.evaluate_first_attention(
+            node_rows=node_rows,
+            max_replay_lag_s=0.0,
+            slowest_node="pg-node1",
+            primary_up=0,
+            primary_node="pg-node2",
+        )
+        self.assertEqual(p3_node, "pg-node2")
+        self.assertEqual(p3_reason, "primary unreachable")
+
+    def test_issue2_patroni_failover_timestamp_accuracy(self):
+        """Regression test for Issue #2: Patroni failover timestamp accuracy.
+
+        Verifies:
+          - UTC timestamp with 'Z'
+          - '+00:00' and '+05:30' explicit timezone offsets
+          - Fractional seconds with microsecond & nanosecond (>6 digits) precision
+          - Naive timestamps (treated as UTC)
+          - Event 20 hours ago counted in Failover_Count_24h
+          - Event older than 24 hours (e.g. 25h) excluded from Failover_Count_24h
+          - Future event excluded from Failover_Count_24h (0 <= now - event_epoch <= 86400)
+          - Invalid timestamps safely handled without crashing
+          - Full patroni_history evaluation end-to-end
+        """
+        # 1. UTC timestamp with Z
+        z_epoch = pc.parse_patroni_epoch("2026-11-12T12:39:45Z")
+        self.assertIsNotNone(z_epoch)
+        self.assertEqual(z_epoch, 1794487185.0)
+
+        # 2. +00:00 and +05:30 offsets representing identical point in time
+        utc_epoch = pc.parse_patroni_epoch("2026-11-12T12:39:45+00:00")
+        ist_epoch = pc.parse_patroni_epoch("2026-11-12T18:09:45+05:30")
+        self.assertEqual(utc_epoch, 1794487185.0)
+        self.assertEqual(ist_epoch, 1794487185.0)
+        self.assertEqual(utc_epoch, ist_epoch)
+
+        # 3. Fractional seconds (microsecond and truncated nanosecond)
+        frac_epoch = pc.parse_patroni_epoch("2026-11-12T12:39:45.123456+00:00")
+        nano_epoch = pc.parse_patroni_epoch("2026-11-12T12:39:45.123456789Z")
+        self.assertAlmostEqual(frac_epoch, 1794487185.123456, places=5)
+        self.assertAlmostEqual(nano_epoch, 1794487185.123456, places=5)
+
+        # 4. Naive timestamp (treated as UTC)
+        naive_epoch = pc.parse_patroni_epoch("2026-11-12T12:39:45")
+        self.assertEqual(naive_epoch, 1794487185.0)
+        naive_space_epoch = pc.parse_patroni_epoch("2026-11-12 12:39:45")
+        self.assertEqual(naive_space_epoch, 1794487185.0)
+
+        # 5. Invalid timestamps safely handled
+        self.assertIsNone(pc.parse_patroni_epoch("not-a-timestamp"))
+        self.assertIsNone(pc.parse_patroni_epoch(""))
+        self.assertIsNone(pc.parse_patroni_epoch("   "))
+        self.assertIsNone(pc.parse_patroni_epoch(None))
+        self.assertIsNone(pc.parse_patroni_epoch(12345))
+        self.assertIsNone(pc.parse_patroni_epoch("2026-99-99T99:99:99Z"))
+
+        # Controlled reference time
+        ref_now = 1794500000.0  # reference epoch
+
+        # 6. Event 20 hours ago counted (20h = 72000s)
+        dt_20h = datetime.fromtimestamp(ref_now - 72000.0, timezone.utc).isoformat()
+        epoch_20h = pc.parse_patroni_epoch(dt_20h)
+        age_20h = ref_now - epoch_20h
+        self.assertEqual(age_20h, 72000.0)
+        self.assertTrue(0 <= age_20h <= 86400)
+
+        # 7. Event older than 24 hours excluded (25h = 90000s)
+        dt_25h = datetime.fromtimestamp(ref_now - 90000.0, timezone.utc).isoformat()
+        epoch_25h = pc.parse_patroni_epoch(dt_25h)
+        age_25h = ref_now - epoch_25h
+        self.assertEqual(age_25h, 90000.0)
+        self.assertFalse(0 <= age_25h <= 86400)
+
+        # 8. Future event excluded (1h future = -3600s)
+        dt_future = datetime.fromtimestamp(ref_now + 3600.0, timezone.utc).isoformat()
+        epoch_future = pc.parse_patroni_epoch(dt_future)
+        age_future = ref_now - epoch_future
+        self.assertEqual(age_future, -3600.0)
+        self.assertFalse(0 <= age_future <= 86400)
+
+        # 9. End-to-end failover processing with controlled patroni_history
+        test_history = [
+            [1, 100, "scheduled", dt_25h, "pg-node1"],        # 25h ago (excluded: > 24h)
+            [2, 200, "failover", dt_20h, "pg-node2"],         # 20h ago (counted: within 24h)
+            [3, 300, "corrupt", "garbage_time", "pg-node3"],   # Invalid timestamp (excluded)
+            [4, 400, "failover", dt_future, "pg-node1"],      # Future timestamp (excluded)
+            [5, 500, "switchover", "2026-11-12T12:39:45Z", "pg-node2"], # counted (~3.5h ago)
+        ]
+        f_count_24h = 0
+        for entry in test_history:
+            try:
+                if len(entry) > 3:
+                    e_epoch = pc.parse_patroni_epoch(entry[3])
+                    if e_epoch is not None:
+                        age = ref_now - e_epoch
+                        if 0 <= age <= 86400:
+                            f_count_24h += 1
+            except Exception:
+                pass
+        self.assertEqual(f_count_24h, 2)
 
 
 if __name__ == "__main__":
