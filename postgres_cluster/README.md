@@ -1,6 +1,9 @@
 # Site24x7 PostgreSQL Cluster Monitoring Plugin (v5 Engine)
 
-Production-grade, single-file Site24x7 Server Monitoring plugin for PostgreSQL clusters (Patroni, repmgr, Stolon, CloudNativePG, physical streaming replication, and multi-master).
+Production-grade, single-file Site24x7 Server Monitoring plugin for PostgreSQL clusters (Patroni, repmgr, Stolon, CloudNativePG, physical streaming replication, and multi-master) as well as standalone instances.
+
+> [!NOTE]
+> **Supported PostgreSQL Versions:** PostgreSQL 10 through PostgreSQL 17. PostgreSQL 10 is the minimum supported version (the setup SQL uses monitoring roles `pg_read_all_stats` / `pg_monitor` and `psql \if` conditionals introduced in PostgreSQL 10).
 
 ---
 
@@ -60,7 +63,13 @@ use_agent_python=0
 redirect_output=1
 
 [postgres_cluster]
-# Seed host: IP address or hostname of any cluster node
+# Monitoring mode: auto | standalone | cluster (default: auto)
+# - auto: automatically detects whether target is a standalone instance or a cluster
+# - standalone: monitors database independently without requiring primary/replica topology
+# - cluster: enforces cluster-specific discovery, topology, and failover checks
+monitor_mode="auto"
+
+# Seed host: IP address or hostname of any cluster node (or standalone host)
 cluster_host="127.0.0.1"
 
 # Target PostgreSQL server port (default 5432)
@@ -95,7 +104,35 @@ To monitor multiple PostgreSQL clusters from the same agent host, create separat
 
 ---
 
-## 3. Comprehensive Enum Reference Sheets
+## 3. Monitoring Modes: Standalone vs Cluster
+
+The plugin natively supports three monitoring modes configured via `monitor_mode`:
+
+| Mode | Behavior & Detection | Target Environments |
+| :--- | :--- | :--- |
+| **`auto`** *(default)* | Safely detects whether the target is a standalone instance or a cluster. Distinguishes standalone instances from clusters by evaluating configured node specs, Patroni REST API discovery, cluster manager extensions (repmgr, Citus, CNPG, Stolon), and streaming replication connections. | Default out-of-the-box configuration for any PostgreSQL installation. |
+| **`standalone`** | Disables cluster manager probes and bypasses all primary/replica topology requirements. Evaluates database-level health (connectivity, auth, version, connections, transaction age) and reports `UP` (`1`) for healthy standalone primaries and read replicas without reporting missing primary errors. | Standalone PostgreSQL servers, RDS/Cloud SQL single instances, or isolated read replicas. |
+| **`cluster`** | Enforces cluster topology discovery and health evaluation. Requires at least one reachable primary; missing or unreachable primaries produce `CRITICAL c1: no primary reachable` and report `DOWN` (`0`). | Production HA clusters (Patroni, repmgr, CloudNativePG, physical streaming replication). |
+
+### Standalone Read-Only Replica Monitoring
+When pointed at a read-only PostgreSQL instance (such as a read replica or standby):
+- Evaluates `SELECT pg_is_in_recovery()`.
+- Uses recovery-safe WAL LSN tracking (`pg_last_wal_replay_lsn()` instead of `pg_current_wal_lsn()`), avoiding `ERROR: recovery is in progress`.
+- Reports monitor `status: 1` (UP) as long as database queries succeed and authentication is valid.
+- Cluster-only metrics (`Standbys_Expected`, `Standbys_Streaming`, `Sync_Standby_Count`) are reported as `0` or N/A without triggering cluster alerts.
+- Offline node retention from previous cluster monitoring runs is suppressed so `Nodes_Total = 1` and `Nodes_Up = 1`.
+
+### Minimum Privileges for Standalone Monitoring
+The monitoring user requires `CONNECT` permission on the target database, plus read access to PostgreSQL stats views:
+```sql
+GRANT pg_read_all_stats TO site24x7;
+GRANT pg_read_all_settings TO site24x7;
+```
+For PostgreSQL versions prior to 10, grant `SELECT` on `pg_stat_database`, `pg_stat_activity`, and `pg_stat_bgwriter`. Missing privileges on optional views (e.g. `pg_replication_slots`) are treated as non-fatal warnings in standalone mode.
+
+---
+
+## 4. Comprehensive Enum Reference Sheets
 
 ### 3.1 Node Roles (`Cluster_Role` & `role` column)
 | Integer | Role Name | Description |

@@ -221,7 +221,8 @@ def validate(doc: Any) -> Tuple[List[Violation], Dict[str, Any]]:
 
     # ---- 4. units <-> metrics <-> tabs, both directions
     units = doc.get("units") or {}
-    tabs = (doc.get("tabs") or {}).get("tabs", {}) if isinstance(doc.get("tabs"), dict) else {}
+    tabs_raw = doc.get("tabs") or {}
+    tabs = tabs_raw.get("tabs", tabs_raw) if isinstance(tabs_raw, dict) else {}
 
     tab_members: Dict[str, List[str]] = {}
     for tab_name, spec in tabs.items():
