@@ -1515,6 +1515,13 @@ def main():
     test_default_ports_and_host_normalization(rep)
     test_repmgr_live(plugin_py, rep)
 
+    # Test: Site24x7 Contract Invariants (Requirement 20)
+    print("\n=== Test: Site24x7 Contract Invariants (Requirement 20) ===")
+    contract_res = subprocess.run([sys.executable, "-m", "unittest", "tests/test_contract.py"], capture_output=True, text=True)
+    rep.check(contract_res.returncode == 0, f"Contract invariants test passed (exit {contract_res.returncode})")
+    if contract_res.returncode != 0:
+        rep.fail(f"Contract test failed:\n{contract_res.stderr}")
+
     # Test 10: Dynamic Failover Assertion
     if args.failover:
         test_failover_assertion(plugin_py, nodes, user, password, db, patroni_port, rep)

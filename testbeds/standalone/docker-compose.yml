@@ -1,0 +1,19 @@
+# True Standalone PostgreSQL 16 Testbed (0 slots, 0 standbys, 0 cluster managers)
+name: tb-standalone
+services:
+  pg-standalone:
+    image: postgres:16
+    container_name: tb-standalone-pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: site24x7
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5450:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

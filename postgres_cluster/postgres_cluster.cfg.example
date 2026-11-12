@@ -19,6 +19,12 @@ password="CHANGE_ME_monitor"
 # Optional: default is postgres
 # db="postgres"
 
+# Monitoring mode: auto | standalone | cluster (default auto)
+# - auto: automatically detects whether target is standalone or cluster
+# - standalone: monitors independent database without requiring cluster topology
+# - cluster: enforces cluster topology discovery and health evaluation
+monitor_mode="auto"
+
 # Advanced options
 # cluster_type="auto"
 # discover="auto"
