@@ -29,7 +29,7 @@ if ($pyCmd -and $pyCmd.Source -notmatch "WindowsApps") {
 
 if (-not $PythonExe) {
     $errObj = @{
-        plugin_version     = 5
+        plugin_version     = 1
         heartbeat_required = $true
         status             = 0
         msg                = "Python 3 executable not found on host. Please ensure Python is installed with psycopg2-binary."
@@ -49,7 +49,7 @@ if (-not (Test-Path $implScript)) {
 
 if (-not (Test-Path $implScript)) {
     $errObj = @{
-        plugin_version     = 5
+        plugin_version     = 1
         heartbeat_required = $true
         status             = 0
         msg                = "PostgreSQL cluster script not found in: $PSScriptRoot"
@@ -99,7 +99,7 @@ try {
     } else {
         $msg = if ($outStr) { $outStr } else { "Process exited with code $exitCode and empty output" }
         $errObj = @{
-            plugin_version     = 5
+            plugin_version     = 1
             heartbeat_required = $true
             status             = 0
             msg                = $msg
@@ -108,7 +108,7 @@ try {
     }
 } catch {
     $errObj = @{
-        plugin_version     = 5
+        plugin_version     = 1
         heartbeat_required = $true
         status             = 0
         msg                = "Exception executing Python script: $($_.Exception.Message)"

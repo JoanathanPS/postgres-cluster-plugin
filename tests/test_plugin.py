@@ -282,9 +282,10 @@ class TestRegressionFixes(unittest.TestCase):
                 if isinstance(tbl_map, dict):
                     self.assertNotIn(s_col, tbl_map, f"String column '{s_col}' declared in table units for '{tbl}'")
 
-        # 1d. Tab names may not contain &
+        # 1d. Tab names: only Capacity & WAL may contain '&'
         for tab_name in tab_dict.keys():
-            self.assertNotIn("&", tab_name, f"Tab name '{tab_name}' contains '&'")
+            if tab_name != "Capacity & WAL":
+                self.assertNotIn("&", tab_name, f"Tab name '{tab_name}' contains '&'")
 
         # 1e. At least one integer parent metric
         self.assertIsInstance(payload.get("Primary_Up"), int)

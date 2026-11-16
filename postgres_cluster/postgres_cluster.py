@@ -39,7 +39,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # 0. PLATFORM CONSTANTS & ABSOLUTE LIMITS (Site24x7 Enforced)
 # -----------------------------------------------------------------------------
-PLUGIN_VERSION = 5
+PLUGIN_VERSION = 1
 HEARTBEAT_REQUIRED = True
 
 MAX_TABLES = 10
@@ -971,14 +971,15 @@ def evaluate_database_health(
 # 2. TAB DEFINITIONS (Exact 8 Tabs, strict order)
 # -----------------------------------------------------------------------------
 TAB_ORDER = [
-    "Diagnosis",
-    "Primary",
+    "Cluster",
     "Nodes",
+    "Primary",
     "Replication",
-    "Health and Capacity",
     "Performance",
-    "WAL and Archiver",
-    "Workload",
+    "Sessions",
+    "Capacity & WAL",
+    "Databases",
+    "Plugin",
 ]
 
 # Child Table Schemas for units and tabs
@@ -1038,13 +1039,13 @@ TABLE_UNITS: Dict[str, Dict[str, str]] = {
 }
 
 TABLE_TABS: Dict[str, str] = {
-    "Topology": "Diagnosis",
+    "Topology": "Cluster",
     "Cluster_Nodes": "Nodes",
     "Node_Snapshot": "Nodes",
     "Replication_Links": "Replication",
     "Replication_Slots": "Replication",
-    "Database_Stats": "Workload",
-    "Wait_Events": "Workload",
+    "Wait_Events": "Sessions",
+    "Database_Stats": "Databases",
 }
 
 OFFICIAL_COMPAT_UNITS: Dict[str, str] = {
@@ -1116,66 +1117,59 @@ OFFICIAL_COMPAT_TABLE_UNITS: Dict[str, Dict[str, str]] = {
     },
 }
 
-OFFICIAL_COMPAT_TABS: Dict[str, Dict[str, Any]] = {
-    "DB and IO stats": {
-        "order": "8",
-        "tablist": [
-            "Stats_per_DB",
-            "Total Rows Deleted",
-            "Total Rows Fetched",
-            "Total Rows Inserted",
-            "Total Rows Returned",
-            "Total Rows Updated",
-            "Total Block Hits",
-            "Total Block Reads",
-            "Database Count",
-            "Table Count",
-            "Index Scans",
-            "Index Rows Read",
-            "Index Rows Fetched",
-            "Heap Blocks Read",
-            "Heap Blocks Hit",
-            "Cache Hit Ratio",
-        ],
-    },
-    "BG Writer": {
-        "order": "9",
-        "tablist": [
-            "Checkpoints Timed",
-            "Checkpoints Req",
-            "Checkpoint Write Time",
-            "Checkpoint Sync Time",
-            "Buffers Checkpoint",
-            "Buffers Clean",
-            "Maxwritten Clean",
-            "Buffers Backend",
-            "Buffers Backend Fsync",
-            "Buffers Alloc",
-        ],
-    },
-    "Transactions and Sessions": {
-        "order": "10",
-        "tablist": [
-            "Transactions_Per_Database",
-            "Total Commits",
-            "Total Rollbacks",
-            "Total Conflicts",
-            "Total Sessions",
-            "Total Sessions Abandoned",
-            "Total Sessions Fatal",
-            "Total Sessions Killed",
-            "Idle Transactions",
-            "Transactions Open",
-            "Active Connections",
-            "Max Connections",
-            "Uptime",
-            "Locks Count",
-            "Active Queries",
-            "Active Waiting Queries",
-            "Server Version",
-        ],
-    },
+OFFICIAL_COMPAT_METRICS_MAP: Dict[str, List[str]] = {
+    "Performance": [
+        "Checkpoints Timed",
+        "Checkpoints Req",
+        "Checkpoint Write Time",
+        "Checkpoint Sync Time",
+        "Buffers Checkpoint",
+        "Buffers Clean",
+        "Maxwritten Clean",
+        "Buffers Backend",
+        "Buffers Backend Fsync",
+        "Buffers Alloc",
+        "Cache Hit Ratio",
+        "Total Block Hits",
+        "Total Block Reads",
+    ],
+    "Sessions": [
+        "Transactions_Per_Database",
+        "Total Commits",
+        "Total Rollbacks",
+        "Total Conflicts",
+        "Total Sessions",
+        "Total Sessions Abandoned",
+        "Total Sessions Fatal",
+        "Total Sessions Killed",
+        "Idle Transactions",
+        "Transactions Open",
+        "Active Connections",
+        "Max Connections",
+        "Uptime",
+        "Locks Count",
+        "Active Queries",
+        "Active Waiting Queries",
+        "Server Version",
+    ],
+    "Databases": [
+        "Stats_per_DB",
+        "Database Count",
+        "Table Count",
+        "Total Rows Deleted",
+        "Total Rows Fetched",
+        "Total Rows Inserted",
+        "Total Rows Returned",
+        "Total Rows Updated",
+        "Index Scans",
+        "Index Rows Read",
+        "Index Rows Fetched",
+        "Heap Blocks Read",
+        "Heap Blocks Hit",
+    ],
 }
+
+OFFICIAL_COMPAT_TABS = OFFICIAL_COMPAT_METRICS_MAP
 
 # -----------------------------------------------------------------------------
 # 3. METRIC CATALOGUE (Single Source of Truth)
@@ -1186,47 +1180,47 @@ METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     # TAB 1: Diagnosis (Cluster overview, health code, timelines, failover)
     # -------------------------------------------------------------------------
-    {"name": "Cluster_Health", "unit": "status", "tab": "Diagnosis", "type": int,
+    {"name": "Cluster_Health", "unit": "status", "tab": "Cluster", "type": int,
      "desc": "Cluster health severity: 0=OK, 1=WARN, 2=CRITICAL"},
-    {"name": "Health_Code", "unit": "status", "tab": "Diagnosis", "type": int,
+    {"name": "Health_Code", "unit": "status", "tab": "Cluster", "type": int,
      "desc": "Stable numeric health condition code for alerting"},
-    {"name": "Cluster_Role", "unit": "status", "tab": "Diagnosis", "type": int,
+    {"name": "Cluster_Role", "unit": "status", "tab": "Cluster", "type": int,
      "desc": "Observed role of target cluster entry point"},
-    {"name": "Topology_Type", "unit": "status", "tab": "Diagnosis", "type": int,
+    {"name": "Topology_Type", "unit": "status", "tab": "Cluster", "type": int,
      "desc": "Detected cluster manager: 1=Patroni, 2=repmgr, 3=Native Physical, etc."},
-    {"name": "Nodes_Total", "unit": "nodes", "tab": "Diagnosis", "type": int,
+    {"name": "Nodes_Total", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Total active and historical nodes tracked in cluster"},
-    {"name": "Nodes_Up", "unit": "nodes", "tab": "Diagnosis", "type": int,
+    {"name": "Nodes_Up", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Number of currently reachable nodes"},
-    {"name": "Nodes_Down", "unit": "nodes", "tab": "Diagnosis", "type": int,
+    {"name": "Nodes_Down", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Number of currently unreachable or offline nodes"},
-    {"name": "Nodes_Omitted", "unit": "nodes", "tab": "Diagnosis", "type": int,
+    {"name": "Nodes_Omitted", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Nodes omitted beyond the 25-row Site24x7 limit"},
-    {"name": "Primary_Timeline", "unit": "timeline", "tab": "Diagnosis", "type": int,
+    {"name": "Primary_Timeline", "unit": "timeline", "tab": "Cluster", "type": int,
      "desc": "Current timeline ID of the primary node"},
-    {"name": "Timeline_Spread", "unit": "timeline", "tab": "Diagnosis", "type": int,
+    {"name": "Timeline_Spread", "unit": "timeline", "tab": "Cluster", "type": int,
      "desc": "Spread between maximum and minimum observed node timelines"},
-    {"name": "Failover_Age_s", "unit": "s", "tab": "Diagnosis", "type": int,
+    {"name": "Failover_Age_s", "unit": "s", "tab": "Cluster", "type": int,
      "desc": "Seconds elapsed since the last detected failover"},
-    {"name": "Failover_Count_24h", "unit": "failovers", "tab": "Diagnosis", "type": int,
+    {"name": "Failover_Count_24h", "unit": "failovers", "tab": "Cluster", "type": int,
      "desc": "Total failovers detected in the last 24 hours"},
-    {"name": "Collect_Warnings", "unit": "events", "tab": "Diagnosis", "type": int,
+    {"name": "Collect_Warnings", "unit": "events", "tab": "Plugin", "type": int,
      "desc": "Number of non-fatal warnings encountered during collection"},
-    {"name": "Auth_Failure_Flag", "unit": "flag", "tab": "Diagnosis", "type": int,
+    {"name": "Auth_Failure_Flag", "unit": "flag", "tab": "Plugin", "type": int,
      "desc": "1 if authentication failure occurred on any node, 0 otherwise"},
-    {"name": "Budget_Exceeded", "unit": "flag", "tab": "Diagnosis", "type": int,
+    {"name": "Budget_Exceeded", "unit": "flag", "tab": "Plugin", "type": int,
      "desc": "1 if cycle deadline was exceeded, 0 otherwise"},
 
     # String metrics in Diagnosis tab (string metrics have no unit in Site24x7)
-    {"name": "Health_Reason", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "Health_Reason", "unit": "", "tab": "Cluster", "type": str,
      "desc": "Concise explanation of current health code"},
-    {"name": "First_Attention_Node", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "First_Attention_Node", "unit": "", "tab": "Cluster", "type": str,
      "desc": "First node requiring operator attention"},
-    {"name": "First_Attention_Reason", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "First_Attention_Reason", "unit": "", "tab": "Cluster", "type": str,
      "desc": "Why First_Attention_Node requires intervention"},
-    {"name": "Action_Hint", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "Action_Hint", "unit": "", "tab": "Cluster", "type": str,
      "desc": "Suggested remediation command or action"},
-    {"name": "Last_Failover_To", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "Last_Failover_To", "unit": "", "tab": "Cluster", "type": str,
      "desc": "Node promoted in the most recent failover"},
 
     # -------------------------------------------------------------------------
@@ -1362,15 +1356,15 @@ METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     # TAB 5: Health and Capacity (Storage, connection, and freeze limits)
     # -------------------------------------------------------------------------
-    {"name": "XID_Wraparound_Pct", "unit": "%", "tab": "Health and Capacity", "type": float,
+    {"name": "XID_Wraparound_Pct", "unit": "%", "tab": "Capacity & WAL", "type": float,
      "desc": "Cluster-wide maximum XID wraparound percentage"},
-    {"name": "Max_Temp_MB", "unit": "MB", "tab": "Health and Capacity", "type": float,
+    {"name": "Max_Temp_MB", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Maximum temporary file usage across databases"},
-    {"name": "Dead_Tuples_Total", "unit": "tuples", "tab": "Health and Capacity", "type": int,
+    {"name": "Dead_Tuples_Total", "unit": "tuples", "tab": "Capacity & WAL", "type": int,
      "desc": "Total dead tuples awaiting autovacuum across databases"},
-    {"name": "Long_Running_Queries", "unit": "queries", "tab": "Health and Capacity", "type": int,
+    {"name": "Long_Running_Queries", "unit": "queries", "tab": "Sessions", "type": int,
      "desc": "Queries executing longer than warning threshold (60s)"},
-    {"name": "Blocked_Sessions", "unit": "sessions", "tab": "Health and Capacity", "type": int,
+    {"name": "Blocked_Sessions", "unit": "sessions", "tab": "Sessions", "type": int,
      "desc": "Total sessions currently blocked waiting on locks"},
 
     # -------------------------------------------------------------------------
@@ -1404,65 +1398,65 @@ METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     # TAB 7: WAL and Archiver (WAL generation, archiving status)
     # -------------------------------------------------------------------------
-    {"name": "WAL_LSN_MB", "unit": "MB", "tab": "WAL and Archiver", "type": float,
+    {"name": "WAL_LSN_MB", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Total WAL bytes written mapped to megabytes"},
-    {"name": "WAL_Rate_MBs", "unit": "MB", "tab": "WAL and Archiver", "type": float,
+    {"name": "WAL_Rate_MBs", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Cluster-wide WAL production rate in MB per second"},
-    {"name": "WAL_Dir_MB", "unit": "MB", "tab": "WAL and Archiver", "type": float,
+    {"name": "WAL_Dir_MB", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Current total size of pg_wal directory"},
-    {"name": "Archive_Success", "unit": "files", "tab": "WAL and Archiver", "type": int,
+    {"name": "Archive_Success", "unit": "files", "tab": "Capacity & WAL", "type": int,
      "desc": "Total WAL segments successfully archived"},
-    {"name": "Archive_Failed", "unit": "files", "tab": "WAL and Archiver", "type": int,
+    {"name": "Archive_Failed", "unit": "files", "tab": "Capacity & WAL", "type": int,
      "desc": "Failed WAL archive attempts"},
-    {"name": "Archive_Ready", "unit": "files", "tab": "WAL and Archiver", "type": int,
+    {"name": "Archive_Ready", "unit": "files", "tab": "Capacity & WAL", "type": int,
      "desc": "WAL segments currently pending archive"},
 
     # String metrics in WAL and Archiver tab
-    {"name": "Archive_Mode", "unit": "", "tab": "WAL and Archiver", "type": str,
+    {"name": "Archive_Mode", "unit": "", "tab": "Capacity & WAL", "type": str,
      "desc": "archive_mode setting: on, off, or always"},
-    {"name": "Last_Archived_WAL", "unit": "", "tab": "WAL and Archiver", "type": str,
+    {"name": "Last_Archived_WAL", "unit": "", "tab": "Capacity & WAL", "type": str,
      "desc": "Filename of most recently archived WAL segment"},
 
     # -------------------------------------------------------------------------
     # TAB 8: Workload (Databases, sessions, and top wait events)
     # -------------------------------------------------------------------------
-    {"name": "DB_Count", "unit": "databases", "tab": "Workload", "type": int,
+    {"name": "DB_Count", "unit": "databases", "tab": "Databases", "type": int,
      "desc": "Number of connectable databases in cluster"},
-    {"name": "DB_Total_Size_MB", "unit": "MB", "tab": "Workload", "type": float,
+    {"name": "DB_Total_Size_MB", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Total disk size of all databases combined in MB"},
-    {"name": "Active_Sessions", "unit": "sessions", "tab": "Workload", "type": int,
+    {"name": "Active_Sessions", "unit": "sessions", "tab": "Sessions", "type": int,
      "desc": "Total sessions actively executing queries"},
-    {"name": "Idle_Sessions", "unit": "sessions", "tab": "Workload", "type": int,
+    {"name": "Idle_Sessions", "unit": "sessions", "tab": "Sessions", "type": int,
      "desc": "Total connected idle sessions"},
 
     # String metrics in Workload tab
-    {"name": "Largest_DB", "unit": "", "tab": "Workload", "type": str,
+    {"name": "Largest_DB", "unit": "", "tab": "Databases", "type": str,
      "desc": "Name of largest database by on-disk size"},
-    {"name": "Wait_Event_Top", "unit": "", "tab": "Workload", "type": str,
+    {"name": "Wait_Event_Top", "unit": "", "tab": "Sessions", "type": str,
      "desc": "Most frequent non-idle wait event across backends"},
 
     # -------------------------------------------------------------------------
     # SELF-INSTRUMENTATION & STATE DIAGNOSTICS (Assigned to Diagnosis Tab)
     # -------------------------------------------------------------------------
-    {"name": "Collect_Time_ms", "unit": "ms", "tab": "Diagnosis", "type": float,
+    {"name": "Collect_Time_ms", "unit": "ms", "tab": "Plugin", "type": float,
      "desc": "Plugin execution time in milliseconds"},
-    {"name": "Queries_Run", "unit": "queries", "tab": "Diagnosis", "type": int,
+    {"name": "Queries_Run", "unit": "queries", "tab": "Plugin", "type": int,
      "desc": "Total SQL queries executed this collection cycle"},
-    {"name": "State_Persistent", "unit": "flag", "tab": "Diagnosis", "type": int,
+    {"name": "State_Persistent", "unit": "flag", "tab": "Plugin", "type": int,
      "desc": "1 if state file is stored on durable storage, 0 if volatile (/tmp)"},
-    {"name": "State_Age_s", "unit": "s", "tab": "Diagnosis", "type": int,
+    {"name": "State_Age_s", "unit": "s", "tab": "Plugin", "type": int,
      "desc": "Seconds since state file was last updated"},
-    {"name": "State_IO_Errors", "unit": "errors", "tab": "Diagnosis", "type": int,
+    {"name": "State_IO_Errors", "unit": "errors", "tab": "Plugin", "type": int,
      "desc": "Cumulative state file read/write I/O errors"},
-    {"name": "Rate_Warmup_Flag", "unit": "flag", "tab": "Diagnosis", "type": int,
+    {"name": "Rate_Warmup_Flag", "unit": "flag", "tab": "Plugin", "type": int,
      "desc": "1 during first poll cycle while rate baselines warm up, 0 otherwise"},
 
     # String diagnostics in Diagnosis tab
-    {"name": "Slowest_Scope", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "Slowest_Scope", "unit": "", "tab": "Plugin", "type": str,
      "desc": "Probe scope that took the longest time to execute"},
-    {"name": "State_File", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "State_File", "unit": "", "tab": "Plugin", "type": str,
      "desc": "Active filesystem path of the state file (truncated <= 100)"},
-    {"name": "State_Reason", "unit": "", "tab": "Diagnosis", "type": str,
+    {"name": "State_Reason", "unit": "", "tab": "Plugin", "type": str,
      "desc": "Diagnostic status message for the state store layer"},
 ]
 
@@ -1690,7 +1684,7 @@ def self_test() -> int:
 
     # 1. Catalogue Invariants
     check("Catalogue metric count <= 200", len(METRICS) <= MAX_METRICS, f"got {len(METRICS)}")
-    check("All 8 tabs defined in order", [k for k in (TABS_DEF.get("tabs", TABS_DEF)).keys()] == TAB_ORDER)
+    check("All 9 tabs defined in order", [k for k in (TABS_DEF.get("tabs", TABS_DEF)).keys()] == TAB_ORDER)
 
     metric_names = [m["name"] for m in METRICS]
     check("No duplicate metric names in catalogue", len(metric_names) == len(set(metric_names)))
@@ -4216,14 +4210,24 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["msg"] = f"{payload['msg']} | {budget_warn}"[:MAX_MSG_CHARS]
 
         compat_units = copy.deepcopy(OFFICIAL_COMPAT_UNITS)
-        compat_tabs = copy.deepcopy(OFFICIAL_COMPAT_TABS)
+
+        # Map official compat metrics into the approved 9-tab dashboard structure
+        tabs_field = payload.get("tabs", {})
+        target_tabs = tabs_field.get("tabs", tabs_field) if isinstance(tabs_field, dict) else {}
+
+        for target_tab_name, m_list in OFFICIAL_COMPAT_METRICS_MAP.items():
+            if target_tab_name in target_tabs:
+                cur_tablist = target_tabs[target_tab_name].setdefault("tablist", [])
+                for m_item in m_list:
+                    if m_item not in cur_tablist:
+                        cur_tablist.append(m_item)
 
         # Finding 7: On PG < 14, prune Total Sessions* from units, tabs, and tables
         if active_client_version < (14, 0):
             for s_key in ("Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed"):
                 compat_units.pop(s_key, None)
-                for t_info in compat_tabs.values():
-                    if "tablist" in t_info:
+                for t_info in target_tabs.values():
+                    if isinstance(t_info, dict) and "tablist" in t_info:
                         t_info["tablist"] = [x for x in t_info["tablist"] if x != s_key]
 
         payload["units"].update(compat_units)
@@ -4234,8 +4238,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             for sc in ("sessions", "sessions_abandoned", "sessions_fatal", "sessions_killed", "session_time", "sessions_active_time", "idle_in_txn_time"):
                 txn_units.pop(sc, None)
         payload["units"]["Transactions_Per_Database"] = txn_units
-
-        payload["tabs"].update(compat_tabs)
 
         payload["Stats_per_DB"] = compat_db_stats[:MAX_ROWS]
         payload["Transactions_Per_Database"] = compat_txn_sessions[:MAX_ROWS]
