@@ -356,7 +356,6 @@ To prevent false alerts on dynamically sized clusters (2-node, 3-node, 5-node+) 
 ---
 
 ## Screenshots
+<img width="1642" height="807" alt="ss1" src="https://github.com/user-attachments/assets/f4be21e7-659f-415f-9e54-4d38fad29d93" />
+<img width="1645" height="751" alt="ss2" src="https://github.com/user-attachments/assets/1f71f19b-4701-4685-9ba1-dd97b98e40a4" />
 
-![PostgreSQL Cluster Summary Dashboard](ss1.png)
-
-![PostgreSQL Cluster Nodes Dashboard](ss2.png)
