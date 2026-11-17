@@ -80,8 +80,8 @@ services:
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "127.0.0.1:5000:5000"
-      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:5500:5000"
+      - "127.0.0.1:5501:5001"
       - "127.0.0.1:7000:7000"
     depends_on:
       - pg-node1

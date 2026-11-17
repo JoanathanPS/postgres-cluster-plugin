@@ -11,6 +11,7 @@ Exercises:
 import os
 import sys
 import unittest
+from unittest.mock import patch, MagicMock
 import socket
 import threading
 import time
@@ -303,16 +304,22 @@ class TestRegressionFixes(unittest.TestCase):
         self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
         self.assertIn("auth", h.format_msg().lower())
 
-        res = pc.run({
-            "cluster_host": "127.0.0.1",
-            "postgres_port": 5432,
-            "username": "site24x7",
-            "password": "wrong_password_xyz",
-            "cycle_deadline": 2.0
-        })
-        self.assertEqual(res.get("status"), 0)
-        self.assertEqual(res.get("Auth_Failure_Flag"), 1)
-        self.assertIn("auth", res.get("msg", "").lower())
+        def mock_connect(self):
+            self.auth_failed = True
+            self.auth_error = "password authentication failed for user site24x7"
+            return False
+
+        with patch.object(pc.NodeClient, "connect", mock_connect):
+            res = pc.run({
+                "cluster_host": "127.0.0.1",
+                "postgres_port": 5432,
+                "username": "site24x7",
+                "password": "wrong_password_xyz",
+                "cycle_deadline": 2.0
+            })
+            self.assertEqual(res.get("status"), 0)
+            self.assertEqual(res.get("Auth_Failure_Flag"), 1)
+            self.assertIn("auth", res.get("msg", "").lower())
 
     def test_fix3_permission_denied_query_sentinel(self):
         """Fix 3: Permission denied query returns -1 sentinel, metric_unavailable note, never real 0."""

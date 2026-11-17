@@ -426,5 +426,72 @@ class TestDynamicClusterThresholds(unittest.TestCase):
         self.assertTrue(h.severity >= 2)
 
 
+class TestHAProxySeedDiscovery(unittest.TestCase):
+    """Verifies HAProxy seed endpoint deduction and CSV status parsing."""
+
+    def test_fetch_haproxy_stats_parses_csv(self):
+        """Simulate HAProxy CSV response and verify parsing into status dict."""
+        from unittest.mock import patch, MagicMock
+        sample_csv = (
+            "# pxname,svname,status\n"
+            "primary_be,pg-node1,DOWN\n"
+            "primary_be,pg-node2,DOWN\n"
+            "primary_be,pg-node3,UP\n"
+            "replica_be,pg-node1,UP\n"
+            "replica_be,pg-node2,UP\n"
+        )
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = sample_csv.encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            stats = pc.fetch_haproxy_stats("127.0.0.1", 7000)
+            self.assertEqual(stats["primary_be"]["pg-node3"], "UP")
+            self.assertEqual(stats["primary_be"]["pg-node1"], "DOWN")
+            self.assertEqual(stats["replica_be"]["pg-node2"], "UP")
+
+    def test_discover_primary_via_proxy_deduction(self):
+        """Mocks NodeClient to test primary deduction from pg_stat_replication."""
+        from unittest.mock import patch, MagicMock
+        mock_client = MagicMock()
+        mock_client.connect.return_value = True
+        mock_client.is_recovery = False
+        mock_client.query_one.return_value = ("patroni-cluster", "172.18.0.3", "5432")
+        mock_client.query_all.return_value = [
+            ("pg-node1", "172.18.0.5", 49580, "async", 0, 0),
+            ("pg-node2", "172.18.0.4", 52830, "async", 0, 1024),
+        ]
+
+        address_map = {
+            "pg-node1:5432": "127.0.0.1:5441",
+            "pg-node2:5432": "127.0.0.1:5442",
+            "pg-node3:5432": "127.0.0.1:5443",
+        }
+
+        with patch.object(pc, "NodeClient", return_value=mock_client), \
+             patch.object(pc, "fetch_haproxy_stats", return_value={}):
+            ok, p_spec, sb_specs, msg = pc.discover_primary_via_proxy(
+                proxy_host="127.0.0.1",
+                proxy_port=5500,
+                username="site24x7",
+                password="pw",
+                dbname="postgres",
+                address_map=address_map
+            )
+            self.assertTrue(ok)
+            self.assertIsNotNone(p_spec)
+            # Deduced that pg-node3 is the primary
+            self.assertEqual(p_spec["name"], "pg-node3")
+            self.assertEqual(p_spec["host"], "127.0.0.1")
+            self.assertEqual(p_spec["port"], 5443)
+            self.assertEqual(p_spec["patroni_role"], "primary")
+
+            # Standbys are pg-node1 and pg-node2
+            self.assertEqual(len(sb_specs), 2)
+            sb_names = {s["name"] for s in sb_specs}
+            self.assertEqual(sb_names, {"pg-node1", "pg-node2"})
+
+
 if __name__ == "__main__":
     unittest.main()

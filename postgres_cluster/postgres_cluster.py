@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import concurrent.futures.thread
 import copy
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -276,6 +277,102 @@ def parse_address_map(raw_map: Any) -> Dict[str, str]:
             src, dst = entry.split("=", 1)
             out[src.strip()] = dst.strip()
     return out
+
+
+def parse_port_list(raw_ports: Any) -> List[int]:
+    """
+    Parses a port list specification from str, list, or int.
+    Supports comma-separated strings ("5441,5442,5443"), ranges ("5441-5443"),
+    lists ([5441, 5442]), or single ints.
+    """
+    if not raw_ports:
+        return []
+    if isinstance(raw_ports, int):
+        return [raw_ports] if 1 <= raw_ports <= 65535 else []
+    if isinstance(raw_ports, (list, tuple)):
+        ports = []
+        for x in raw_ports:
+            p = safe_int(x, default=0)
+            if 1 <= p <= 65535:
+                ports.append(p)
+        return ports
+
+    ports: List[int] = []
+    text = str(raw_ports).strip()
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            parts = item.split("-", 1)
+            p_start = safe_int(parts[0].strip(), default=0)
+            p_end = safe_int(parts[1].strip(), default=0)
+            if 1 <= p_start <= 65535 and 1 <= p_end <= 65535 and p_start <= p_end:
+                ports.extend(range(p_start, p_end + 1))
+        else:
+            p = safe_int(item, default=0)
+            if 1 <= p <= 65535:
+                ports.append(p)
+    return ports
+
+
+def resolve_mapped_endpoint(
+    name: str,
+    host: str,
+    port: int,
+    address_map: Dict[str, str],
+    cluster_host: str = "",
+    node_ports: Optional[List[int]] = None,
+    node_index: int = 0,
+) -> Tuple[str, int]:
+    """
+    Resolves reachable host and port for a cluster node using:
+      1. Explicit address_map lookup (by name, name:port, host, host:port)
+      2. If mapped value is purely numeric (e.g. '5441'), resolves to (cluster_host or '127.0.0.1', int(target))
+      3. If mapped value is 'host:port', resolves to (host, int(port))
+      4. If not in address_map and node_ports provided:
+         - Matches trailing index in name (e.g. 'pg-node2' -> index 1 -> node_ports[1])
+         - Or uses node_index as fallback
+      5. Otherwise falls back to original (host, port).
+    """
+    keys_to_check = [
+        name,
+        f"{name}:{port}",
+        host,
+        f"{host}:{port}",
+    ]
+    mapped_target: Optional[str] = None
+    for k in keys_to_check:
+        if k and k in address_map:
+            mapped_target = address_map[k]
+            break
+
+    if mapped_target:
+        mapped_target = str(mapped_target).strip()
+        # Case A: Pure port number (e.g. '5441')
+        if mapped_target.isdigit():
+            c_host = cluster_host or ("127.0.0.1" if host in ("localhost", "127.0.0.1", "") else host)
+            return c_host, int(mapped_target)
+        # Case B: 'host:port'
+        if ":" in mapped_target:
+            m_h, m_p = mapped_target.rsplit(":", 1)
+            return m_h, safe_int(m_p, default=port)
+        # Case C: Just host override
+        return mapped_target, port
+
+    # 2. Check node_ports list
+    if node_ports and len(node_ports) > 0:
+        c_host = cluster_host or ("127.0.0.1" if host in ("localhost", "127.0.0.1", "") else host)
+        # Try matching trailing digits in name (e.g. pg-node1 -> 1, node2 -> 2)
+        match = re.search(r"(\d+)$", name)
+        if match:
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < len(node_ports):
+                return c_host, node_ports[idx]
+        if 0 <= node_index < len(node_ports):
+            return c_host, node_ports[node_index]
+
+    return host, port
 
 
 def normalize_host(host: str) -> str:
@@ -2030,28 +2127,17 @@ def discover_patroni_cluster(
     address_map: Dict[str, str],
     prev_state: Dict[str, Any],
     raw_nodes: str = "",
-    timeout: float = 1.0
+    timeout: float = 1.0,
+    patroni_ports: Optional[List[int]] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]], List[List[Any]], Optional[str], List[Tuple[str, int]]]:
     """
     Multi-endpoint resilient Patroni discovery.
     Tries candidate endpoints in priority order:
       1. Configured seed Patroni endpoint (translated via address_map if mapped).
-      2. Explicit host-to-Patroni-port mappings in configuration (from address_map).
-      3. Previously discovered and persisted Patroni endpoint mappings (from prev_state).
-      4. Other known cluster members where their Patroni REST port is explicitly known.
-
-    Requirements:
-      - Does not assume PostgreSQL ports (e.g. 5432) are Patroni ports.
-      - Does not assume every Patroni endpoint uses port 8001 or 800x.
-      - Deduplicates candidate endpoints while preserving priority order.
-      - Applies connection timeouts.
-      - Continues to next candidate after connection errors, timeouts, invalid JSON, or malformed responses.
-      - Accepts a candidate only when it returns valid Patroni cluster topology.
-      - Records which endpoint supplied the successful topology.
-      - Does not use stale cached topology as proof of current cluster health.
-
-    Returns:
-      (status, patroni_data, patroni_history, endpoint_used, candidates_tried)
+      2. Multi-port candidate list (e.g. 8001, 8002, 8003 on cluster_host).
+      3. Explicit host-to-Patroni-port mappings in configuration (from address_map).
+      4. Previously discovered and persisted Patroni endpoint mappings (from prev_state).
+      5. Other known cluster members where their Patroni REST port is explicitly known.
     """
     candidates: List[Tuple[str, int]] = []
     seen: Set[Tuple[str, int]] = set()
@@ -2079,6 +2165,12 @@ def discover_patroni_cluster(
         elif mapped_seed:
             act_h = mapped_seed
         add_candidate(act_h, act_p)
+
+    # 1b. Multi-port candidate list (e.g. 8001, 8002, 8003 on cluster_host)
+    if patroni_ports:
+        p_host = seed_host or "127.0.0.1"
+        for p in patroni_ports:
+            add_candidate(p_host, p)
 
     # 2. Explicit Patroni mappings in configuration (address_map)
     for src, dst in address_map.items():
@@ -2120,6 +2212,193 @@ def discover_patroni_cluster(
             return "positive", data, history, endpoint_used, candidates
 
     return "negative", None, [], None, candidates
+
+
+def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, timeout: float = 1.0) -> Dict[str, Dict[str, str]]:
+    """
+    Fetches HAProxy backend server states via CSV endpoint (http://host:port/;csv).
+    Returns mapping of {pxname: {svname: status}}.
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    if not stats_host or not stats_port:
+        return result
+    url = f"http://{normalize_host(stats_host)}:{stats_port}/;csv"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "site24x7_pgcluster"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                content = resp.read().decode("utf-8", errors="replace").lstrip("# ")
+                reader = csv.DictReader(content.splitlines())
+                for row in reader:
+                    px = row.get("pxname", "")
+                    sv = row.get("svname", "")
+                    st = row.get("status", "")
+                    if px and sv:
+                        if px not in result:
+                            result[px] = {}
+                        result[px][sv] = st
+    except Exception:
+        pass
+    return result
+
+
+def discover_primary_via_proxy(
+    proxy_host: str,
+    proxy_port: int,
+    username: str,
+    password: str,
+    dbname: str,
+    address_map: Dict[str, str],
+    sslmode: str = "prefer",
+    sslrootcert: str = "",
+    sslcert: str = "",
+    sslkey: str = "",
+    connect_timeout: int = 3,
+    haproxy_stats_port: int = 7000,
+    node_ports: Optional[List[int]] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """
+    Connects to HAProxy primary write port (e.g. 5000 / 5500) to discover the active
+    leader and all attached standby nodes from pg_stat_replication.
+
+    Returns:
+      (success, primary_spec, standby_specs, message)
+    """
+    if not proxy_host or not proxy_port:
+        return False, None, [], "no proxy host/port specified"
+
+    client = NodeClient(
+        name="haproxy_primary_seed",
+        host=proxy_host,
+        port=proxy_port,
+        user=username,
+        password=password,
+        dbname=dbname,
+        sslmode=sslmode,
+        sslrootcert=sslrootcert,
+        sslcert=sslcert,
+        sslkey=sslkey,
+        connect_timeout=connect_timeout,
+        statement_timeout_ms=3000,
+    )
+    if not client.connect():
+        warn = client.warnings[0] if client.warnings else "connection failed"
+        return False, None, [], f"failed to connect to proxy seed {proxy_host}:{proxy_port} ({warn})"
+
+    try:
+        # 1. Verify this is the writable primary (not in recovery)
+        if client.is_recovery:
+            return False, None, [], f"proxy {proxy_host}:{proxy_port} connected to node in recovery (standby)"
+
+        # 2. Discover primary identity
+        ident_row = client.query_one("""
+            SELECT 
+                coalesce(current_setting('cluster_name', true), ''),
+                coalesce(inet_server_addr()::text, ''),
+                current_setting('port', true)
+        """)
+        c_name = ident_row[0] if ident_row and ident_row[0] else ""
+        s_addr = ident_row[1] if ident_row and ident_row[1] else proxy_host
+        if "/" in s_addr:
+            s_addr = s_addr.split("/")[0]
+        s_port = safe_int(ident_row[2] if ident_row and len(ident_row) > 2 else proxy_port, default=5432)
+
+        # 3. Query pg_stat_replication for all attached standbys
+        rep_rows = client.query_all("""
+            SELECT 
+                application_name, 
+                coalesce(client_addr::text, ''), 
+                client_port, 
+                sync_state, 
+                sync_priority,
+                coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0) AS replay_lag_bytes
+            FROM pg_stat_replication;
+        """) or []
+
+        standby_specs: List[Dict[str, Any]] = []
+        standby_names: Set[str] = set()
+        for r_idx, r in enumerate(rep_rows):
+            app_name = str(r[0] or "").strip()
+            c_addr = str(r[1] or "").strip()
+            if "/" in c_addr:
+                c_addr = c_addr.split("/")[0]
+            c_port = safe_int(r[2], default=5432)
+            sync_st = str(r[3] or "async").strip()
+            lag_b = safe_int(r[5], default=0)
+
+            sb_host, sb_port = resolve_mapped_endpoint(
+                name=app_name,
+                host=c_addr or app_name,
+                port=5432,
+                address_map=address_map,
+                cluster_host=proxy_host,
+                node_ports=node_ports,
+                node_index=r_idx + 1,
+            )
+            sb_name = app_name or f"{sb_host}:{sb_port}"
+            standby_names.add(sb_name)
+            standby_specs.append({
+                "name": sb_name,
+                "host": sb_host,
+                "port": sb_port,
+                "patroni_role": "standby",
+                "patroni_state": PATRONI_STATE_RUNNING,
+                "patroni_tl": 1,
+                "patroni_lag": lag_b,
+                "sync_state": sync_st,
+            })
+
+        # 4. Resolve Primary Name:
+        # Check HAProxy stats if available
+        primary_name = ""
+        hp_stats = fetch_haproxy_stats(proxy_host, stats_port=haproxy_stats_port)
+        for px_name, sv_dict in hp_stats.items():
+            if any(k in px_name.lower() for k in ("primary", "master", "write")):
+                for sv_name, sv_st in sv_dict.items():
+                    if sv_st == "UP" and sv_name not in ("FRONTEND", "BACKEND"):
+                        primary_name = sv_name
+                        break
+            if primary_name:
+                break
+
+        # If HAProxy stats port not reachable, deduce by subtraction from known nodes
+        if not primary_name:
+            known_aliases: List[str] = []
+            for k in address_map:
+                alias = k.split(":")[0]
+                if alias not in known_aliases:
+                    known_aliases.append(alias)
+            for a in known_aliases:
+                if a not in standby_names:
+                    primary_name = a
+                    break
+
+        if not primary_name:
+            primary_name = c_name or f"{s_addr}:{s_port}"
+
+        p_host, p_port = resolve_mapped_endpoint(
+            name=primary_name,
+            host=s_addr,
+            port=s_port,
+            address_map=address_map,
+            cluster_host=proxy_host,
+            node_ports=node_ports,
+            node_index=0,
+        )
+
+        primary_spec = {
+            "name": primary_name,
+            "host": p_host,
+            "port": p_port,
+            "patroni_role": "primary",
+            "patroni_state": PATRONI_STATE_RUNNING,
+            "patroni_tl": 1,
+            "patroni_lag": 0,
+        }
+
+        return True, primary_spec, standby_specs, f"discovered primary {primary_name} ({p_host}:{p_port}) and {len(standby_specs)} standbys via proxy {proxy_host}:{proxy_port}"
+    finally:
+        client.close()
 
 
 def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2729,8 +3008,27 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     patroni_data = None
     patroni_history = []
 
-    # Attempt Patroni REST discovery first (skipped in standalone mode)
-    seed_host = cluster_host or ("127.0.0.1" if not raw_nodes else "")
+    node_specs: List[Dict[str, Any]] = []
+
+    # Single-endpoint & Network Discovery Parameters
+    discovery_port = safe_int(merged.get("discovery_port", merged.get("haproxy_stats_port")), default=7000)
+    discovery_uri = str(merged.get("discovery_uri", "/;csv")).strip()
+    patroni_ports = parse_port_list(merged.get("patroni_ports"))
+    node_ports = parse_port_list(merged.get("node_ports"))
+    write_port = safe_int(merged.get("write_port", merged.get("haproxy_port")), default=0)
+    read_port = safe_int(merged.get("read_port"), default=0)
+    proxy_host = merged.get("proxy_host", merged.get("haproxy_host", ""))
+
+    hp_stats = fetch_haproxy_stats(proxy_host or cluster_host or "127.0.0.1", stats_port=discovery_port)
+
+    # 1. Attempt Patroni REST discovery (multi-port resilient)
+    if ("nodes" in param or "node" in param) and "cluster_host" not in param:
+        cluster_host = ""
+        seed_host = ""
+        patroni_ports = parse_port_list(param.get("patroni_ports"))
+        node_ports = parse_port_list(param.get("node_ports"))
+    else:
+        seed_host = cluster_host or proxy_host or ("127.0.0.1" if not raw_nodes else "")
     patroni_probe_status = "not_applicable"
     patroni_endpoint_used = None
     if seed_host and monitor_mode != MODE_STANDALONE:
@@ -2740,7 +3038,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             address_map=address_map,
             prev_state=prev_state,
             raw_nodes=raw_nodes,
-            timeout=1.0
+            timeout=1.0,
+            patroni_ports=patroni_ports,
         )
         if patroni_probe_status == "positive" and patroni_data and "members" in patroni_data:
             cluster_manager = TOPOLOGY_PATRONI
@@ -2754,10 +3053,36 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                     eps.insert(0, patroni_endpoint_used)
                 new_state["patroni_endpoints"] = eps[:5]
 
-    node_specs: List[Dict[str, Any]] = []
+    # 2. If Patroni REST is not available, attempt HAProxy primary write-proxy discovery
+    use_haproxy_seed = bool(proxy_host or write_port or port_default in (5000, 5500))
+    if not discovered_members and use_haproxy_seed and monitor_mode != MODE_STANDALONE:
+        hp_h = proxy_host or cluster_host or "127.0.0.1"
+        hp_p = write_port or (port_default if port_default in (5000, 5500) else 5000)
+        hp_ok, p_spec, sb_specs, hp_msg = discover_primary_via_proxy(
+            proxy_host=hp_h,
+            proxy_port=hp_p,
+            username=username,
+            password=password,
+            dbname=dbname,
+            address_map=address_map,
+            sslmode=sslmode,
+            sslrootcert=sslrootcert,
+            sslcert=sslcert,
+            sslkey=sslkey,
+            connect_timeout=3,
+            haproxy_stats_port=discovery_port,
+            node_ports=node_ports,
+        )
+        if hp_ok and p_spec:
+            node_specs = [p_spec] + sb_specs
+            cluster_manager = TOPOLOGY_PATRONI
+            cluster_manager_str = "haproxy"
+            payload["Topology_Type"] = TOPOLOGY_PATRONI
 
-    if discovered_members:
-        for raw_m in discovered_members:
+    if node_specs:
+        pass
+    elif discovered_members:
+        for node_idx, raw_m in enumerate(discovered_members):
             m = parse_patroni_member(raw_m)
             m_name = m.get("name", "")
             m_host = m.get("host", "")
@@ -2767,20 +3092,18 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             m_tl = m.get("timeline", 0)
             m_lag = m.get("lag")
 
-            # Apply address mapping if necessary
-            target_key = f"{m_host}:{m_port}"
-            mapped_target = address_map.get(target_key) or address_map.get(m_host)
-            conn_host = m_host
-            conn_port = m_port
-            if mapped_target:
-                if ":" in mapped_target:
-                    conn_host, p_str = mapped_target.rsplit(":", 1)
-                    conn_port = safe_int(p_str, default=m_port)
-                else:
-                    conn_host = mapped_target
+            conn_host, conn_port = resolve_mapped_endpoint(
+                name=m_name,
+                host=m_host,
+                port=m_port,
+                address_map=address_map,
+                cluster_host=cluster_host,
+                node_ports=node_ports,
+                node_index=node_idx,
+            )
 
             node_specs.append({
-                "name": m_name or target_key,
+                "name": m_name or f"{conn_host}:{conn_port}",
                 "host": conn_host,
                 "port": conn_port,
                 "patroni_role": m_role_str,
@@ -2789,9 +3112,35 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 "patroni_lag": m_lag
             })
 
-        # Include any expected cluster members declared in address_map or raw_nodes
+        # Include any expected cluster members declared in address_map, HAProxy stats, or raw_nodes
         # that are missing from live Patroni discovery (e.g. stopped nodes)
         discovered_names = {s["name"] for s in node_specs}
+
+        # Check HAProxy stats backends for any additional cluster nodes
+        if hp_stats:
+            for px_name, sv_dict in hp_stats.items():
+                if any(k in px_name.lower() for k in ("primary", "replica", "standby", "postgres")):
+                    for sv_name, sv_st in sv_dict.items():
+                        if sv_name not in ("FRONTEND", "BACKEND") and sv_name not in discovered_names:
+                            h_h, h_p = resolve_mapped_endpoint(
+                                name=sv_name,
+                                host=cluster_host or "127.0.0.1",
+                                port=port_default,
+                                address_map=address_map,
+                                cluster_host=cluster_host,
+                                node_ports=node_ports,
+                            )
+                            node_specs.append({
+                                "name": sv_name,
+                                "host": h_h,
+                                "port": h_p,
+                                "patroni_role": "unknown",
+                                "patroni_state": PATRONI_STATE_STOPPED,
+                                "patroni_tl": 0,
+                                "patroni_lag": None,
+                            })
+                            discovered_names.add(sv_name)
+
         if raw_nodes:
             for name, host, port in parse_node_specs(raw_nodes, default_port=port_default):
                 if name not in discovered_names and f"{host}:{port}" not in discovered_names:
@@ -2807,20 +3156,26 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                     discovered_names.add(name)
         if address_map:
             for src, dst in address_map.items():
-                if ":5432" in src:
-                    n_alias = src.split(":")[0]
-                    if n_alias not in discovered_names:
-                        dst_h, dst_p = dst.rsplit(":", 1) if ":" in dst else (dst, str(port_default))
-                        node_specs.append({
-                            "name": n_alias,
-                            "host": dst_h,
-                            "port": safe_int(dst_p, default=port_default),
-                            "patroni_role": "unknown",
-                            "patroni_state": PATRONI_STATE_STOPPED,
-                            "patroni_tl": 0,
-                            "patroni_lag": None
-                        })
-                        discovered_names.add(n_alias)
+                n_alias = src.split(":")[0]
+                if n_alias not in discovered_names:
+                    dst_h, dst_p = resolve_mapped_endpoint(
+                        name=n_alias,
+                        host=cluster_host or "127.0.0.1",
+                        port=port_default,
+                        address_map=address_map,
+                        cluster_host=cluster_host,
+                        node_ports=node_ports,
+                    )
+                    node_specs.append({
+                        "name": n_alias,
+                        "host": dst_h,
+                        "port": dst_p,
+                        "patroni_role": "unknown",
+                        "patroni_state": PATRONI_STATE_STOPPED,
+                        "patroni_tl": 0,
+                        "patroni_lag": None
+                    })
+                    discovered_names.add(n_alias)
     elif raw_nodes:
         for name, host, port in parse_node_specs(raw_nodes, default_port=port_default):
             node_specs.append({
@@ -3276,12 +3631,12 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         queries_count += 1
         commits, rollbacks, ins, upd, dels, blks_r, blks_h = 0, 0, 0, 0, 0, 0, 0
         if row:
-            conns = safe_int(row[0])
-            commits = safe_int(row[1])
-            rollbacks = safe_int(row[2])
-            ins = safe_int(row[3])
-            upd = safe_int(row[4])
-            dels = safe_int(row[5])
+            conns = safe_int(row[0]) if len(row) > 0 else 0
+            commits = safe_int(row[1]) if len(row) > 1 else 0
+            rollbacks = safe_int(row[2]) if len(row) > 2 else 0
+            ins = safe_int(row[3]) if len(row) > 3 else 0
+            upd = safe_int(row[4]) if len(row) > 4 else 0
+            dels = safe_int(row[5]) if len(row) > 5 else 0
             blks_r = safe_int(row[8]) if len(row) > 8 else 0
             blks_h = safe_int(row[9]) if len(row) > 9 else 0
             max_xid_age = safe_int(row[10]) if len(row) > 10 else 0
@@ -3590,8 +3945,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 sub_stats = active_client.query_one("SELECT coalesce(sum(apply_error_count), 0), coalesce(sum(sync_error_count), 0) FROM pg_stat_subscription_stats;")
                 queries_count += 1
                 if sub_stats:
-                    payload["Subscription_Apply_Errors"] = safe_int(sub_stats[0])
-                    payload["Subscription_Conflicts"] = safe_int(sub_stats[1])
+                    payload["Subscription_Apply_Errors"] = safe_int(sub_stats[0]) if len(sub_stats) > 0 else 0
+                    payload["Subscription_Conflicts"] = safe_int(sub_stats[1]) if len(sub_stats) > 1 else 0
                 else:
                     prune_omitted_metric(payload, "Subscription_Apply_Errors")
                     prune_omitted_metric(payload, "Subscription_Conflicts")
@@ -4340,76 +4695,186 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=f"Site24x7 PostgreSQL Cluster Monitor v{PLUGIN_VERSION}")
-    parser.add_argument("--self-test", action="store_true", help="Run in-process pure validation checks")
-    parser.add_argument("--json-out", type=str, default="", help="Write emitted JSON to specified file")
-    parser.add_argument("--nodes", type=str, default="", help="Comma-separated node specifications (e.g. pg1=host:port)")
-    parser.add_argument("--cluster_host", type=str, default="", help="Hostname or IP of cluster seed node")
-    parser.add_argument("--postgres_port", type=int, default=5432, help="PostgreSQL server port")
-    parser.add_argument("--patroni_port", type=int, default=0, help="Patroni REST API port")
-    parser.add_argument("--address_map", type=str, default="", help="Address translation map (e.g. pg1:5432=127.0.0.1:5441)")
-    parser.add_argument("--username", type=str, default="", help="Monitoring username")
-    parser.add_argument("--password", type=str, default="", help="Monitoring password")
-    parser.add_argument("--db", type=str, default="postgres", help="Target database name")
-    parser.add_argument("--cluster_name", type=str, default="", help="Cluster name override")
-    parser.add_argument("--state_dir", type=str, default="", help="State file directory override")
-    parser.add_argument("--sslmode", type=str, default="prefer", help="PostgreSQL SSL mode")
-    parser.add_argument("--cycle_deadline", type=float, default=40.0, help="Total cycle collection deadline in seconds")
-    parser.add_argument("--hard_exit", type=int, default=0, help="1 for immediate os._exit(0), 0 for clean interpreter exit")
-    parser.add_argument("--is_multi_master", type=int, default=0, help="1 for multi-master active-active topology")
-    parser.add_argument("--topology_type", type=str, default="", help="Topology type override")
-    parser.add_argument("--compat_official", type=int, default=1, help="1 for official postgres backward compatibility, 0 for pure cluster")
-    parser.add_argument("--monitor_mode", type=str, default="", help="Monitoring mode: auto | standalone | cluster")
-    args, _ = parser.parse_known_args()
+    try:
+        parser = argparse.ArgumentParser(description=f"Site24x7 PostgreSQL Cluster Monitor v{PLUGIN_VERSION}")
+        parser.add_argument("--self-test", action="store_true", help="Run in-process pure validation checks")
+        parser.add_argument("--json-out", type=str, default="", help="Write emitted JSON to specified file")
+        parser.add_argument("--nodes", type=str, default="", help="Comma-separated node specifications (e.g. pg1=host:port)")
+        parser.add_argument("--cluster_host", type=str, default="", help="Hostname or IP of cluster seed node")
+        parser.add_argument("--postgres_port", type=int, default=5432, help="PostgreSQL server port")
+        parser.add_argument("--patroni_port", type=int, default=0, help="Patroni REST API port")
+        parser.add_argument("--haproxy_host", type=str, default="", help="HAProxy hostname or IP for primary write frontend")
+        parser.add_argument("--haproxy_port", type=int, default=0, help="HAProxy primary write port (e.g. 5000 or 5500)")
+        parser.add_argument("--haproxy_stats_port", type=int, default=7000, help="HAProxy stats port for CSV telemetry")
+        parser.add_argument("--discovery_port", type=int, default=0, help="Cluster telemetry/stats discovery port (default: 7000)")
+        parser.add_argument("--discovery_uri", type=str, default="", help="Telemetry/stats URI path (default: /;csv)")
+        parser.add_argument("--patroni_ports", type=str, default="", help="Candidate Patroni REST ports (e.g. 8001,8002,8003 or 8001-8003)")
+        parser.add_argument("--node_ports", type=str, default="", help="Discovered backend PostgreSQL ports (e.g. 5441,5442,5443 or 5441-5443)")
+        parser.add_argument("--write_port", type=int, default=0, help="PostgreSQL write endpoint port (e.g. 5000 or 5500)")
+        parser.add_argument("--read_port", type=int, default=0, help="PostgreSQL read/replica endpoint port (e.g. 5001 or 5501)")
+        parser.add_argument("--proxy_host", type=str, default="", help="Cluster entry-point proxy or VIP hostname/IP")
+        parser.add_argument("--address_map", type=str, default="", help="Address translation map (e.g. pg1:5432=127.0.0.1:5441)")
+        parser.add_argument("--username", type=str, default="", help="Monitoring username")
+        parser.add_argument("--password", type=str, default="", help="Monitoring password")
+        parser.add_argument("--db", type=str, default="postgres", help="Target database name")
+        parser.add_argument("--cluster_name", type=str, default="", help="Cluster name override")
+        parser.add_argument("--state_dir", type=str, default="", help="State file directory override")
+        parser.add_argument("--sslmode", type=str, default="prefer", help="PostgreSQL SSL mode")
+        parser.add_argument("--cycle_deadline", type=float, default=40.0, help="Total cycle collection deadline in seconds")
+        parser.add_argument("--hard_exit", type=int, default=0, help="1 for immediate os._exit(0), 0 for clean interpreter exit")
+        parser.add_argument("--is_multi_master", type=int, default=0, help="1 for multi-master active-active topology")
+        parser.add_argument("--topology_type", type=str, default="", help="Topology type override")
+        parser.add_argument("--compat_official", type=int, default=1, help="1 for official postgres backward compatibility, 0 for pure cluster")
+        parser.add_argument("--monitor_mode", type=str, default="", help="Monitoring mode: auto | standalone | cluster")
 
-    if args.self_test:
-        sys.exit(self_test())
+        try:
+            args, _ = parser.parse_known_args()
+        except BaseException as parse_err:
+            if isinstance(parse_err, SystemExit) and parse_err.code == 0:
+                sys.exit(0)
+            args = argparse.Namespace()
 
-    params: Dict[str, Any] = {}
-    if args.monitor_mode:
-        params["monitor_mode"] = args.monitor_mode
-    if args.nodes:
-        params["nodes"] = args.nodes
-    if args.cluster_host:
-        params["cluster_host"] = args.cluster_host
-    if args.postgres_port:
-        params["postgres_port"] = args.postgres_port
-    if args.patroni_port:
-        params["patroni_port"] = args.patroni_port
-    if args.address_map:
-        params["address_map"] = args.address_map
-    if args.username:
-        params["username"] = args.username
-    if args.password:
-        params["password"] = args.password
-    if args.db:
-        params["db"] = args.db
-    if args.cluster_name:
-        params["cluster_name"] = args.cluster_name
-    if args.state_dir:
-        params["state_dir"] = args.state_dir
-    if args.sslmode:
-        params["sslmode"] = args.sslmode
-    if args.cycle_deadline:
-        params["cycle_deadline"] = args.cycle_deadline
-    if args.hard_exit:
-        params["hard_exit"] = args.hard_exit
-    if args.is_multi_master:
-        params["is_multi_master"] = args.is_multi_master
-    if args.topology_type:
-        params["topology_type"] = args.topology_type
-    if args.compat_official is not None:
-        params["compat_official"] = args.compat_official
+        if getattr(args, "self_test", False):
+            sys.exit(self_test())
 
-    result = run(params)
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
-    print(json.dumps(result))
-    sys.stdout.flush()
-    if int(params.get("hard_exit") or 0) == 1:
-        os._exit(0)
+        params: Dict[str, Any] = {}
+        if getattr(args, "monitor_mode", None):
+            params["monitor_mode"] = args.monitor_mode
+        if getattr(args, "nodes", None):
+            params["nodes"] = args.nodes
+        if getattr(args, "cluster_host", None):
+            params["cluster_host"] = args.cluster_host
+        if getattr(args, "postgres_port", None):
+            params["postgres_port"] = args.postgres_port
+        if getattr(args, "patroni_port", None):
+            params["patroni_port"] = args.patroni_port
+        if getattr(args, "haproxy_host", None):
+            params["haproxy_host"] = args.haproxy_host
+        if getattr(args, "haproxy_port", None):
+            params["haproxy_port"] = args.haproxy_port
+        if getattr(args, "haproxy_stats_port", None):
+            params["haproxy_stats_port"] = args.haproxy_stats_port
+        if getattr(args, "discovery_port", None):
+            params["discovery_port"] = args.discovery_port
+        if getattr(args, "discovery_uri", None):
+            params["discovery_uri"] = args.discovery_uri
+        if getattr(args, "patroni_ports", None):
+            params["patroni_ports"] = args.patroni_ports
+        if getattr(args, "node_ports", None):
+            params["node_ports"] = args.node_ports
+        if getattr(args, "write_port", None):
+            params["write_port"] = args.write_port
+        if getattr(args, "read_port", None):
+            params["read_port"] = args.read_port
+        if getattr(args, "proxy_host", None):
+            params["proxy_host"] = args.proxy_host
+        if getattr(args, "address_map", None):
+            params["address_map"] = args.address_map
+        if getattr(args, "username", None):
+            params["username"] = args.username
+        if getattr(args, "password", None):
+            params["password"] = args.password
+        if getattr(args, "db", None):
+            params["db"] = args.db
+        if getattr(args, "cluster_name", None):
+            params["cluster_name"] = args.cluster_name
+        if getattr(args, "state_dir", None):
+            params["state_dir"] = args.state_dir
+        if getattr(args, "sslmode", None):
+            params["sslmode"] = args.sslmode
+        if getattr(args, "cycle_deadline", None):
+            params["cycle_deadline"] = args.cycle_deadline
+        if getattr(args, "hard_exit", None):
+            params["hard_exit"] = args.hard_exit
+        if getattr(args, "is_multi_master", None):
+            params["is_multi_master"] = args.is_multi_master
+        if getattr(args, "topology_type", None):
+            params["topology_type"] = args.topology_type
+        if getattr(args, "compat_official", None) is not None:
+            params["compat_official"] = args.compat_official
+
+        try:
+            result = run(params)
+        except BaseException as exc:
+            if isinstance(exc, SystemExit) and exc.code == 0:
+                sys.exit(0)
+            result = {
+                "plugin_version": PLUGIN_VERSION,
+                "heartbeat_required": HEARTBEAT_REQUIRED,
+                "status": STATUS_DOWN,
+                "msg": f"CRITICAL: Unhandled plugin exception: {exc}"[:MAX_MSG_CHARS],
+            }
+
+        # Absolute guarantee that mandatory keys are present and correctly typed
+        if not isinstance(result, dict):
+            result = {
+                "plugin_version": PLUGIN_VERSION,
+                "heartbeat_required": HEARTBEAT_REQUIRED,
+                "status": STATUS_DOWN,
+                "msg": "CRITICAL: Non-dict payload returned",
+            }
+        result["plugin_version"] = int(PLUGIN_VERSION)
+        result["heartbeat_required"] = bool(HEARTBEAT_REQUIRED)
+        if "status" not in result:
+            result["status"] = STATUS_DOWN
+        else:
+            result["status"] = int(result["status"])
+
+        if getattr(args, "json_out", None):
+            try:
+                with open(args.json_out, "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=2, default=str)
+            except Exception:
+                pass
+
+        try:
+            json_str = json.dumps(result, default=str)
+        except Exception as exc:
+            json_str = json.dumps({
+                "plugin_version": int(PLUGIN_VERSION),
+                "heartbeat_required": bool(HEARTBEAT_REQUIRED),
+                "status": STATUS_DOWN,
+                "msg": f"CRITICAL: JSON serialization error: {str(exc)[:100]}",
+            })
+
+        print(json_str)
+        sys.stdout.flush()
+
+        if int(params.get("hard_exit") or 0) == 1:
+            os._exit(0)
+
+    except BaseException as fatal_exc:
+        if isinstance(fatal_exc, SystemExit) and fatal_exc.code == 0:
+            sys.exit(0)
+        try:
+            err_msg = str(fatal_exc).replace('"', "'").replace("\n", " ")[:MAX_MSG_CHARS]
+            emergency = {
+                "plugin_version": int(PLUGIN_VERSION),
+                "heartbeat_required": bool(HEARTBEAT_REQUIRED),
+                "status": STATUS_DOWN,
+                "msg": f"CRITICAL: Fatal plugin error: {err_msg}",
+            }
+            print(json.dumps(emergency, default=str))
+            sys.stdout.flush()
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as top_exc:
+        if isinstance(top_exc, SystemExit) and top_exc.code == 0:
+            pass
+        else:
+            try:
+                print(json.dumps({
+                    "plugin_version": 2,
+                    "heartbeat_required": True,
+                    "status": 0,
+                    "msg": f"CRITICAL: Top-level exception: {str(top_exc)[:150]}"
+                }, default=str))
+                sys.stdout.flush()
+            except Exception:
+                pass

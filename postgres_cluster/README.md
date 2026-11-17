@@ -104,7 +104,52 @@ To monitor multiple PostgreSQL clusters from the same agent host, create separat
 
 ---
 
-## 3. Monitoring Modes: Standalone vs Cluster
+## 3. Network Architecture & Single-Endpoint Discovery
+
+The plugin eliminates the requirement to manually configure individual backend PostgreSQL node IP addresses or rely on static node lists.
+
+### Architecture Overview
+
+```
+                      +-----------------------------------+
+                      |   Site24x7 Agent Host             |
+                      |   (postgres_cluster plugin)       |
+                      +-----------------+-----------------+
+                                        | Single cluster entry point:
+                                        | cluster_host="cluster-lb.corp"
+                                        v
+         +-------------------------------------------------------------+
+         |     Cluster Entry Point / Load Balancer (HAProxy / VIP)     |
+         |  - Port 5500: Write pool (routes to active primary)         |
+         |  - Port 5501: Read pool (load balances active standbys)     |
+         |  - Port 7000: HAProxy stats interface (/stats;csv)         |
+         +------+----------------------+-------------------------+-----+
+                |                      |                         |
+                v                      v                         v
+       +-----------------+    +-----------------+       +-----------------+
+       | pg-node1 (5441) |    | pg-node2 (5442) |       | pg-node3 (5443) |
+       | Patroni (8001)  |    | Patroni (8002)  |       | Patroni (8003)  |
+       +-----------------+    +-----------------+       +-----------------+
+```
+
+### Discovery & Port Resolution Engine
+1. **Dynamic Patroni REST Discovery (`patroni_ports`)**:
+   - The plugin probes candidate Patroni REST API ports on `cluster_host` (e.g. `8001-8003` or `8008`).
+   - Obtains real-time cluster membership from `/cluster`, including roles (`primary`, `standby`), timelines, replication lag, and node states.
+2. **HAProxy Stats Discovery (`discovery_port`, `discovery_uri`)**:
+   - If Patroni REST is disabled or unreachable, the plugin queries HAProxy CSV stats on port 7000.
+   - Discovers which backend is currently marked active (`UP`) in the primary/write backend pool.
+3. **Mapped Port Resolution (`node_ports`, `address_map`)**:
+   - Resolves internal advertised container/VM IPs to client-accessible connection ports.
+   - Supports shorthand mapping (e.g. `address_map="pg-node1=5441,pg-node2=5442,pg-node3=5443"`), host:port pairs, or automatic indexing via `node_ports="5441-5443"`.
+4. **Zero-Reconfiguration Failover**:
+   - When the primary node crashes or shuts down, Patroni promotes a replica.
+   - The plugin automatically detects the promoted primary on the next collection cycle without any configuration modifications.
+   - Stopped nodes are accurately reported as `offline` (`patroni_state: stopped`), while the overall cluster remains `UP` (`1`) with healthy nodes operational.
+
+---
+
+## 4. Monitoring Modes: Standalone vs Cluster
 
 The plugin natively supports three monitoring modes configured via `monitor_mode`:
 

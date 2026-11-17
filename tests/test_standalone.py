@@ -45,6 +45,22 @@ def live_postgres_accessible(port=5441):
         return False
 
 
+def get_live_primary_port():
+    """Finds which PostgreSQL port (5443, 5442, 5441) is currently primary."""
+    for p in (5443, 5442, 5441):
+        if live_postgres_accessible(p):
+            try:
+                c = pc.NodeClient("probe", "127.0.0.1", p, "site24x7", "site24x7", connect_timeout=1)
+                if c.connect():
+                    res = c.query_one("SELECT pg_is_in_recovery()")
+                    c.close()
+                    if res and not res[0]:
+                        return p
+            except Exception:
+                pass
+    return 5441
+
+
 class TestStandaloneHealthEngine(unittest.TestCase):
     """Pure unit tests for evaluate_database_health() reasoning engine."""
 
@@ -229,8 +245,9 @@ class TestStandaloneScenarios(unittest.TestCase):
     @unittest.skipUnless(live_postgres_accessible(5441), "Live PostgreSQL container port 5441 required")
     def test_scenario_05_healthy_single_node_cluster(self):
         """Case 5: Healthy single-node cluster with monitor_mode=cluster -> UP (1)."""
+        p_port = get_live_primary_port()
         res = pc.run({
-            "nodes": "127.0.0.1:5441",
+            "nodes": f"127.0.0.1:{p_port}",
             "username": "site24x7",
             "password": "site24x7",
             "monitor_mode": "cluster"
@@ -313,8 +330,9 @@ class TestStandaloneScenarios(unittest.TestCase):
     @unittest.skipUnless(live_postgres_accessible(5441), "Live PostgreSQL container port 5441 required")
     def test_scenario_11_legacy_config_without_monitor_mode(self):
         """Case 11: Legacy configuration without monitor_mode defaults to auto."""
+        p_port = get_live_primary_port()
         res = pc.run({
-            "nodes": "127.0.0.1:5441",
+            "nodes": f"127.0.0.1:{p_port}",
             "username": "site24x7",
             "password": "site24x7"
         })
