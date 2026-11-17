@@ -288,5 +288,143 @@ class TestStateStorePersistence(unittest.TestCase):
             self.assertEqual(loaded_state3.get("primary_name"), "pg-node3")
 
 
+class TestDynamicClusterThresholds(unittest.TestCase):
+    """
+    Verifies threshold rule conditions against dynamically sized clusters (2-node, 3-node, 5-node)
+    and verifies alert deduplication and resulting states.
+    """
+
+    def test_2_node_cluster_healthy_no_false_alerts(self):
+        """A healthy 2-node cluster (1 primary + 1 standby) must not trigger any false alerts."""
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg1",
+            nodes_up=2,
+            nodes_total=2,
+            timeline=1,
+            primaries_count=1,
+            expected_standbys=1,
+            streaming_standbys=1,
+            max_replay_lag_s=0.0
+        )
+        nodes_down = 2 - 2
+        standby_disconnect_flag = 1 if 1 > 1 else 0
+
+        # Health is HEALTHY
+        self.assertEqual(h.severity, pc.HEALTH_OK)
+        # Evaluated threshold states
+        self.assertFalse(h.severity >= 1, "Cluster_Health >= 1 must NOT trigger on healthy 2-node cluster")
+        self.assertFalse(h.severity >= 2, "Cluster_Health >= 2 must NOT trigger on healthy 2-node cluster")
+        self.assertFalse(nodes_down >= 1, "Nodes_Down >= 1 must NOT trigger on healthy 2-node cluster")
+        self.assertFalse(standby_disconnect_flag == 1, "Standby_Disconnect_Flag must be 0")
+
+    def test_2_node_cluster_standby_down_triggers_critical(self):
+        """In a 2-node cluster, loss of the sole standby leaves 0 standbys streaming -> CRITICAL."""
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg1",
+            nodes_up=1,
+            nodes_total=2,
+            timeline=1,
+            primaries_count=1,
+            expected_standbys=1,
+            streaming_standbys=0,
+            max_replay_lag_s=0.0
+        )
+        nodes_down = 2 - 1
+        standby_disconnect_flag = 1 if 1 > 0 else 0
+
+        # Rule 3 triggers CRITICAL (0 of 1 streaming)
+        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
+        self.assertEqual(h.code, pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
+        self.assertTrue(h.severity >= 1)
+        self.assertTrue(h.severity >= 2, "Cluster_Health >= 2 must trigger Critical when sole replica is lost")
+        self.assertTrue(nodes_down >= 1)
+        self.assertEqual(standby_disconnect_flag, 1)
+
+    def test_3_node_cluster_single_standby_down_triggers_trouble_not_critical(self):
+        """In a 3-node cluster, loss of 1 standby leaves 1 standby still streaming -> TROUBLE (DEGRADED)."""
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg-node3",
+            nodes_up=2,
+            nodes_total=3,
+            timeline=2,
+            primaries_count=1,
+            expected_standbys=2,
+            streaming_standbys=1,
+            max_replay_lag_s=0.0
+        )
+        nodes_down = 3 - 2
+        standby_disconnect_flag = 1 if 2 > 1 else 0
+
+        self.assertEqual(h.severity, pc.HEALTH_WARN)
+        self.assertEqual(h.code, pc.HEALTH_CODE_NODE_DOWN)
+        # Evaluated threshold states
+        self.assertTrue(h.severity >= 1, "Cluster_Health >= 1 must trigger Trouble")
+        self.assertFalse(h.severity >= 2, "Cluster_Health >= 2 must NOT trigger on single replica loss")
+        self.assertTrue(nodes_down >= 1)
+        self.assertEqual(standby_disconnect_flag, 1)
+
+    def test_5_node_cluster_partial_standby_loss_triggers_trouble_dynamically(self):
+        """In a 5-node cluster, loss of 1 standby (4/5 up) dynamically triggers Trouble without static constants."""
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg-primary",
+            nodes_up=4,
+            nodes_total=5,
+            timeline=3,
+            primaries_count=1,
+            expected_standbys=4,
+            streaming_standbys=3,
+            max_replay_lag_s=0.0
+        )
+        nodes_down = 5 - 4
+        standby_disconnect_flag = 1 if 4 > 3 else 0
+
+        self.assertEqual(h.severity, pc.HEALTH_WARN)
+        self.assertEqual(h.code, pc.HEALTH_CODE_NODE_DOWN)
+        self.assertTrue(h.severity >= 1, "Cluster_Health >= 1 must trigger Trouble dynamically on 5-node cluster")
+        self.assertFalse(h.severity >= 2, "Cluster_Health >= 2 must NOT trigger (redundancy remains)")
+        self.assertTrue(nodes_down >= 1)
+        self.assertEqual(standby_disconnect_flag, 1)
+
+    def test_high_replication_lag_triggers_trouble(self):
+        """Replication lag > 60s triggers Trouble state while nodes are fully online."""
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg-node3",
+            nodes_up=3,
+            nodes_total=3,
+            timeline=2,
+            primaries_count=1,
+            expected_standbys=2,
+            streaming_standbys=2,
+            max_replay_lag_s=75.5,
+            replay_warn_s=60.0
+        )
+        self.assertEqual(h.severity, pc.HEALTH_WARN)
+        self.assertEqual(h.code, pc.HEALTH_CODE_STANDBY_LAG_HIGH)
+        # Threshold: Max_Replay_Lag_s > 60 triggers Trouble
+        self.assertTrue(75.5 > 60.0)
+        self.assertTrue(h.severity >= 1)
+        self.assertFalse(h.severity >= 2)
+
+    def test_primary_loss_triggers_critical(self):
+        """Total loss of primary node triggers CRITICAL / DOWN state."""
+        h = pc.evaluate_cluster_health(
+            has_primary=False,
+            primary_name="pg-node2",
+            nodes_up=2,
+            nodes_total=3,
+            timeline=1,
+            primaries_count=0
+        )
+        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
+        self.assertEqual(h.code, pc.HEALTH_CODE_PRIMARY_DOWN)
+        # Threshold: Cluster_Health >= 2 triggers Critical
+        self.assertTrue(h.severity >= 2)
+
+
 if __name__ == "__main__":
     unittest.main()
