@@ -4,20 +4,29 @@ __pycache__/
 *$py.class
 *.so
 
-# Environment & local credentials
+# Virtual environments
 .env
+.venv/
+env/
+venv/
+ENV/
+
+# Operating System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime & execution artifacts
+*.log
+*.tmp
+out.json
+.pgcluster*/
+
+# Configuration files
+# Ignores local / agent-encrypted configs while keeping the template tracked
 *.cfg
 !postgres_cluster.cfg
-
-# Test & Evidence artifacts
-.auth/
-evidence/
-ScheduledTask/
-
-# Residual dev folders
-patroni-cluster/
-postgres_cluster/
-tester/
-.pgcluster*/
-out.json
-*.log
+!*.cfg.example
