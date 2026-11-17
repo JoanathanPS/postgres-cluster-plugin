@@ -9,8 +9,9 @@ param()
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$clusterDir = Join-Path $scriptDir "postgres_cluster"
-$standaloneDir = Join-Path $scriptDir "postgres"
+$rootDir = Split-Path -Parent $scriptDir
+$clusterDir = Join-Path $rootDir "postgres_cluster"
+$standaloneDir = Join-Path $rootDir "reference\postgres"
 
 Write-Host "=================================================================" -ForegroundColor Cyan
 Write-Host " Site24x7 Layout Compliance & Health Check" -ForegroundColor Cyan

@@ -12,7 +12,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     PYTHON_BIN="python"
 fi
 
-PLUGIN_PY="$SCRIPT_DIR/postgres_cluster/postgres_cluster.py"
+PLUGIN_PY="$SCRIPT_DIR/../postgres_cluster/postgres_cluster.py"
 NODES="${PG_NODES:-node1=localhost:5441,node2=localhost:5442,node3=localhost:5443}"
 USER="${MONITOR_USER:-site24x7}"
 PASS="${MONITOR_PASSWORD:-site24x7}"

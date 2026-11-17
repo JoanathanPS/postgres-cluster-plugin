@@ -37,7 +37,7 @@ services:
       - hot_standby=on
     volumes:
       - primary-data:/var/lib/postgresql/data
-      - ./initdb/primary:/docker-entrypoint-initdb.d:ro
+      - ./environments/streaming/initdb/primary:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:${PRIMARY_HOST_PORT:-5432}:5432"
     healthcheck:
@@ -63,7 +63,7 @@ services:
     command: ["postgres"]
     volumes:
       - replica-data:/var/lib/postgresql/data
-      - ./replica:/replica:ro
+      - ./environments/streaming/replica:/replica:ro
     ports:
       - "127.0.0.1:${REPLICA_HOST_PORT:-5433}:5432"
     depends_on:
@@ -78,7 +78,7 @@ services:
     restart: unless-stopped
 
   plugin-test:
-    build: ./tester
+    build: ./tests/tester
     profiles: ["test"]
     environment:
       MONITOR_USER: ${MONITOR_USER:-site24x7}
@@ -89,7 +89,7 @@ services:
       PLUGIN_DB: appdb
       OUTPUT_DIR: /out
     volumes:
-      - ./postgres:/plugin/postgres:ro
+      - ./reference/postgres:/plugin/postgres:ro
       - ./test-output:/out
     depends_on:
       pg-primary:

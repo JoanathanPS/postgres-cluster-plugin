@@ -1,33 +1,43 @@
-# secrets & configs (only *.example files should be tracked)
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
 .env
 *.env
 !*.env.example
 *.env.local
-postgres/postgres.cfg
-postgres_cluster/postgres_cluster.cfg
-patroni-cluster/.env
+.venv/
+env/
+venv/
+ENV/
 
-# debug, helper & scratch files
-inspect_plugin.ps1
-pg_debug*
-pgtest*
-pgbackup*
-pg_out*
+# Operating System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime, logs & evidence artifacts
 *.log
-scratch/
-test-output/
+*.tmp
+out.json
 evidence/
 .auth/
 .chrome_user_data/
-tester/.chrome_user_data/
-__pycache__/
-*.pyc
-
-# legacy task folders
-ScheduledTask/
-
-# runtime files the plugin writes next to itself
+.pgcluster*/
 topology_cache.json
-.pgcluster*
-*.tmp
-out.json
+test-output/
+scratch/
+
+# Local credentials & configs
+*.cfg
+!postgres_cluster/postgres_cluster.cfg.example
+!reference/postgres/postgres.cfg.example
+
+# Local screenshots
+ss*.png

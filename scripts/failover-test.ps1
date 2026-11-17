@@ -9,5 +9,6 @@ Write-Host "Running PostgreSQL Cluster Failover Test Suite..." -ForegroundColor 
 $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $pyExe) { $pyExe = "python" }
 
-& $pyExe tester/test_cluster_plugin.py --failover
+$repoRoot = Split-Path -Parent $PSScriptRoot
+& $pyExe (Join-Path $repoRoot "tests\tester\test_cluster_plugin.py") --failover
 exit $LASTEXITCODE
