@@ -39,7 +39,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # 0. PLATFORM CONSTANTS & ABSOLUTE LIMITS (Site24x7 Enforced)
 # -----------------------------------------------------------------------------
-PLUGIN_VERSION = 1
+PLUGIN_VERSION = 2
 HEARTBEAT_REQUIRED = True
 
 MAX_TABLES = 10
@@ -51,6 +51,14 @@ MAX_NAME_CHARS = 520
 MAX_STRING_CHARS = 100
 MAX_METRICS = 200
 MAX_MSG_CHARS = 180
+
+# Metrics promoted to the built-in Site24x7 Summary tab (untabbed in payload)
+SUMMARY_METRICS: Set[str] = {
+    "Cluster_Health",
+    "Nodes_Up",
+    "Standbys_Streaming",
+    "Max_Replay_Lag_s",
+}
 
 RESERVED_KEYS = {
     "plugin_version", "heartbeat_required", "status", "msg",
@@ -565,15 +573,22 @@ class Health:
         Renders Site24x7 single-line monitor message <= 180 chars:
         '<SEVERITY> <code>: <fact> (<quantified>) | <context> | hint: <action>'
         """
-        sev_name = HEALTH_NAMES.get(self.severity, "INFO")
+        sev_map = {
+            HEALTH_OK: "HEALTHY",
+            HEALTH_WARN: "DEGRADED",
+            HEALTH_CRITICAL: "CRITICAL",
+        }
+        sev_name = sev_map.get(self.severity, "INFO")
         code_str = f"c{self.code}"
         msg = f"{sev_name} {code_str}: {self.fact}"
         if self.quantified:
             msg += f" ({self.quantified})"
         if self.context:
             msg += f" | {self.context}"
-        if self.hint:
+        if self.hint and self.hint != "none":
             msg += f" | hint: {self.hint}"
+        elif self.hint == "none":
+            msg += " | Attention: None"
         return msg[:MAX_MSG_CHARS]
 
 
@@ -611,6 +626,8 @@ def evaluate_cluster_health(
     stale_stats: int = 0,
     auth_failure: bool = False,
     auth_msg: str = "",
+    prev_primary_name: str = "",
+    prev_primary_recovered: bool = True,
 ) -> Health:
     """
     Pure health reasoning engine. Evaluates criteria in strict precedence order:
@@ -702,12 +719,15 @@ def evaluate_cluster_health(
     # -------------------------------------------------------------------------
     # 7. WARN: Any Node Down
     if nodes_up < nodes_total:
+        ctx = f"primary: {primary_name}"
+        if expected_standbys > 0 or streaming_standbys > 0:
+            ctx += f" | {streaming_standbys}/{expected_standbys} streaming"
         return Health(
             code=HEALTH_CODE_NODE_DOWN,
             severity=HEALTH_WARN,
             fact=f"{nodes_total - nodes_up} cluster node(s) unreachable",
             quantified=f"{nodes_up}/{nodes_total} up",
-            context=f"primary: {primary_name}",
+            context=ctx,
             hint="inspect offline node postmaster"
         )
 
@@ -748,13 +768,22 @@ def evaluate_cluster_health(
     # 11. WARN: Recent Failover within Window
     if 0 <= failover_age_s <= failover_window_s:
         age_m = failover_age_s // 60
+        if not prev_primary_recovered and prev_primary_name:
+            fail_ctx = f"promoted: {primary_name} | previous {prev_primary_name} unrecovered"
+            fail_hint = f"verify {prev_primary_name} re-joins as standby"
+        elif prev_primary_recovered and prev_primary_name:
+            fail_ctx = f"promoted: {primary_name} | {prev_primary_name} recovered as standby"
+            fail_hint = "none"
+        else:
+            fail_ctx = f"promoted: {primary_name}"
+            fail_hint = "verify previous primary re-joined as standby"
         return Health(
             code=HEALTH_CODE_RECENT_FAILOVER,
             severity=HEALTH_WARN,
             fact="recent failover occurred within warning window",
             quantified=f"{age_m}m ago",
-            context=f"promoted: {primary_name}",
-            hint="verify previous primary re-joined as standby"
+            context=fail_ctx,
+            hint=fail_hint
         )
 
     # 12. WARN: XID Wraparound >= 70%
@@ -801,13 +830,27 @@ def evaluate_cluster_health(
             hint="run ANALYZE"
         )
 
+    # 16. WARN: Unconfirmed Failover Recovery (even if failover_age_s > failover_window_s)
+    if prev_primary_name and not prev_primary_recovered:
+        return Health(
+            code=HEALTH_CODE_RECENT_FAILOVER,
+            severity=HEALTH_WARN,
+            fact=f"failover recovery incomplete: {prev_primary_name} not streaming",
+            quantified="unrecovered standby",
+            context=f"primary: {primary_name}",
+            hint=f"verify {prev_primary_name} re-joins as standby"
+        )
+
     # Healthy OK State
+    ctx = f"primary: {primary_name}"
+    if expected_standbys > 0 or streaming_standbys > 0:
+        ctx += f" | {streaming_standbys}/{expected_standbys} streaming (lag: {max_replay_lag_s:.1f}s)"
     return Health(
         code=HEALTH_CODE_OK,
         severity=HEALTH_OK,
         fact=f"Cluster healthy: {nodes_up}/{nodes_total} nodes active",
         quantified=f"timeline {timeline}",
-        context=f"primary: {primary_name}",
+        context=ctx,
         hint="none"
     )
 
@@ -1180,8 +1223,8 @@ METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     # TAB 1: Diagnosis (Cluster overview, health code, timelines, failover)
     # -------------------------------------------------------------------------
-    {"name": "Cluster_Health", "unit": "status", "tab": "Cluster", "type": int,
-     "desc": "Cluster health severity: 0=OK, 1=WARN, 2=CRITICAL"},
+    {"name": "Cluster_Health", "unit": "status", "tab": "Summary", "type": int,
+     "desc": "Cluster health severity: 0=HEALTHY, 1=DEGRADED, 2=CRITICAL"},
     {"name": "Health_Code", "unit": "status", "tab": "Cluster", "type": int,
      "desc": "Stable numeric health condition code for alerting"},
     {"name": "Cluster_Role", "unit": "status", "tab": "Cluster", "type": int,
@@ -1190,7 +1233,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Detected cluster manager: 1=Patroni, 2=repmgr, 3=Native Physical, etc."},
     {"name": "Nodes_Total", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Total active and historical nodes tracked in cluster"},
-    {"name": "Nodes_Up", "unit": "nodes", "tab": "Cluster", "type": int,
+    {"name": "Nodes_Up", "unit": "nodes", "tab": "Summary", "type": int,
      "desc": "Number of currently reachable nodes"},
     {"name": "Nodes_Down", "unit": "nodes", "tab": "Cluster", "type": int,
      "desc": "Number of currently unreachable or offline nodes"},
@@ -1300,7 +1343,7 @@ METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     {"name": "Standbys_Expected", "unit": "nodes", "tab": "Nodes", "type": int,
      "desc": "Number of standbys expected to stream from primary"},
-    {"name": "Standbys_Streaming", "unit": "nodes", "tab": "Nodes", "type": int,
+    {"name": "Standbys_Streaming", "unit": "nodes", "tab": "Summary", "type": int,
      "desc": "Number of standbys actively streaming WAL from primary"},
     {"name": "Standby_Disconnect_Flag", "unit": "flag", "tab": "Nodes", "type": int,
      "desc": "1 if any expected standby is disconnected, 0 otherwise"},
@@ -1310,7 +1353,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Number of cascading standbys connected to replicas"},
     {"name": "Delayed_Standby_Count", "unit": "nodes", "tab": "Nodes", "type": int,
      "desc": "Number of deliberately delayed standbys configured"},
-    {"name": "Max_Replay_Lag_s", "unit": "s", "tab": "Nodes", "type": float,
+    {"name": "Max_Replay_Lag_s", "unit": "s", "tab": "Summary", "type": float,
      "desc": "Maximum replay lag across all active standbys in seconds"},
     {"name": "Max_Replay_Backlog", "unit": "bytes", "tab": "Nodes", "type": int,
      "desc": "Maximum replay byte backlog across all standbys"},
@@ -1494,7 +1537,10 @@ def build_tabs_and_units(metric_defs: List[Dict[str, Any]]) -> Tuple[Dict[str, A
         unit = item.get("unit", "")
         mtype = item.get("type", int)
 
-        if tab in tabs_dict:
+        if name in SUMMARY_METRICS or tab == "Summary":
+            # Promoted to built-in Summary tab (untabbed in Site24x7)
+            pass
+        elif tab in tabs_dict:
             tabs_dict[tab]["tablist"].append(name)
         else:
             raise ValueError(f"Metric '{name}' assigned to unknown tab '{tab}'")
@@ -1626,9 +1672,16 @@ def validate_output(payload: Dict[str, Any]) -> List[str]:
             if t_m in tables and t_m not in units_data:
                 violations.append(f"TAB_TABLE_NO_UNIT: Table '{t_m}' declared in tab '{t_name}' has no unit schema")
 
+    # Strict check: all emitted metrics must belong to an approved tab OR the explicit SUMMARY_METRICS whitelist
+    allowed_metrics = all_tab_metrics | SUMMARY_METRICS
     for mname in metrics.keys():
-        if mname not in all_tab_metrics:
-            violations.append(f"EMITTED_METRIC_NO_TAB: '{mname}' emitted but not present in any tab")
+        if mname not in allowed_metrics:
+            violations.append(f"EMITTED_METRIC_NO_TAB: '{mname}' emitted but not present in any tab or Summary whitelist")
+
+    # Strict check: all SUMMARY_METRICS must have valid unit schemas when emitted
+    for sm in SUMMARY_METRICS:
+        if sm in metrics and not isinstance(metrics[sm], str) and sm not in units_data:
+            violations.append(f"SUMMARY_METRIC_NO_UNIT: '{sm}' whitelisted for Summary has no unit")
 
     return violations
 
@@ -4151,6 +4204,21 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         else:
             payload["status"] = STATUS_UP
     else:
+        # Determine previous primary and whether failover recovery is confirmed
+        prev_primary_name = str(prev_state.get("primary_name") or "")
+        cur_primary_name = str(payload.get("Primary_Node") or "")
+        prev_primary_recovered = True
+        if prev_primary_name and cur_primary_name and prev_primary_name != cur_primary_name:
+            prev_row = next((r for r in node_rows if r.get("name") == prev_primary_name), None)
+            if not prev_row or prev_row.get("status") != STATUS_UP:
+                prev_primary_recovered = False
+            elif prev_row.get("role") != ROLE_STANDBY:
+                prev_primary_recovered = False
+            elif payload.get("Standbys_Streaming", 0) < payload.get("Standbys_Expected", 0):
+                prev_primary_recovered = False
+            elif prev_row.get("replay_lag_s", 0.0) > 60.0:
+                prev_primary_recovered = False
+
         health = evaluate_cluster_health(
             has_primary=any(r["role"] == ROLE_PRIMARY and r["status"] == STATUS_UP for r in node_rows),
             primary_name=payload.get("Primary_Node", ""),
@@ -4172,7 +4240,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             archive_failed=payload.get("Primary_Archive_Failed", 0),
             auth_failure=auth_failure,
             auth_msg=auth_msg,
-            is_multi_master=is_multi_master
+            is_multi_master=is_multi_master,
+            prev_primary_name=prev_primary_name,
+            prev_primary_recovered=prev_primary_recovered
         )
 
         payload["Cluster_Health"] = health.severity
