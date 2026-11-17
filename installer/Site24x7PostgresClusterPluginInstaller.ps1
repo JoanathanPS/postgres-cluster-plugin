@@ -114,9 +114,8 @@ Write-Step "2/5 Locating Python 3 and psycopg2-binary"
 $PythonExe = $null
 
 $candidatePythons = @(
-    "C:\Users\Joanathan\AppData\Local\Programs\Python\Python313\python.exe",
-    "C:\Users\Joanathan\AppData\Local\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "C:\Program Files\Python313\python.exe",
     "C:\Program Files\Python312\python.exe",
@@ -232,6 +231,26 @@ Write-Step "4/5 Deploying Plugin Files"
 
 $targetPluginsDir = Join-Path $AgentDir "monitoring\Plugins\$PluginFolderName"
 
+$sourcePy = Join-Path $ScriptDir "postgres_cluster.py"
+if (-not (Test-Path $sourcePy)) {
+    $parentDir = Split-Path -Parent $ScriptDir
+    $candidate = Join-Path $parentDir "postgres_cluster.py"
+    if (Test-Path $candidate) {
+        $sourcePy = $candidate
+    } else {
+        Write-Host "postgres_cluster.py not found locally. Attempting to download from repository..." -ForegroundColor Yellow
+        $rawUrl = "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/main/postgres_cluster.py"
+        try {
+            Invoke-WebRequest -Uri $rawUrl -OutFile $sourcePy -UseBasicParsing -ErrorAction Stop
+            Write-Success "Downloaded postgres_cluster.py from repository"
+        } catch {
+            Write-ErrorMsg "postgres_cluster.py not found locally and download failed: $_"
+            Write-ErrorMsg "If the repository is private, please clone the repository first: git clone -b main https://github.com/JoanathanPS/postgres-cluster-plugin.git"
+            exit 1
+        }
+    }
+}
+
 if ($DryRun) {
     Write-Success "[DRY RUN] Would deploy to: $targetPluginsDir"
 } else {
@@ -244,25 +263,6 @@ if ($DryRun) {
                 New-Item -ItemType Directory -Path $targetPluginsDir -Force | Out-Null
             }
 
-            $sourcePy = Join-Path $ScriptDir "postgres_cluster.py"
-            if (-not (Test-Path $sourcePy)) {
-                $parentDir = Split-Path -Parent $ScriptDir
-                $candidate = Join-Path $parentDir "postgres_cluster.py"
-                if (Test-Path $candidate) {
-                    $sourcePy = $candidate
-                } else {
-                    Write-Host "postgres_cluster.py not found locally. Attempting to download from repository..." -ForegroundColor Yellow
-                    $rawUrl = "https://raw.githubusercontent.com/JoanathanPS/postgres-cluster-plugin/upstream-layout/upstream_layout/postgres_cluster/postgres_cluster.py"
-                    try {
-                        Invoke-WebRequest -Uri $rawUrl -OutFile $sourcePy -UseBasicParsing -ErrorAction Stop
-                        Write-Success "Downloaded postgres_cluster.py from repository"
-                    } catch {
-                        Write-ErrorMsg "postgres_cluster.py not found locally and download failed: $_"
-                        Write-ErrorMsg "If the repository is private, please clone the repository first: git clone -b upstream-layout https://github.com/JoanathanPS/postgres-cluster-plugin.git"
-                        exit 1
-                    }
-                }
-            }
             $destPy = Join-Path $targetPluginsDir "$PluginFolderName.py"
 
             # Copy Python collector
@@ -332,14 +332,14 @@ try {
     }
     Write-Success "Plugin validation succeeded in ${elapsedMs}ms!"
     Write-Host "  Plugin Version:      $($json.plugin_version)" -ForegroundColor Gray
-    Write-Host "  Nodes Total:         $($json.'Nodes Total')" -ForegroundColor Gray
-    Write-Host "  Nodes Up:            $($json.'Nodes Up')" -ForegroundColor Gray
-    Write-Host "  Primary Count:       $($json.'Primary Count')" -ForegroundColor Gray
-    Write-Host "  Primary Timeline:    $($json.'Primary Timeline')" -ForegroundColor Gray
-    Write-Host "  Max Replay Backlog:  $($json.'Max Replay Backlog') bytes" -ForegroundColor Gray
-    Write-Host "  Replication Slots:   $($json.'Replication Slots Total') total ($($json.'Physical Slots') physical, $($json.'Logical Slots') logical)" -ForegroundColor Gray
+    Write-Host "  Cluster Health:      $($json.Cluster_Health)" -ForegroundColor Gray
+    Write-Host "  Nodes Total:         $($json.Nodes_Total)" -ForegroundColor Gray
+    Write-Host "  Nodes Up:            $($json.Nodes_Up)" -ForegroundColor Gray
+    Write-Host "  Standbys Streaming:  $($json.Standbys_Streaming)" -ForegroundColor Gray
+    Write-Host "  Primary Timeline:    $($json.Primary_Timeline)" -ForegroundColor Gray
+    Write-Host "  Max Replay Lag:      $($json.Max_Replay_Lag_s) seconds" -ForegroundColor Gray
     Write-Host "  Cluster Nodes:       $($json.Cluster_Nodes.Count) rows" -ForegroundColor Gray
-    Write-Host "  Standbys Detected:   $($json.Replication_Standbys.Count) rows" -ForegroundColor Gray
+    Write-Host "  Replication Links:   $($json.Replication_Links.Count) rows" -ForegroundColor Gray
 } catch {
     Write-ErrorMsg "Failed to parse plugin output as JSON: $_"
     Write-Host $output
@@ -362,6 +362,6 @@ Agent Lifecycle:
 3. In Site24x7 Web Console:
    - Navigate to: Plugins -> Plugin Integrations
    - Open monitor: $PluginFolderName
-   - Verify: 6 Dashboard tabs, Cluster_Nodes table, Replication_Standbys table.
+   - Verify: 9 Dashboard tabs and built-in Summary view.
 ==================================================================
 "@ -ForegroundColor Green
