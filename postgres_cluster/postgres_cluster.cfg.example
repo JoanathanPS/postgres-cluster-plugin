@@ -39,7 +39,17 @@ cluster_host="127.0.0.1"
 
 # Address translation map (optional override for containerized / NAT / K8s):
 # Can map short ports (pg-node1=5441,pg-node2=5442) or host:port pairs
-# address_map="pg-node1=5441,pg-node2=5442,pg-node3=5443"
+# address_map="pg-node1=5441,pg-node2=5442,pg-node3=5443,pg-node1:8008=8001,pg-node2:8008=8002,pg-node3:8008=8003"
+
+# --- Docker Desktop on Windows Configuration Example ---
+# When the Site24x7 agent runs directly on the Windows host monitoring a Dockerized
+# Patroni cluster whose ports are published to 127.0.0.1:
+# cluster_host="127.0.0.1"
+# discovery_port=7000
+# write_port=5500
+# read_port=5501
+# patroni_ports="8001-8003"
+# node_ports="5441-5443"
 
 # Monitoring credentials
 username="site24x7"

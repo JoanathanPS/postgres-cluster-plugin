@@ -336,10 +336,10 @@ def resolve_mapped_endpoint(
       5. Otherwise falls back to original (host, port).
     """
     keys_to_check = [
-        name,
         f"{name}:{port}",
-        host,
         f"{host}:{port}",
+        name,
+        host,
     ]
     mapped_target: Optional[str] = None
     for k in keys_to_check:

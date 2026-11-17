@@ -147,6 +147,25 @@ The plugin eliminates the requirement to manually configure individual backend P
    - The plugin automatically detects the promoted primary on the next collection cycle without any configuration modifications.
    - Stopped nodes are accurately reported as `offline` (`patroni_state: stopped`), while the overall cluster remains `UP` (`1`) with healthy nodes operational.
 
+### Docker Desktop (Windows Host) Network Mapping Reference
+
+In Docker Desktop on Windows with WSL2, internal bridge subnets (e.g. `172.18.0.0/16`) are encapsulated inside the WSL2 Linux VM and are not directly routable from Windows. Communication occurs through published port forwards on the Windows loopback interface (`127.0.0.1`):
+
+| Service | Internal Docker Target | Windows Host Port / Endpoint | Protocol / Interface |
+| :--- | :--- | :--- | :--- |
+| **HAProxy Stats** | `patroni-haproxy:7000` | `http://127.0.0.1:7000/;csv` | HTTP Stats (CSV & HTML) |
+| **HAProxy Write Pool** | `patroni-haproxy:5000` | `127.0.0.1:5500` | PostgreSQL TCP (Leader) |
+| **HAProxy Read Pool** | `patroni-haproxy:5001` | `127.0.0.1:5501` | PostgreSQL TCP (Replicas) |
+| **PostgreSQL Node 1** | `pg-node1:5432` | `127.0.0.1:5441` | PostgreSQL TCP (Direct) |
+| **PostgreSQL Node 2** | `pg-node2:5432` | `127.0.0.1:5442` | PostgreSQL TCP (Direct) |
+| **PostgreSQL Node 3** | `pg-node3:5432` | `127.0.0.1:5443` | PostgreSQL TCP (Direct) |
+| **Patroni API Node 1** | `pg-node1:8008` | `http://127.0.0.1:8001/patroni` | Patroni REST (HTTP) |
+| **Patroni API Node 2** | `pg-node2:8008` | `http://127.0.0.1:8002/patroni` | Patroni REST (HTTP) |
+| **Patroni API Node 3** | `pg-node3:8008` | `http://127.0.0.1:8003/patroni` | Patroni REST (HTTP) |
+| **etcd DCS** | `etcd:2379` | `127.0.0.1:2379` | etcd Client API |
+
+Inside the Docker bridge network, containers communicate directly using stable Docker DNS service names (`pg-node1`, `pg-node2`, `pg-node3`, `etcd`), ensuring internal routing and health checks are independent of external port bindings.
+
 ---
 
 ## 4. Monitoring Modes: Standalone vs Cluster
