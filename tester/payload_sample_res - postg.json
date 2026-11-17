@@ -1,0 +1,219 @@
+{
+  "units": {
+    "Uptime": "s",
+    "Total Rows Returned": "rows",
+    "Transactions Open": "transactions",
+    "Transactions Idle In Transaction": "transactions",
+    "Total Rows Inserted": "rows",
+    "Total Sessions Abandoned": "sessions",
+    "Total Sessions": "sessions",
+    "Total Commits": "transactions",
+    "Database Count": "databases",
+    "Active Connections": "connections",
+    "Total Rows Deleted": "rows",
+    "Locks Count": "locks",
+    "Total Rows Updated": "rows",
+    "Max Connections": "connections",
+    "Total Rollbacks": "transactions",
+    "Total Sessions Fatal": "sessions",
+    "Total Rows Fetched": "rows",
+    "Total Sessions Killed": "sessions"
+  },
+  "type": "postgres",
+  "data": {
+    "Total Sessions Killed": "0",
+    "Server Version": "17.2 (OnGres 17.2-build-6.38)",
+    "Total Sessions": "147",
+    "Buffers Alloc": "548",
+    "Total Sessions Abandoned": "0",
+    "Index Rows Read": "0",
+    "s247config": {
+      "childdiscovery": [
+        "Tranasctions_and_Session_per_Database",
+        "Stats_per_DB"
+      ]
+    },
+    "Total Rows Deleted": "0",
+    "Total Conflicts": "0",
+    "Checkpoints Req": "0",
+    "Database Count": "2",
+    "Transactions Open": "1",
+    "Total Rows Updated": "0",
+    "Locks Count": "24",
+    "Active Connections": "3",
+    "Buffers Clean": "0",
+    "Total Sessions Fatal": "0",
+    "Max Connections": "100",
+    "Table Count": "113",
+    "Total Rows Fetched": "125763",
+    "Maxwritten Clean": "0",
+    "Tranasctions_and_Session_per_Database": [
+      {
+        "sessions_fatal": 0,
+        "session_time": 0,
+        "sessions": 0,
+        "name": "template1",
+        "sessions_active_time": 0,
+        "commits": 0,
+        "session_idle_in_transaction_time": 0,
+        "rollbacks": 0,
+        "conflicts": 0,
+        "sessions_abandoned": 0,
+        "sessions_killed": 0
+      },
+      {
+        "sessions_fatal": 0,
+        "session_time": 0,
+        "sessions": 0,
+        "name": "template0",
+        "sessions_active_time": 0,
+        "commits": 0,
+        "session_idle_in_transaction_time": 0,
+        "rollbacks": 0,
+        "conflicts": 0,
+        "sessions_abandoned": 0,
+        "sessions_killed": 0
+      },
+      {
+        "sessions_fatal": 0,
+        "session_time": 23375.919,
+        "sessions": 52,
+        "name": "appdb",
+        "sessions_active_time": 1217.345,
+        "commits": 1353,
+        "session_idle_in_transaction_time": 201.881,
+        "rollbacks": 4,
+        "conflicts": 0,
+        "sessions_abandoned": 0,
+        "sessions_killed": 0
+      },
+      {
+        "sessions_fatal": 0,
+        "session_time": 36005.607,
+        "sessions": 95,
+        "name": "postgres",
+        "sessions_active_time": 1538.354,
+        "commits": 1574,
+        "session_idle_in_transaction_time": 1411.055,
+        "rollbacks": 69,
+        "conflicts": 0,
+        "sessions_abandoned": 0,
+        "sessions_killed": 0
+      }
+    ],
+    "Checkpoint Write Time": "560.0",
+    "Total Rows Inserted": "0",
+    "Heap Blocks Hit": "0",
+    "Total Block Hits": "194826",
+    "Uptime": "11237",
+    "Checkpoints Timed": "0",
+    "Transactions Idle In Transaction": "0",
+    "Checkpoint Sync Time": "12.0",
+    "tabs": {
+      "DB and IO stats": {
+        "order": "1",
+        "tablist": [
+          "Stats_per_DB",
+          "Total Rows Deleted",
+          "Total Rows Fetched",
+          "Total Rows Inserted",
+          "Total Rows Returned",
+          "Total Rows Updated",
+          "Total Block Hits",
+          "Total Block Reads"
+        ]
+      },
+      "Transactions and Sessions": {
+        "order": "3",
+        "tablist": [
+          "Tranasctions_and_Session_per_Database",
+          "Total Commits",
+          "Total Rollbacks",
+          "Total Conflicts",
+          "Total Sessions",
+          "Total Sessions Abandoned",
+          "Total Sessions Fatal",
+          "Total Sessions Killed",
+          "Transactions Idle In Transaction",
+          "Transactions Open"
+        ]
+      },
+      "BG Writer": {
+        "order": "2",
+        "tablist": [
+          "Checkpoints Timed",
+          "Checkpoints Req",
+          "Checkpoint Write Time",
+          "Checkpoint Sync Time",
+          "Buffers Checkpoint",
+          "Buffers Clean",
+          "Maxwritten Clean",
+          "Buffers Backend",
+          "Buffers Backend Fsync",
+          "Buffers Alloc"
+        ]
+      }
+    },
+    "Active Waiting Queries": "0",
+    "Active Queries": "5",
+    "Total Commits": "2927",
+    "Stats_per_DB": [
+      {
+        "rows_fetched": "0",
+        "rows_updated": "0",
+        "rows_deleted": "0",
+        "name": "template1",
+        "block_hits": "0",
+        "active_connections": "0",
+        "size_in_mb": "7.00",
+        "rows_returned": "0",
+        "rows_inserted": "0",
+        "block_reads": "0"
+      },
+      {
+        "rows_fetched": "0",
+        "rows_updated": "0",
+        "rows_deleted": "0",
+        "name": "template0",
+        "block_hits": "0",
+        "active_connections": "0",
+        "size_in_mb": "7.00",
+        "rows_returned": "0",
+        "rows_inserted": "0",
+        "block_reads": "0"
+      },
+      {
+        "rows_fetched": "54455",
+        "rows_updated": "0",
+        "rows_deleted": "0",
+        "name": "appdb",
+        "block_hits": "87069",
+        "active_connections": "1",
+        "size_in_mb": "22.00",
+        "rows_returned": "101398",
+        "rows_inserted": "0",
+        "block_reads": "253"
+      },
+      {
+        "rows_fetched": "69140",
+        "rows_updated": "0",
+        "rows_deleted": "0",
+        "name": "postgres",
+        "block_hits": "102111",
+        "active_connections": "2",
+        "size_in_mb": "7.00",
+        "rows_returned": "76070",
+        "rows_inserted": "0",
+        "block_reads": "276"
+      }
+    ],
+    "Index Scans": "0",
+    "Index Rows Fetched": "0",
+    "Cache Hit Ratio": "0",
+    "Total Block Reads": "547",
+    "Buffers Checkpoint": "5",
+    "Total Rows Returned": "183362",
+    "Heap Blocks Read": "0",
+    "Total Rollbacks": "73"
+  }
+}
