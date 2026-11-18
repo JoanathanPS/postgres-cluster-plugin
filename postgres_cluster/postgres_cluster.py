@@ -40,7 +40,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # 0. PLATFORM CONSTANTS & ABSOLUTE LIMITS (Site24x7 Enforced)
 # -----------------------------------------------------------------------------
-PLUGIN_VERSION = 2
+PLUGIN_VERSION = 1
 HEARTBEAT_REQUIRED = True
 
 MAX_TABLES = 10
@@ -2297,8 +2297,8 @@ def discover_primary_via_proxy(
                 coalesce(inet_server_addr()::text, ''),
                 current_setting('port', true)
         """)
-        c_name = ident_row[0] if ident_row and ident_row[0] else ""
-        s_addr = ident_row[1] if ident_row and ident_row[1] else proxy_host
+        c_name = ident_row[0] if ident_row and len(ident_row) > 0 and ident_row[0] else ""
+        s_addr = ident_row[1] if ident_row and len(ident_row) > 1 and ident_row[1] else proxy_host
         if "/" in s_addr:
             s_addr = s_addr.split("/")[0]
         s_port = safe_int(ident_row[2] if ident_row and len(ident_row) > 2 else proxy_port, default=5432)
@@ -3021,41 +3021,29 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
     hp_stats = fetch_haproxy_stats(proxy_host or cluster_host or "127.0.0.1", stats_port=discovery_port)
 
-    # 1. Attempt Patroni REST discovery (multi-port resilient)
+    # Single-endpoint Discovery Precedence:
+    # 1. If explicit nodes or specific postgres_port provided by caller, isolate to explicit target
     if ("nodes" in param or "node" in param) and "cluster_host" not in param:
         cluster_host = ""
         seed_host = ""
+        discovery_port = 0
+        write_port = 0
+        proxy_host = ""
         patroni_ports = parse_port_list(param.get("patroni_ports"))
         node_ports = parse_port_list(param.get("node_ports"))
+    elif "postgres_port" in param and param["postgres_port"] not in (5432, 0, "5432", None) and "discovery_port" not in param and "write_port" not in param:
+        discovery_port = 0
+        write_port = 0
+        proxy_host = ""
+        seed_host = ""
+        patroni_ports = []
+        node_ports = []
     else:
         seed_host = cluster_host or proxy_host or ("127.0.0.1" if not raw_nodes else "")
-    patroni_probe_status = "not_applicable"
-    patroni_endpoint_used = None
-    if seed_host and monitor_mode != MODE_STANDALONE:
-        patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
-            seed_host=seed_host,
-            seed_port=patroni_port,
-            address_map=address_map,
-            prev_state=prev_state,
-            raw_nodes=raw_nodes,
-            timeout=1.0,
-            patroni_ports=patroni_ports,
-        )
-        if patroni_probe_status == "positive" and patroni_data and "members" in patroni_data:
-            cluster_manager = TOPOLOGY_PATRONI
-            cluster_manager_str = "patroni"
-            payload["Topology_Type"] = TOPOLOGY_PATRONI
-            discovered_members = patroni_data.get("members", [])
-            # Persist discovered endpoint into state for future fallback
-            if patroni_endpoint_used:
-                eps = list(prev_state.get("patroni_endpoints") or [])
-                if patroni_endpoint_used not in eps:
-                    eps.insert(0, patroni_endpoint_used)
-                new_state["patroni_endpoints"] = eps[:5]
 
-    # 2. If Patroni REST is not available, attempt HAProxy primary write-proxy discovery
+    # 1. PRIMARY DISCOVERY: HAProxy Discovery (Write Port & Stats CSV)
     use_haproxy_seed = bool(proxy_host or write_port or port_default in (5000, 5500))
-    if not discovered_members and use_haproxy_seed and monitor_mode != MODE_STANDALONE:
+    if not raw_nodes and use_haproxy_seed and monitor_mode != MODE_STANDALONE:
         hp_h = proxy_host or cluster_host or "127.0.0.1"
         hp_p = write_port or (port_default if port_default in (5000, 5500) else 5000)
         hp_ok, p_spec, sb_specs, hp_msg = discover_primary_via_proxy(
@@ -3078,6 +3066,31 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             cluster_manager = TOPOLOGY_PATRONI
             cluster_manager_str = "haproxy"
             payload["Topology_Type"] = TOPOLOGY_PATRONI
+
+    # 2. FALLBACK DISCOVERY: Patroni REST API (/cluster) if HAProxy did not discover cluster
+    patroni_probe_status = "not_applicable"
+    patroni_endpoint_used = None
+    if not node_specs and seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes:
+        patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
+            seed_host=seed_host,
+            seed_port=patroni_port,
+            address_map=address_map,
+            prev_state=prev_state,
+            raw_nodes=raw_nodes,
+            timeout=1.0,
+            patroni_ports=patroni_ports,
+        )
+        if patroni_probe_status == "positive" and patroni_data and "members" in patroni_data:
+            cluster_manager = TOPOLOGY_PATRONI
+            cluster_manager_str = "patroni"
+            payload["Topology_Type"] = TOPOLOGY_PATRONI
+            discovered_members = patroni_data.get("members", [])
+            # Persist discovered endpoint into state for future fallback
+            if patroni_endpoint_used:
+                eps = list(prev_state.get("patroni_endpoints") or [])
+                if patroni_endpoint_used not in eps:
+                    eps.insert(0, patroni_endpoint_used)
+                new_state["patroni_endpoints"] = eps[:5]
 
     if node_specs:
         pass
@@ -4870,7 +4883,7 @@ if __name__ == "__main__":
         else:
             try:
                 print(json.dumps({
-                    "plugin_version": 2,
+                    "plugin_version": PLUGIN_VERSION,
                     "heartbeat_required": True,
                     "status": 0,
                     "msg": f"CRITICAL: Top-level exception: {str(top_exc)[:150]}"

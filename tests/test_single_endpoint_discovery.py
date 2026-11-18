@@ -382,7 +382,7 @@ class TestSingleEndpointDiscoveryScenarios(unittest.TestCase):
         })
 
         self.assertEqual(res["status"], pc.STATUS_DOWN)
-        self.assertEqual(res["plugin_version"], 2)
+        self.assertEqual(res["plugin_version"], pc.PLUGIN_VERSION)
         self.assertTrue(res["heartbeat_required"])
         self.assertTrue(len(res["msg"]) > 0)
 

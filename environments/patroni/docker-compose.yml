@@ -22,6 +22,10 @@ services:
       interval: 3s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+    networks:
+      patroni-net:
+        ipv4_address: 172.30.0.2
 
   pg-node1:
     build: ./patroni
@@ -39,6 +43,9 @@ services:
       etcd:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      patroni-net:
+        ipv4_address: 172.30.0.11
 
   pg-node2:
     build: ./patroni
@@ -56,6 +63,9 @@ services:
       etcd:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      patroni-net:
+        ipv4_address: 172.30.0.12
 
   pg-node3:
     build: ./patroni
@@ -73,6 +83,9 @@ services:
       etcd:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      patroni-net:
+        ipv4_address: 172.30.0.13
 
   haproxy:
     image: haproxy:2.8-alpine
@@ -88,6 +101,19 @@ services:
       - pg-node2
       - pg-node3
     restart: unless-stopped
+    networks:
+      patroni-net:
+        ipv4_address: 172.30.0.10
+
+networks:
+  patroni-net:
+    name: patroni-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
 
 volumes:
   patroni1-data:
