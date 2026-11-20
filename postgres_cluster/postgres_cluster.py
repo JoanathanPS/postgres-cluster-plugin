@@ -1967,7 +1967,10 @@ def discover_patroni_cluster(
     return "negative", None, [], None, candidates
 
 
-def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, stats_uri: str = "/;csv", timeout: float = 1.0) -> Dict[str, Dict[str, str]]:
+HAPROXY_STATS_URI = "/;csv"
+
+
+def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, timeout: float = 1.0) -> Dict[str, Dict[str, str]]:
     """
     Fetches HAProxy backend server states via CSV endpoint (http://host:port/;csv).
     Returns mapping of {pxname: {svname: status}}.
@@ -1975,8 +1978,7 @@ def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, stats_uri: str 
     result: Dict[str, Dict[str, str]] = {}
     if not stats_host or not stats_port:
         return result
-    uri = stats_uri if stats_uri.startswith("/") else f"/{stats_uri}"
-    url = f"http://{normalize_host(stats_host)}:{stats_port}{uri}"
+    url = f"http://{normalize_host(stats_host)}:{stats_port}{HAPROXY_STATS_URI}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "site24x7_pgcluster"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -2028,8 +2030,6 @@ def discover_cluster_via_sql(
     sslkey: str = "",
     connect_timeout: int = 3,
     stats_port: int = 0,
-    stats_uri: str = "/;csv",
-    read_port: int = 0,
     node_ports: Optional[List[int]] = None,
     _follow_depth: int = 0,
 ) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
@@ -2092,8 +2092,8 @@ def discover_cluster_via_sql(
                 username=username, password=password, dbname=dbname,
                 address_map=address_map, sslmode=sslmode, sslrootcert=sslrootcert,
                 sslcert=sslcert, sslkey=sslkey, connect_timeout=connect_timeout,
-                stats_port=stats_port, stats_uri=stats_uri, read_port=read_port,
-                node_ports=node_ports, _follow_depth=_follow_depth + 1,
+                stats_port=stats_port, node_ports=node_ports,
+                _follow_depth=_follow_depth + 1,
             )
 
         # 3. Primary identity.
@@ -2155,7 +2155,7 @@ def discover_cluster_via_sql(
         primary_name = ""
         if stats_port > 0:
             for px_name, sv_dict in fetch_haproxy_stats(
-                seed_host, stats_port=stats_port, stats_uri=stats_uri
+                seed_host, stats_port=stats_port
             ).items():
                 if any(k in px_name.lower() for k in ("primary", "master", "write")):
                     for sv_name, sv_st in sv_dict.items():
@@ -2196,20 +2196,6 @@ def discover_cluster_via_sql(
             "patroni_lag_bytes": 0,
             "system_identifier": getattr(client, "system_identifier", ""),
         }
-
-        # A read endpoint is only worth probing when the primary reports no standbys
-        # of its own (e.g. a proxy hides them behind a single read address).
-        if not standby_specs and read_port > 0:
-            standby_specs.append({
-                "name": f"read_endpoint_{read_port}",
-                "host": seed_host,
-                "port": read_port,
-                "patroni_role": "standby",
-                "patroni_state": PATRONI_STATE_RUNNING,
-                "patroni_tl": 0,
-                "patroni_lag_bytes": 0,
-                "sync_state": "unknown",
-            })
 
         followed = " (followed upstream from a standby)" if _follow_depth else ""
         return True, primary_spec, standby_specs, (
@@ -3645,11 +3631,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
     # Single-endpoint & Network Discovery Parameters
     discovery_port = safe_int(merged.get("discovery_port", merged.get("haproxy_stats_port")), default=7000)
-    discovery_uri = str(merged.get("discovery_uri", "/;csv")).strip()
     patroni_ports = parse_port_list(merged.get("patroni_ports"))
     node_ports = parse_port_list(merged.get("node_ports"))
     write_port = safe_int(merged.get("write_port", merged.get("haproxy_port")), default=0)
-    read_port = safe_int(merged.get("read_port"), default=0)
     proxy_host = merged.get("proxy_host", merged.get("haproxy_host", ""))
 
     # Single-endpoint Discovery Precedence:
@@ -3673,7 +3657,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         hp_stats = fetch_haproxy_stats(
             stats_host=proxy_host or cluster_host or seed_host or "127.0.0.1",
             stats_port=discovery_port,
-            stats_uri=discovery_uri,
         )
 
     # -------------------------------------------------------------------------
@@ -3737,7 +3720,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     if can_discover and not discovered_members:
         seed_h = proxy_host or cluster_host or seed_host or "127.0.0.1"
         candidate_ports: List[int] = []
-        for cand in ([write_port] if write_port else []) + [port_default] + ([5000, 5500] if hp_stats else []):
+        # Only ports the operator actually configured: write_port if a proxy or VIP
+        # fronts the primary, otherwise the PostgreSQL port. Guessing 5000/5500 would
+        # mean dialling someone else's service with the monitor's credentials.
+        for cand in ([write_port] if write_port else []) + [port_default]:
             if cand and cand not in candidate_ports:
                 candidate_ports.append(cand)
         for sql_port in candidate_ports:
@@ -3759,8 +3745,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 sslkey=sslkey,
                 connect_timeout=max(1, int(min(2.0, _discovery_budget_left()))),
                 stats_port=discovery_port if hp_stats else 0,
-                stats_uri=discovery_uri,
-                read_port=read_port,
                 node_ports=node_ports,
             )
             if sql_ok and p_spec:
@@ -4810,11 +4794,9 @@ def main():
         parser.add_argument("--haproxy_port", type=int, default=0, help="HAProxy primary write port (e.g. 5000 or 5500)")
         parser.add_argument("--haproxy_stats_port", type=int, default=7000, help="HAProxy stats port for CSV telemetry")
         parser.add_argument("--discovery_port", type=int, default=0, help="Cluster telemetry/stats discovery port (default: 7000)")
-        parser.add_argument("--discovery_uri", type=str, default="", help="Telemetry/stats URI path (default: /;csv)")
         parser.add_argument("--patroni_ports", type=str, default="", help="Candidate Patroni REST ports (e.g. 8001,8002,8003 or 8001-8003)")
         parser.add_argument("--node_ports", type=str, default="", help="Discovered backend PostgreSQL ports (e.g. 5441,5442,5443 or 5441-5443)")
         parser.add_argument("--write_port", type=int, default=0, help="PostgreSQL write endpoint port (e.g. 5000 or 5500)")
-        parser.add_argument("--read_port", type=int, default=0, help="PostgreSQL read/replica endpoint port (e.g. 5001 or 5501)")
         parser.add_argument("--proxy_host", type=str, default="", help="Cluster entry-point proxy or VIP hostname/IP")
         parser.add_argument("--address_map", type=str, default="", help="Address translation map (e.g. pg1:5432=127.0.0.1:5441)")
         parser.add_argument("--username", type=str, default="", help="Monitoring username")
@@ -4859,16 +4841,12 @@ def main():
             params["haproxy_stats_port"] = args.haproxy_stats_port
         if getattr(args, "discovery_port", None):
             params["discovery_port"] = args.discovery_port
-        if getattr(args, "discovery_uri", None):
-            params["discovery_uri"] = args.discovery_uri
         if getattr(args, "patroni_ports", None):
             params["patroni_ports"] = args.patroni_ports
         if getattr(args, "node_ports", None):
             params["node_ports"] = args.node_ports
         if getattr(args, "write_port", None):
             params["write_port"] = args.write_port
-        if getattr(args, "read_port", None):
-            params["read_port"] = args.read_port
         if getattr(args, "proxy_host", None):
             params["proxy_host"] = args.proxy_host
         if getattr(args, "address_map", None):

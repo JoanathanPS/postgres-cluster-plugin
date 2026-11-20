@@ -158,13 +158,13 @@ touches a proxy. A plain two-node streaming pair with neither is fully supported
    - `inet_server_addr()`, `current_setting('port')` and `cluster_name` for identity.
 
    Candidate ports: an explicitly configured `write_port` first, then the plain
-   PostgreSQL port (`postgres_port`, default 5432), then the conventional HAProxy
-   write ports 5000 and 5500 — but those last two **only if a proxy stats endpoint
-   actually answered**, so they are never dialled speculatively on a host that has no
-   proxy. This covers a direct node, a VIP, a floating IP, HAProxy and pgpool-II
-   identically, because to PostgreSQL they are all just a connection.
+   PostgreSQL port (`postgres_port`, default 5432). Only ports the operator actually
+   configured are dialled — the plugin never guesses conventional proxy ports, because
+   that would mean offering the monitor's credentials to whatever else is listening.
+   This covers a direct node, a VIP, a floating IP, HAProxy and pgpool-II identically,
+   because to PostgreSQL they are all just a connection.
 
-   A proxy stats endpoint (`discovery_port`, `discovery_uri`), when reachable, is used
+   A proxy stats endpoint (`discovery_port`), when reachable, is used
    **only to put a friendly backend name on the primary**. Without it the primary is
    named from `address_map`, then `cluster_name`, then its own `host:port`. Losing the
    stats endpoint costs you a nicer label and nothing else.

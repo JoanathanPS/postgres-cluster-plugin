@@ -715,13 +715,17 @@ class TestRegressionFixes(unittest.TestCase):
 
     def test_review_defects_fixes(self):
         """Comprehensive regression test for all code review defect fixes (Bugs 9-18)."""
-        # Bug 9: HAProxy fetch respects custom discovery_uri
+        # The stats CSV path is fixed at HAProxy's documented /;csv. It used to be a
+        # configurable discovery_uri, which no test exercised and which only existed
+        # to support a path HAProxy does not serve.
+        self.assertEqual(pc.HAPROXY_STATS_URI, "/;csv")
+        self.assertNotIn("stats_uri", set(inspect.signature(pc.fetch_haproxy_stats).parameters))
         with patch("urllib.request.urlopen") as mock_url:
             mock_resp = MagicMock()
             mock_resp.status = 200
             mock_resp.read.return_value = b"# pxname,svname,status\nprimary,pg1,UP\n"
             mock_url.return_value.__enter__.return_value = mock_resp
-            st = pc.fetch_haproxy_stats("127.0.0.1", 7000, stats_uri="/custom_stats;csv")
+            st = pc.fetch_haproxy_stats("127.0.0.1", 7000)
             self.assertIn("primary", st)
             self.assertEqual(st["primary"].get("pg1"), "UP")
 

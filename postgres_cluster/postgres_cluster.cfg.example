@@ -34,13 +34,9 @@ database="postgres"
 # current primary. Leave unset for a direct node: the plugin then uses postgres_port.
 # write_port=5000
 
-# Read endpoint port, if a proxy exposes replicas behind a single address. Only probed
-# when the primary reports no standbys of its own.
-# read_port=5001
-
-# HAProxy Stats / Discovery Interface (default: 7000 and /;csv)
+# HAProxy stats port, used only to read friendly backend names for the nodes.
+# The CSV path is HAProxy's documented /;csv and is not configurable.
 # discovery_port=7000
-# discovery_uri="/;csv"
 
 # Patroni REST API port (default: 8008)
 # patroni_port=8008
