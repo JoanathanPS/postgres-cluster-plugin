@@ -881,10 +881,13 @@ class _StubCursor:
         self.description = [("c0",)]
         self._rows = [(0,)]
 
-    def _set(self, rows):
+    def _set(self, rows, cols=None):
         self._rows = rows
-        n = len(rows[0]) if rows else 1
-        self.description = [("c%d" % i,) for i in range(n)]
+        if cols:
+            self.description = [(c,) for c in cols]
+        else:
+            n = len(rows[0]) if rows else 1
+            self.description = [("c%d" % i,) for i in range(n)]
 
     def execute(self, sql, params=None):
         low = " ".join(sql.lower().split())
@@ -925,6 +928,24 @@ class _StubCursor:
             self._set([(40, 3, 1200.5, 300.2, 777, 5, 2)])
         elif "sum(seq_scan)" in low:
             self._set([(1000, 50000)])
+        elif "datname as name" in low:
+            # Transactions_Per_Database (PG 14+ shape, since server_version is 16).
+            self._set(
+                [("appdb", 5000, 20, 0, 100, 2, 1, 0, 1000.0, 900.0, 10.0),
+                 ("postgres", 10, 0, 0, 5, 0, 0, 0, 10.0, 9.0, 0.0)],
+                cols=["name", "commits", "rollbacks", "conflicts", "sessions",
+                      "sessions_abandoned", "sessions_fatal", "sessions_killed",
+                      "session_time", "sessions_active_time", "idle_in_txn_time"],
+            )
+        elif "size_in_mb" in low:
+            # Stats_per_DB
+            self._set(
+                [("appdb", 8, 95.0, 100, 50, 10, 900, 1200, 300, 90000),
+                 ("postgres", 1, 0.5, 0, 0, 0, 0, 0, 0, 0)],
+                cols=["name", "active_connections", "size_in_mb", "rows_inserted",
+                      "rows_updated", "rows_deleted", "rows_fetched", "rows_returned",
+                      "block_reads", "block_hits"],
+            )
         else:
             self._set([(0,)])
 
@@ -1102,6 +1123,88 @@ class TestPayloadContract(unittest.TestCase):
         """The plugin must not carry its own test harness."""
         self.assertFalse(hasattr(pc, "self_test"),
                          "self_test() should live in the test suite, not the plugin")
+
+
+class TestEmittedContract(unittest.TestCase):
+    """Guards the payload contract on the paths the rest of the suite did not reach."""
+
+    def _run(self, **extra):
+        import tempfile as _tf
+        stub = MagicMock()
+        stub.connect = lambda **kw: _StubConn(None)
+        params = {
+            "nodes": "pgnode1=127.0.0.1:5432",
+            "username": "site24x7", "password": "x", "db": "postgres",
+            "monitor_mode": "cluster", "compat_official": 1,
+            "state_dir": _tf.mkdtemp(prefix="s247contract-"),
+        }
+        params.update(extra)
+        with patch.object(pc, "psycopg2", stub, create=True), \
+             patch.object(pc, "HAVE_PSYCOPG2", True):
+            return pc.run(params)
+
+    def test_compat_path_emits_a_schema_clean_payload(self):
+        """The official-compat path had no schema coverage at all.
+
+        Stats_per_DB and Transactions_Per_Database are built from whatever columns the
+        server returns. A row without 'name' is invalid, trips validate_output(), and
+        now truncates the operator's msg -- and the suite passed anyway because every
+        other run()-level test used compat_official=0.
+        """
+        out = self._run()
+        self.assertEqual(pc.validate_output(out), [],
+                         "compat payload must satisfy every Site24x7 platform limit")
+        self.assertNotIn("schema:", str(out.get("msg", "")),
+                         "a schema violation must never reach the operator message")
+        for table in ("Stats_per_DB", "Transactions_Per_Database"):
+            for row in out.get(table, []):
+                self.assertIn("name", row, f"{table} row has no 'name' column")
+
+    def test_compat_row_builder_drops_nameless_rows(self):
+        """compat_table_row() must refuse a result set with no 'name' column."""
+        self.assertIsNone(pc.compat_table_row(["c0", "c1"], (1, 2)))
+        good = pc.compat_table_row(["name", "commits"], ("appdb", 7))
+        self.assertEqual(good, {"name": "appdb", "commits": 7})
+
+    def test_retired_health_codes_are_never_emitted(self):
+        """Health_Code is a published contract: retired numbers must stay unused.
+
+        Re-pointing a retired code at a new condition would silently change what an
+        existing Site24x7 alert matches.
+        """
+        import re
+        src = open(pc.__file__, encoding="utf-8").read()
+        emitted = set()
+        for match in re.findall(r"code=([^,\n]+)", src):
+            for name in re.findall(r"HEALTH_CODE_[A-Z_]+", match):
+                emitted.add(getattr(pc, name))
+        self.assertTrue(emitted, "expected to find emitted Health_Code values")
+        leaked = sorted(emitted & pc.RETIRED_HEALTH_CODES)
+        self.assertEqual(leaked, [], f"retired Health_Code(s) emitted again: {leaked}")
+        self.assertTrue(emitted <= pc.LIVE_HEALTH_CODES,
+                        f"emitted codes outside LIVE_HEALTH_CODES: "
+                        f"{sorted(emitted - pc.LIVE_HEALTH_CODES)}")
+        self.assertFalse(pc.LIVE_HEALTH_CODES & pc.RETIRED_HEALTH_CODES,
+                         "a code cannot be both live and retired")
+
+    def test_child_tables_stay_inside_the_string_column_ceiling(self):
+        """Site24x7 allows 5 string columns per table including 'name'.
+
+        Replication_Links sits exactly on the limit, so this pins it: the next string
+        column added there would otherwise violate the contract silently.
+        """
+        out = self._run()
+        for name, rows in out.items():
+            if not isinstance(rows, list) or not rows:
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                strings = [c for c, v in row.items() if isinstance(v, str)]
+                self.assertLessEqual(
+                    len(strings), pc.MAX_STRING_COLS,
+                    f"table '{name}' has {len(strings)} string columns "
+                    f"({strings}); the limit is {pc.MAX_STRING_COLS} including 'name'")
 
 
 if __name__ == "__main__":

@@ -120,6 +120,35 @@ HEALTH_CODE_ARCHIVE_FAILING = 17           # RETIRED: use Archive_Failed
 HEALTH_CODE_STALE_STATS = 18               # RETIRED: never emitted
 HEALTH_CODE_UNSUPPORTED_VERSION = 19
 
+# The live contract, enforced by the test suite rather than left to the comments
+# above. Health_Code is an emitted metric, so an alert may be keyed on any value
+# in LIVE_HEALTH_CODES; RETIRED_HEALTH_CODES must never be emitted again, and must
+# never be re-pointed at a new condition.
+LIVE_HEALTH_CODES: Set[int] = {
+    HEALTH_CODE_OK,
+    HEALTH_CODE_PRIMARY_DOWN,
+    HEALTH_CODE_SPLIT_BRAIN,
+    HEALTH_CODE_NO_FAILOVER_CANDIDATE,
+    HEALTH_CODE_AUTH_FAIL,
+    HEALTH_CODE_CONN_FAIL,
+    HEALTH_CODE_NODE_DOWN,
+    HEALTH_CODE_UNSUPPORTED_VERSION,
+}
+RETIRED_HEALTH_CODES: Set[int] = {
+    HEALTH_CODE_NO_STANDBYS_STREAMING,
+    HEALTH_CODE_SYNC_STANDBYS_DEFICIT,
+    HEALTH_CODE_SLOT_LOST_OR_CRITICAL,
+    HEALTH_CODE_XID_CRITICAL,
+    HEALTH_CODE_STANDBY_LAG_HIGH,
+    HEALTH_CODE_INACTIVE_SLOT_WARN,
+    HEALTH_CODE_TIMELINE_MISMATCH,
+    HEALTH_CODE_RECENT_FAILOVER,
+    HEALTH_CODE_XID_WARN,
+    HEALTH_CODE_HIGH_CONNECTIONS,
+    HEALTH_CODE_ARCHIVE_FAILING,
+    HEALTH_CODE_STALE_STATS,
+}
+
 # Version Capability Map (query/feature -> minimum version tuple)
 REQUIRES: Dict[str, Tuple[int, int]] = {
     "pg_control_system": (10, 0),
@@ -2137,6 +2166,34 @@ def discover_cluster_via_sql(
         client.close()
 
 
+def compat_table_row(col_names: List[str], row: Tuple) -> Optional[Dict[str, Any]]:
+    """
+    Builds one Site24x7 child-table row from a compat query result.
+
+    Returns None when the result carries no 'name' column. Every child-table row must
+    have one: a nameless row trips validate_output() and, because violations are now
+    surfaced, truncates the operator's health message. The shipped queries always alias
+    `datname AS name`, so this only guards a fork, a permission-filtered view, or a
+    future column rename -- but it guards them silently rather than corrupting `msg`.
+    """
+    if "name" not in col_names:
+        return None
+    out: Dict[str, Any] = {}
+    for i, c in enumerate(col_names):
+        if i >= len(row):
+            break
+        val = row[i]
+        if c == "name":
+            out[c] = safe_name(val or "db")
+        elif val is None:
+            out[c] = 0
+        elif isinstance(val, float) or "." in str(val):
+            out[c] = safe_float(val)
+        else:
+            out[c] = safe_int(val)
+    return out if "name" in out else None
+
+
 def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Collects the metric set emitted by the official Site24x7 postgres plugin, so a
@@ -2318,16 +2375,9 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
         rows = cur.fetchall()
         cur.close()
         for r in rows[:MAX_ROWS]:
-            row_dict: Dict[str, Any] = {}
-            for i, c in enumerate(col_names):
-                val = r[i]
-                if c == "name":
-                    row_dict[c] = safe_name(val or "db")
-                else:
-                    if val is None:
-                        val = 0
-                    row_dict[c] = float(val) if isinstance(val, float) or (isinstance(val, (int, float, str)) and "." in str(val)) else int(val)
-            txn_session_rows.append(row_dict)
+            row_dict = compat_table_row(col_names, r)
+            if row_dict is not None:
+                txn_session_rows.append(row_dict)
     except Exception:
         if client.conn:
             try:
@@ -2344,16 +2394,9 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
         rows = cur.fetchall()
         cur.close()
         for r in rows[:MAX_ROWS]:
-            row_dict = {}
-            for i, c in enumerate(col_names):
-                val = r[i]
-                if c == "name":
-                    row_dict[c] = safe_name(val or "db")
-                else:
-                    if val is None:
-                        val = 0
-                    row_dict[c] = float(val) if isinstance(val, float) or (isinstance(val, (int, float, str)) and "." in str(val)) else int(val)
-            db_stats_rows.append(row_dict)
+            row_dict = compat_table_row(col_names, r)
+            if row_dict is not None:
+                db_stats_rows.append(row_dict)
     except Exception:
         if client.conn:
             try:
