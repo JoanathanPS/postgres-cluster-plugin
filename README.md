@@ -33,11 +33,8 @@ The plugin itself is in [`postgres_cluster/`](postgres_cluster/). Start with its
 ## Quick checks
 
 ```powershell
-# Run plugin self-test (10/10 skeleton checks)
-python postgres_cluster\postgres_cluster.py --self-test
-
-# Run unit tests
-python tests\test_summary.py
+# Run the full test suite, including the Site24x7 payload-contract checks
+python -m pytest tests -q
 
 # Run layout compliance check
 powershell scripts\check-layout.ps1

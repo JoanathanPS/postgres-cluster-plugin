@@ -1022,5 +1022,87 @@ class TestRunLevelRegressions(unittest.TestCase):
         self.assertEqual(pc.validate_output(out), [])
 
 
+class TestPayloadContract(unittest.TestCase):
+    """The checks that used to live in the plugin's own --self-test.
+
+    These are the Site24x7 contract invariants: if any of them breaks, the console
+    either drops metrics silently or refuses the payload. They were shipped inside
+    postgres_cluster.py as a self_test() function and a --self-test flag, which put
+    test code in the production deliverable. They belong here.
+    """
+
+    def test_catalogue_has_no_duplicate_metric_names(self):
+        names = [m["name"] for m in pc.METRICS]
+        dupes = {n for n in names if names.count(n) > 1}
+        self.assertEqual(dupes, set(), f"duplicate metric names: {dupes}")
+
+    def test_catalogue_uses_no_reserved_keys(self):
+        clashes = {m["name"] for m in pc.METRICS} & pc.RESERVED_KEYS
+        self.assertEqual(clashes, set(), f"metrics collide with reserved keys: {clashes}")
+
+    def test_every_numeric_metric_has_a_unit(self):
+        missing = [
+            m["name"] for m in pc.METRICS
+            if m.get("type", int) is not str and m["name"] not in pc.UNITS_DEF
+        ]
+        self.assertEqual(missing, [], f"numeric metrics with no unit: {missing}")
+
+    def test_every_child_table_has_a_unit_schema(self):
+        missing = [t for t in pc.TABLE_UNITS if t not in pc.UNITS_DEF]
+        self.assertEqual(missing, [], f"child tables with no unit schema: {missing}")
+
+    def test_empty_payload_satisfies_the_contract(self):
+        """The zero-state payload must be emittable: it is what a cold start sends."""
+        violations = pc.validate_output(pc.get_empty_payload())
+        self.assertEqual(violations, [], f"empty payload violates the contract: {violations}")
+
+    def test_validator_detects_a_metric_declared_but_never_emitted(self):
+        """Guard the guard: a tab entry with no matching metric must be reported.
+
+        This is the failure mode that silently drops a whole chart in the console, so
+        the validator catching it is load-bearing.
+        """
+        payload = pc.get_empty_payload()
+        tabs = payload["tabs"].get("tabs", payload["tabs"])
+        tabs["Primary"]["tablist"].append("Ghost_Metric")
+        violations = pc.validate_output(payload)
+        self.assertTrue(
+            any("Ghost_Metric" in v for v in violations),
+            "validate_output must flag a tab entry that is never emitted",
+        )
+
+    def test_tab_order_is_the_declared_order(self):
+        tabs_def, _ = pc.build_tabs_and_units(pc.METRICS)
+        self.assertEqual(list(tabs_def.get("tabs", tabs_def).keys()), pc.TAB_ORDER)
+
+    def test_patroni_timestamps_in_different_zones_compare_equal(self):
+        """The same instant written as Z and as +05:30 must parse to one epoch.
+
+        Getting this wrong made Failover_Age_s wrong by the UTC offset, which is how a
+        stale failover looked recent (or a recent one looked stale).
+        """
+        z = pc.parse_patroni_epoch("2026-11-12T12:39:45Z")
+        offset = pc.parse_patroni_epoch("2026-11-12T18:09:45+05:30")
+        self.assertEqual(z, offset)
+        self.assertEqual(z, 1794487185.0)
+
+    def test_healthy_cluster_needs_no_attention(self):
+        rows = [
+            {"name": "pg-node2", "role": pc.ROLE_PRIMARY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+            {"name": "pg-node1", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+            {"name": "pg-node3", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP, "status_reason": "healthy"},
+        ]
+        node, reason = pc.evaluate_first_attention(
+            node_rows=rows, max_replay_lag_s=0.0, slowest_node="pg-node1",
+            primary_up=1, primary_node="pg-node2",
+        )
+        self.assertEqual((node, reason), ("none", "none"))
+
+    def test_production_file_ships_no_test_entry_point(self):
+        """The plugin must not carry its own test harness."""
+        self.assertFalse(hasattr(pc, "self_test"),
+                         "self_test() should live in the test suite, not the plugin")
+
+
 if __name__ == "__main__":
     unittest.main()

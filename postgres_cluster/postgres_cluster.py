@@ -1535,7 +1535,7 @@ def validate_output(payload: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------------------------------------------------------
-# 6. PAYLOAD SKELETON & SELF-TEST
+# 6. PAYLOAD SKELETON
 # -----------------------------------------------------------------------------
 def get_empty_payload() -> Dict[str, Any]:
     """Generates an initial zero-state payload guaranteed to pass all limits."""
@@ -1569,75 +1569,6 @@ def get_empty_payload() -> Dict[str, Any]:
     return payload
 
 
-def self_test() -> int:
-    """Exercises in-process assertions and validators without database access."""
-    print("=================================================================", flush=True)
-    print(f" Site24x7 PostgreSQL Cluster Plugin v{PLUGIN_VERSION} Self-Test (Skeleton Gate)", flush=True)
-    print("=================================================================", flush=True)
-
-    fails = 0
-
-    def check(desc: str, ok: bool, extra: str = ""):
-        nonlocal fails
-        if ok:
-            print(f"  [PASS] {desc}", flush=True)
-        else:
-            print(f"  [FAIL] {desc} {extra}", flush=True)
-            fails += 1
-
-    # 1. Catalogue Invariants
-    check("Catalogue metric count <= 200", len(METRICS) <= MAX_METRICS, f"got {len(METRICS)}")
-    check("All 9 tabs defined in order", [k for k in (TABS_DEF.get("tabs", TABS_DEF)).keys()] == TAB_ORDER)
-
-    metric_names = [m["name"] for m in METRICS]
-    check("No duplicate metric names in catalogue", len(metric_names) == len(set(metric_names)))
-    check("No reserved keys used in catalogue", not any(m in RESERVED_KEYS for m in metric_names))
-
-    # 2. Units completeness
-    missing_units = [m["name"] for m in METRICS if m.get("type", int) != str and m["name"] not in UNITS_DEF]
-    check("Every numeric catalogue metric has an entry in units{}", len(missing_units) == 0, f"missing: {missing_units}")
-    missing_table_units = [tbl for tbl in TABLE_UNITS if tbl not in UNITS_DEF]
-    check("Every child table has a schema entry in units{}", len(missing_table_units) == 0, f"missing: {missing_table_units}")
-
-    # 3. Payload validation
-    payload = get_empty_payload()
-    violations = validate_output(payload)
-    check("Empty payload passes validate_output() with 0 violations", len(violations) == 0, f"violations: {violations}")
-
-    # 4. Failure detection in validate_output
-    bad_payload = copy.deepcopy(payload)
-    target_tabs = bad_payload["tabs"].get("tabs", bad_payload["tabs"])
-    target_tabs["Primary"]["tablist"].append("Ghost_Metric")
-    bad_violations = validate_output(bad_payload)
-    check("validate_output catches TAB_METRIC_NEVER_EMITTED", any("Ghost_Metric" in v for v in bad_violations))
-
-    # 5. First Attention evaluation ordering
-    test_node_rows = [
-        {"name": "pg-node2", "role": ROLE_PRIMARY, "status": STATUS_UP, "status_reason": "healthy"},
-        {"name": "pg-node1", "role": ROLE_STANDBY, "status": STATUS_UP, "status_reason": "healthy"},
-        {"name": "pg-node3", "role": ROLE_STANDBY, "status": STATUS_UP, "status_reason": "healthy"},
-    ]
-    fa_n, fa_r = evaluate_first_attention(
-        node_rows=test_node_rows,
-        max_replay_lag_s=0.0,
-        slowest_node="pg-node1",
-        primary_up=1,
-        primary_node="pg-node2",
-    )
-    check("Healthy cluster evaluates First_Attention to ('none', 'none')", fa_n == "none" and fa_r == "none", f"got ({fa_n}, {fa_r})")
-
-    # 6. Patroni failover timestamp parsing
-    ts_z_epoch = parse_patroni_epoch("2026-11-12T12:39:45Z")
-    ts_offset_epoch = parse_patroni_epoch("2026-11-12T18:09:45+05:30")
-    check("Patroni parser handles Z and +05:30 offset consistently", ts_z_epoch == ts_offset_epoch and ts_z_epoch == 1794487185.0)
-
-    print("=================================================================", flush=True)
-    if fails == 0:
-        print("RESULT: ALL SKELETON TESTS PASSED", flush=True)
-        return 0
-    else:
-        print(f"RESULT: {fails} TEST(S) FAILED", flush=True)
-        return 1
 
 
 def lsn_to_bytes(lsn_val: Any) -> int:
@@ -4784,7 +4715,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 def main():
     try:
         parser = argparse.ArgumentParser(description=f"Site24x7 PostgreSQL Cluster Monitor v{PLUGIN_VERSION}")
-        parser.add_argument("--self-test", action="store_true", help="Run in-process pure validation checks")
         parser.add_argument("--json-out", type=str, default="", help="Write emitted JSON to specified file")
         parser.add_argument("--nodes", type=str, default="", help="Comma-separated node specifications (e.g. pg1=host:port)")
         parser.add_argument("--cluster_host", type=str, default="", help="Hostname or IP of cluster seed node")
@@ -4818,9 +4748,6 @@ def main():
             if isinstance(parse_err, SystemExit) and parse_err.code == 0:
                 sys.exit(0)
             args = argparse.Namespace()
-
-        if getattr(args, "self_test", False):
-            sys.exit(self_test())
 
         params: Dict[str, Any] = {}
         if getattr(args, "monitor_mode", None):

@@ -173,8 +173,7 @@ sets the product's bar and that is not an intern's call to change.
 
 | Check | Result |
 |---|---|
-| `--self-test` | 10/10 pass |
-| `pytest tests/` | 98 passed, 7 skipped |
+| `pytest tests/` | 104 passed, 7 skipped |
 | Live 3-node Patroni cluster | `status 1`, 3/3 nodes, primary `pg-node3`, 2/2 streaming, timeline 64, 0 schema violations, 1.3s collect |
 | SQL-only discovery, proxy disabled | Correct topology from all three nodes as seed, including both standbys following upstream |
 | Refactor equivalence | Every stable payload key byte-identical pre/post |
