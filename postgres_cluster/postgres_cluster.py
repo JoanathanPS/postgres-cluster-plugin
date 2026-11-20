@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PostgreSQL Cluster Monitoring Plugin for Site24x7 (v5 Engine).
+PostgreSQL cluster monitoring plugin for Site24x7.
 Architecture: Catalogue -> Capabilities -> Truth Model -> Health Object -> Emitter.
 Single-file deliverable conforming to Site24x7 hard constraints.
 """
@@ -1068,7 +1068,7 @@ def evaluate_database_health(
 
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
-# 2. TAB DEFINITIONS (Exact 8 Tabs, strict order)
+# 2. TAB & CHILD-TABLE DEFINITIONS (order is the console's display order)
 # -----------------------------------------------------------------------------
 TAB_ORDER = [
     "Cluster",
@@ -1276,7 +1276,7 @@ OFFICIAL_COMPAT_METRICS_MAP: Dict[str, List[str]] = {
 # units{} and tabs{} are programmatically generated from this structure.
 METRICS: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
-    # TAB 1: Diagnosis (Cluster overview, health code, timelines, failover)
+    # Cluster: overview, health code, timelines, failover
     # -------------------------------------------------------------------------
     {"name": "Cluster_Health", "unit": "status", "tab": "Summary", "type": int,
      "desc": "Cluster health severity: 0=HEALTHY, 1=DEGRADED, 2=CRITICAL"},
@@ -1322,7 +1322,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Node promoted in the most recent failover"},
 
     # -------------------------------------------------------------------------
-    # TAB 2: Primary (Core health, clamping, and activity of primary node)
+    # Primary: core health, clamped values, and activity of the primary node
     # -------------------------------------------------------------------------
     {"name": "Primary_Up", "unit": "flag", "tab": "Primary", "type": int,
      "desc": "1 if primary node is reachable and serving, 0 if down"},
@@ -1394,7 +1394,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Source of primary metrics: live, clamped, or none"},
 
     # -------------------------------------------------------------------------
-    # TAB 3: Nodes (Cluster-wide node roll-up)
+    # Nodes: cluster-wide roll-up across every node
     # -------------------------------------------------------------------------
     {"name": "Standbys_Expected", "unit": "nodes", "tab": "Nodes", "type": int,
      "desc": "Number of standbys expected to stream from primary"},
@@ -1424,7 +1424,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Node exhibiting slowest response time during probe"},
 
     # -------------------------------------------------------------------------
-    # TAB 4: Replication (Replication slots, mesh, and logical telemetry)
+    # Replication: slots, mesh links, and logical replication telemetry
     # -------------------------------------------------------------------------
     {"name": "Replication_Slots_Total", "unit": "slots", "tab": "Replication", "type": int,
      "desc": "Total physical and logical replication slots"},
@@ -1452,7 +1452,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Cumulative subscription conflict count"},
 
     # -------------------------------------------------------------------------
-    # TAB 5: Health and Capacity (Storage, connection, and freeze limits)
+    # Capacity & WAL / Sessions: storage, connection and freeze limits
     # -------------------------------------------------------------------------
     {"name": "XID_Wraparound_Pct", "unit": "%", "tab": "Capacity & WAL", "type": float,
      "desc": "Cluster-wide maximum XID wraparound percentage"},
@@ -1466,7 +1466,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Total sessions currently blocked waiting on locks"},
 
     # -------------------------------------------------------------------------
-    # TAB 6: Performance (Throughput, buffer pool, checkpoints, background writer)
+    # Performance: throughput, buffer pool, checkpoints, background writer
     # -------------------------------------------------------------------------
     {"name": "Cache_Hit_Ratio", "unit": "%", "tab": "Performance", "type": float,
      "desc": "Cluster buffer pool cache hit ratio"},
@@ -1494,7 +1494,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Index scans per second"},
 
     # -------------------------------------------------------------------------
-    # TAB 7: WAL and Archiver (WAL generation, archiving status)
+    # Capacity & WAL: WAL generation and archiver status
     # -------------------------------------------------------------------------
     {"name": "WAL_LSN_MB", "unit": "MB", "tab": "Capacity & WAL", "type": float,
      "desc": "Total WAL bytes written mapped to megabytes"},
@@ -1516,7 +1516,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Filename of most recently archived WAL segment"},
 
     # -------------------------------------------------------------------------
-    # TAB 8: Workload (Databases, sessions, and top wait events)
+    # Databases / Sessions: database sizes, sessions, top wait events
     # -------------------------------------------------------------------------
     {"name": "DB_Count", "unit": "databases", "tab": "Databases", "type": int,
      "desc": "Number of connectable databases in cluster"},
@@ -1534,7 +1534,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Most frequent non-idle wait event across backends"},
 
     # -------------------------------------------------------------------------
-    # SELF-INSTRUMENTATION & STATE DIAGNOSTICS (Assigned to Diagnosis Tab)
+    # Plugin: self-instrumentation and state-store diagnostics
     # -------------------------------------------------------------------------
     {"name": "Collect_Time_ms", "unit": "ms", "tab": "Plugin", "type": float,
      "desc": "Plugin execution time in milliseconds"},
@@ -1548,6 +1548,8 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Cumulative state file read/write I/O errors"},
     {"name": "Rate_Warmup_Flag", "unit": "flag", "tab": "Plugin", "type": int,
      "desc": "1 during first poll cycle while rate baselines warm up, 0 otherwise"},
+    {"name": "Schema_Violations", "unit": "errors", "tab": "Plugin", "type": int,
+     "desc": "Site24x7 contract violations detected in this payload (0 = clean)"},
 
     # String diagnostics in Diagnosis tab
     {"name": "Slowest_Scope", "unit": "", "tab": "Plugin", "type": str,
@@ -1742,7 +1744,7 @@ def validate_output(payload: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------------------------------------------------------
-# 6. SKELETON EMITTER & ENTRY POINT (Step 0)
+# 6. PAYLOAD SKELETON & SELF-TEST
 # -----------------------------------------------------------------------------
 def get_empty_payload() -> Dict[str, Any]:
     """Generates an initial zero-state payload guaranteed to pass all limits."""
@@ -1833,7 +1835,7 @@ def self_test() -> int:
     )
     check("Healthy cluster evaluates First_Attention to ('none', 'none')", fa_n == "none" and fa_r == "none", f"got ({fa_n}, {fa_r})")
 
-    # 6. Patroni failover timestamp parsing (Issue #2)
+    # 6. Patroni failover timestamp parsing
     ts_z_epoch = parse_patroni_epoch("2026-11-12T12:39:45Z")
     ts_offset_epoch = parse_patroni_epoch("2026-11-12T18:09:45+05:30")
     check("Patroni parser handles Z and +05:30 offset consistently", ts_z_epoch == ts_offset_epoch and ts_z_epoch == 1794487185.0)
@@ -2429,8 +2431,11 @@ def discover_cluster_via_sql(
 
 def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Collects backward-compatibility metrics matching official postgres plugin (Fix 9).
-    Emits 41 parent metrics, Stats_per_DB, and Transactions_Per_Database.
+    Collects the metric set emitted by the official Site24x7 postgres plugin, so a
+    monitor migrated from that plugin keeps its existing charts and history.
+    Emits the official plugin's parent metrics plus its Stats_per_DB and
+    Transactions_Per_Database child tables. Only metrics declared in
+    OFFICIAL_COMPAT_UNITS are emitted, so the payload cannot drift.
     """
     metrics: Dict[str, Any] = {}
     db_stats_rows: List[Dict[str, Any]] = []
@@ -2559,6 +2564,16 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
             if row:
                 for idx, col in enumerate(col_names):
                     m_name = col.replace("_", " ").title()
+                    # Metric names derive from server column names, so only emit the
+                    # ones this plugin actually declares a unit and a tab for. A fork,
+                    # a pooler or a future PostgreSQL rename would otherwise produce an
+                    # untabbed, unitless metric that trips the Site24x7 contract check.
+                    if m_name not in OFFICIAL_COMPAT_UNITS and m_name != "Server Version":
+                        if client is not None:
+                            client.warnings.append(
+                                f"compat: dropped undeclared metric '{m_name}' from query {q_key}"
+                            )
+                        continue
                     val = row[idx]
                     if val is None:
                         val = 0
@@ -3604,6 +3619,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         else:
             entry["ts_fail"] = t0
             entry["last_reason"] = r["status_reason"]
+            # Only persist a failed node once it has been seen alive at least once.
+            # StateStore._prune_nodes() drops any entry with ts_ok <= 0, so writing a
+            # never-connected node here would be discarded on save and would also let a
+            # typo in `nodes` accumulate phantom aliases in the offline-row retention.
             if "ts_ok" in entry:
                 r["last_seen_s"] = int(t0 - float(entry["ts_ok"]))
                 new_state["nodes"][alias] = entry
@@ -3672,7 +3691,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 node_rows.append(offline_row)
                 new_state["nodes"][alias] = entry
 
-    # Cross-check system_identifier across UP nodes (Bug 10 protection against alien nodes)
+    # Reject nodes that belong to a different cluster: an endpoint reachable at the
+    # configured address is not necessarily part of this cluster, so compare the
+    # PostgreSQL system identifier against the primary's before trusting it.
     primary_sys_id = ""
     for r in node_rows:
         if r.get("role") == ROLE_PRIMARY and r.get("status") == STATUS_UP:
@@ -3767,7 +3788,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # 3. Primary / Standalone Metrics Collection (Tier 1)
+    # 3. Primary / standalone metric collection
     db_stat_rows: List[Any] = []
     raw_we_rows: List[Any] = []
     compat_metrics: Dict[str, Any] = {}
@@ -4093,7 +4114,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["DB_Count"] = int(db_size_row[0] or 0)
             payload["DB_Total_Size_MB"] = round(float(db_size_row[1] or 0), 2) if len(db_size_row) > 1 else 0.0
 
-        # 3.9 Additional Health and Activity Metrics (Finding 4)
+        # 3.9 Health and activity metrics
         # Long running queries
         lq_sec = safe_int(merged.get("long_query_seconds", 300), default=300)
         lq_backend = "AND (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else ""
@@ -4416,7 +4437,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         new_state["primary_counters"]["idx_scans"] = cur_idx
         new_state["primary_counters"]["arch_failed"] = payload.get("Primary_Archive_Failed", 0)
 
-        # Fix 9: Collect official postgres plugin backward compat metrics
+        # Official-plugin compatibility metrics (see collect_official_compat)
         compat_client_version = getattr(active_client, "version_tuple", (0, 0))
         if compat_official == 1:
             compat_metrics, compat_db_stats, compat_txn_sessions = collect_official_compat(active_client)
@@ -4438,7 +4459,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 cluster_manager = mgr_code
                 cluster_manager_str = mgr_str
 
-        # Fix 9: If primary is unreachable, collect from any connected local instance if available
+        # Primary unreachable: collect compatibility metrics from any node still connected,
+        # so a migrated monitor keeps reporting instance-level stats during a failover.
         if compat_official == 1:
             local_client = None
             for r in node_rows:
@@ -4480,7 +4502,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["Primary_Data_Stale"] = 1
             payload["Rate_Warmup_Flag"] = 1
 
-    # Map sync state from rep_rows to node_rows (Finding 5)
+    # Map each standby's synchronous state from pg_stat_replication onto its node row
     rep_link_data: List[Dict[str, Any]] = []
     if rep_rows:
         for r_item in rep_rows:
@@ -4576,7 +4598,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         })
     payload["Node_Snapshot"] = node_snapshot_table
 
-    # 4.3 Replication_Links (Finding 3: ONLY real rows)
+    # 4.3 Replication_Links -- emitted only for links that genuinely exist
     replication_links_table: List[Dict[str, Any]] = []
     seen_link_names: Set[str] = set()
     if rep_link_data:
@@ -4866,7 +4888,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         else:
             payload["status"] = STATUS_UP
 
-    # Finding 9: Append metric_unavailable note to msg if any metric failed
+    # Surface the first unavailable metric in the message, so a partial collection is
+    # visible to the operator rather than looking like a healthy poll.
     unavail_notes = [w for w in all_warnings if "metric_unavailable" in w]
     if unavail_notes:
         note = unavail_notes[0]
@@ -4880,7 +4903,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     payload["Queries_Run"] = queries_count
     payload["Collect_Time_ms"] = round((time.time() - t0) * 1000.0, 2)
 
-    # Fix 9: Backward compatibility injection for official postgres plugin
+    # Merge the official-plugin metric set into the payload, units and tabs
     if compat_official == 1 and compat_metrics:
         # Check metric budget: platform cap is 200
         cur_metric_count = len([k for k, v in payload.items() if k not in RESERVED_KEYS and not isinstance(v, (list, dict))]) + len(compat_metrics)
@@ -4902,7 +4925,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                     if m_item in compat_metrics and m_item not in cur_tablist:
                         cur_tablist.append(m_item)
 
-        # Finding 7: On PG < 14, prune Total Sessions* from units, tabs, and tables
+        # pg_stat_database session counters are PostgreSQL 14+; prune them below that
+        # so they are never emitted as a fabricated zero.
         if compat_client_version < (14, 0):
             for s_key in ("Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed"):
                 compat_units.pop(s_key, None)
@@ -4939,14 +4963,20 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             if u_key not in payload:
                 payload["units"].pop(u_key, None)
 
-    # 7. Validate payload integrity
+    # 7. Validate payload integrity.
+    # A contract violation silently drops metrics server-side, so it must be visible:
+    # appended to msg (never substituted, so an outage message survives) and counted
+    # in a metric that can be alerted on.
     violations = validate_output(payload)
+    payload["Schema_Violations"] = len(violations)
     if violations:
-        all_warnings.append(f"schema: {'; '.join(violations[:2])}")
+        detail = "; ".join(violations[:2])
+        all_warnings.append(f"schema: {detail}")
         payload["Collect_Warnings"] = len(all_warnings)
-        # Never clobber existing operational outage message
-        if payload.get("status") == STATUS_UP and not payload.get("msg"):
-            payload["msg"] = f"schema: {'; '.join(violations[:2])}"[:MAX_MSG_CHARS]
+        current = str(payload.get("msg") or "")
+        suffix = f" | schema: {detail}"
+        if len(current) + 12 < MAX_MSG_CHARS:
+            payload["msg"] = (current + suffix)[:MAX_MSG_CHARS]
 
     return payload
 
