@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import weakref
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 try:
     import psycopg2
@@ -426,6 +426,17 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
             t.start()
             self._threads.add(t)
             concurrent.futures.thread._threads_queues[t] = self._work_queue
+
+
+class ConnConfig(NamedTuple):
+    """The credentials and TLS settings shared by every node connection in a cycle."""
+    username: str
+    password: str
+    dbname: str
+    sslmode: str = "prefer"
+    sslrootcert: str = ""
+    sslcert: str = ""
+    sslkey: str = ""
 
 
 class NodeClient:
@@ -3525,6 +3536,188 @@ def collect_primary_metrics(
     }
 
 
+def probe_node(
+    spec: Dict[str, Any],
+    conn: "ConnConfig",
+    prev_state: Dict[str, Any],
+    t0: float,
+) -> Dict[str, Any]:
+    """
+    Connects to one cluster node and returns its observed row.
+
+    Role is decided by pg_is_in_recovery() alone -- never by what Patroni, repmgr
+    or a proxy claimed about this node -- so a stale register cannot mislabel a
+    primary. A node that fails to connect keeps its last known role from state for
+    an hour, then falls back to ROLE_UNKNOWN rather than being guessed as a standby.
+    """
+    n_name = spec["name"]
+    n_host = spec["host"]
+    n_port = spec["port"]
+    p_role_str = spec["patroni_role"]
+    p_state_int = spec["patroni_state"]
+
+    row_res = {
+        "name": safe_name(n_name),
+        "raw_name": n_name,
+        "host": n_host,
+        "port": n_port,
+        "role": ROLE_UNKNOWN,
+        "status": STATUS_DOWN,
+        "status_reason": "connection failed",
+        "last_seen_s": 0,
+        "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "timeline": spec.get("patroni_tl", 0),
+        "replay_lag_s": 0.0,
+        "replay_lag_bytes": 0,
+        "conn_pct": 0.0,
+        "resp_ms": 0.0,
+        "sync": None,
+        "patroni_state": p_state_int,
+        "xact_age_s": 0,
+        "uptime_s": 0,
+        "version_num": 0,
+        "active_queries": 0,
+        "idle_in_txn": 0,
+        "longest_query_s": 0,
+        "temp_bytes": 0,
+        "dead_tuples": 0,
+        "system_identifier": "",
+        "client": None,
+        "is_primary": False
+    }
+
+    t_start = time.time()
+    client = NodeClient(
+        name=n_name,
+        host=n_host,
+        port=n_port,
+        user=conn.username,
+        password=conn.password,
+        dbname=conn.dbname,
+        sslmode=conn.sslmode,
+        sslrootcert=conn.sslrootcert,
+        sslcert=conn.sslcert,
+        sslkey=conn.sslkey
+    )
+
+    if client.connect():
+        if not client.is_supported:
+            row_res["status"] = STATUS_DOWN
+            row_res["status_reason"] = f"unsupported_version: PostgreSQL {client.version_tuple[0]}.{client.version_tuple[1]} < 9.6"
+            row_res["version_num"] = safe_int(client.version_num)
+            row_res["system_identifier"] = getattr(client, "system_identifier", "")
+            row_res["client_warnings"] = list(client.warnings)
+            row_res["client"] = client
+            return row_res
+
+        resp_ms = round((time.time() - t_start) * 1000.0, 2)
+        row_res["status"] = STATUS_UP
+        row_res["status_reason"] = "healthy"
+        row_res["resp_ms"] = resp_ms
+        row_res["system_identifier"] = getattr(client, "system_identifier", "")
+        row_res["client"] = client
+
+        is_prim = not client.is_recovery
+        row_res["is_primary"] = is_prim
+        row_res["role"] = ROLE_PRIMARY if is_prim else ROLE_STANDBY
+
+        # Probe connections and activity (Client backends only on PG10+)
+        if client.version_tuple >= (10, 0):
+            c_sql = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';"
+        else:
+            c_sql = "SELECT count(*) FROM pg_stat_activity;"
+        c_row = client.query_one(c_sql)
+        if c_row and c_row[0] is not None:
+            conns = safe_int(c_row[0])
+            max_conn = safe_int(client.settings.get("max_connections", 100), default=100)
+            c_pct = round(100.0 * conns / max_conn, 2) if max_conn > 0 else 0.0
+            row_res["conn_pct"] = c_pct
+
+        # Timeline
+        if row_res["timeline"] == 0 and client.requires("pg_control_checkpoint"):
+            tl_row = client.query_one("SELECT timeline_id FROM pg_control_checkpoint();")
+            if tl_row and tl_row[0]:
+                row_res["timeline"] = safe_int(tl_row[0])
+
+        # Standby specific lag
+        if not is_prim:
+            lag_row = client.query_one("SELECT extract(epoch from (now() - pg_last_xact_replay_timestamp()));")
+            if lag_row and lag_row[0] is not None:
+                row_res["replay_lag_s"] = round(max(0.0, safe_float(lag_row[0])), 2)
+
+            if client.requires("pg_wal_lsn_diff"):
+                b_row = client.query_one("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
+            else:
+                b_row = client.query_one("SELECT pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location());")
+            if b_row and b_row[0] is not None:
+                row_res["replay_lag_bytes"] = safe_int(b_row[0])
+
+            # Check if delayed replica (recovery_min_apply_delay is GUC parameter only in PG 12+)
+            if client.version_tuple >= (12, 0):
+                delay_row = client.query_one("SHOW recovery_min_apply_delay;")
+                if delay_row and delay_row[0] and delay_row[0] != "0":
+                    row_res["role"] = ROLE_DELAYED
+
+            # Check if cascading replica (standby with downstream streaming replicas)
+            casc_row = client.query_one("SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';")
+            if casc_row and safe_int(casc_row[0]) > 0:
+                row_res["role"] = ROLE_CASCADING
+
+        # Per-node snapshot details
+        row_res["version_num"] = safe_int(client.version_num)
+        up_row = client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()))::int;")
+        if up_row and up_row[0] is not None:
+            row_res["uptime_s"] = safe_int(up_row[0])
+        act_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active';")
+        if act_q and act_q[0] is not None:
+            row_res["active_queries"] = safe_int(act_q[0])
+        idle_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state LIKE 'idle in transaction%';")
+        if idle_q and idle_q[0] is not None:
+            row_res["idle_in_txn"] = safe_int(idle_q[0])
+        lq = client.query_one("SELECT coalesce(max(extract(epoch from (now() - query_start)))::int, 0) FROM pg_stat_activity WHERE state = 'active';")
+        if lq and lq[0] is not None:
+            row_res["longest_query_s"] = safe_int(lq[0])
+
+        # Oldest active transaction age in seconds
+        xa_row = client.query_one("SELECT coalesce(max(extract(epoch from (now() - xact_start)))::int, 0) FROM pg_stat_activity WHERE xact_start IS NOT NULL;")
+        if xa_row and xa_row[0] is not None:
+            row_res["xact_age_s"] = safe_int(xa_row[0])
+
+        # Temp bytes from database stats
+        tb_row = client.query_one("SELECT coalesce(sum(temp_bytes)::bigint, 0) FROM pg_stat_database;")
+        if tb_row and tb_row[0] is not None:
+            row_res["temp_bytes"] = safe_int(tb_row[0])
+
+        # Dead tuples from user tables
+        dt_row = client.query_one("SELECT coalesce(sum(n_dead_tup)::bigint, 0) FROM pg_stat_user_tables;")
+        if dt_row and dt_row[0] is not None:
+            row_res["dead_tuples"] = safe_int(dt_row[0])
+    else:
+        row_res["status"] = STATUS_DOWN
+        # Patroni and pg_stat_replication both report member lag in BYTES.
+        # It must not be written into replay_lag_s, which is seconds.
+        if spec.get("patroni_lag_bytes") is not None:
+            row_res["replay_lag_bytes"] = safe_int(spec.get("patroni_lag_bytes"))
+        if p_state_int in (PATRONI_STATE_STOPPED, PATRONI_STATE_CRASHED):
+            row_res["status_reason"] = "stopped (Patroni)"
+        else:
+            row_res["status_reason"] = client.warnings[-1][:100] if client.warnings else "unreachable"
+        row_res["auth_failed"] = getattr(client, "auth_failed", False)
+        row_res["auth_error"] = getattr(client, "auth_error", "")
+        row_res["client_warnings"] = list(client.warnings)
+
+        # Stopped node must not automatically be classified as a replica
+        # Use last known role from prev_state only if trustworthy, otherwise ROLE_UNKNOWN
+        prev_info = prev_state.get("nodes", {}).get(n_name, {})
+        last_r = prev_info.get("last_role")
+        if last_r and (t0 - float(prev_info.get("ts_ok", 0))) <= 3600:
+            row_res["role"] = last_r
+        else:
+            row_res["role"] = ROLE_UNKNOWN
+
+    return row_res
+
+
 def run(param: Dict[str, Any]) -> Dict[str, Any]:
     """Standard Site24x7 plugin entry point."""
     t0 = time.time()
@@ -3866,6 +4059,15 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         })
 
     # 2. Parallel / Multi-node probing
+    conn_cfg = ConnConfig(
+        username=username,
+        password=password,
+        dbname=dbname,
+        sslmode=sslmode,
+        sslrootcert=sslrootcert,
+        sslcert=sslcert,
+        sslkey=sslkey,
+    )
     node_rows: List[Dict[str, Any]] = []
     primary_client: Optional[NodeClient] = None
     standby_client: Optional[NodeClient] = None
@@ -3879,178 +4081,14 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     conn_pcts: List[Tuple[float, str]] = []
     response_times: List[Tuple[float, str]] = []
 
-    def probe_single_node(spec: Dict[str, Any]) -> Dict[str, Any]:
-        n_name = spec["name"]
-        n_host = spec["host"]
-        n_port = spec["port"]
-        p_role_str = spec["patroni_role"]
-        p_state_int = spec["patroni_state"]
-
-        row_res = {
-            "name": safe_name(n_name),
-            "raw_name": n_name,
-            "host": n_host,
-            "port": n_port,
-            "role": ROLE_UNKNOWN,
-            "status": STATUS_DOWN,
-            "status_reason": "connection failed",
-            "last_seen_s": 0,
-            "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "timeline": spec.get("patroni_tl", 0),
-            "replay_lag_s": 0.0,
-            "replay_lag_bytes": 0,
-            "conn_pct": 0.0,
-            "resp_ms": 0.0,
-            "sync": None,
-            "patroni_state": p_state_int,
-            "xact_age_s": 0,
-            "uptime_s": 0,
-            "version_num": 0,
-            "active_queries": 0,
-            "idle_in_txn": 0,
-            "longest_query_s": 0,
-            "temp_bytes": 0,
-            "dead_tuples": 0,
-            "system_identifier": "",
-            "client": None,
-            "is_primary": False
-        }
-
-        t_start = time.time()
-        client = NodeClient(
-            name=n_name,
-            host=n_host,
-            port=n_port,
-            user=username,
-            password=password,
-            dbname=dbname,
-            sslmode=sslmode,
-            sslrootcert=sslrootcert,
-            sslcert=sslcert,
-            sslkey=sslkey
-        )
-
-        if client.connect():
-            if not client.is_supported:
-                row_res["status"] = STATUS_DOWN
-                row_res["status_reason"] = f"unsupported_version: PostgreSQL {client.version_tuple[0]}.{client.version_tuple[1]} < 9.6"
-                row_res["version_num"] = safe_int(client.version_num)
-                row_res["system_identifier"] = getattr(client, "system_identifier", "")
-                row_res["client_warnings"] = list(client.warnings)
-                row_res["client"] = client
-                return row_res
-
-            resp_ms = round((time.time() - t_start) * 1000.0, 2)
-            row_res["status"] = STATUS_UP
-            row_res["status_reason"] = "healthy"
-            row_res["resp_ms"] = resp_ms
-            row_res["system_identifier"] = getattr(client, "system_identifier", "")
-            row_res["client"] = client
-
-            is_prim = not client.is_recovery
-            row_res["is_primary"] = is_prim
-            row_res["role"] = ROLE_PRIMARY if is_prim else ROLE_STANDBY
-
-            # Probe connections and activity (Client backends only on PG10+)
-            if client.version_tuple >= (10, 0):
-                c_sql = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';"
-            else:
-                c_sql = "SELECT count(*) FROM pg_stat_activity;"
-            c_row = client.query_one(c_sql)
-            if c_row and c_row[0] is not None:
-                conns = safe_int(c_row[0])
-                max_conn = safe_int(client.settings.get("max_connections", 100), default=100)
-                c_pct = round(100.0 * conns / max_conn, 2) if max_conn > 0 else 0.0
-                row_res["conn_pct"] = c_pct
-
-            # Timeline
-            if row_res["timeline"] == 0 and client.requires("pg_control_checkpoint"):
-                tl_row = client.query_one("SELECT timeline_id FROM pg_control_checkpoint();")
-                if tl_row and tl_row[0]:
-                    row_res["timeline"] = safe_int(tl_row[0])
-
-            # Standby specific lag
-            if not is_prim:
-                lag_row = client.query_one("SELECT extract(epoch from (now() - pg_last_xact_replay_timestamp()));")
-                if lag_row and lag_row[0] is not None:
-                    row_res["replay_lag_s"] = round(max(0.0, safe_float(lag_row[0])), 2)
-
-                if client.requires("pg_wal_lsn_diff"):
-                    b_row = client.query_one("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
-                else:
-                    b_row = client.query_one("SELECT pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location());")
-                if b_row and b_row[0] is not None:
-                    row_res["replay_lag_bytes"] = safe_int(b_row[0])
-
-                # Check if delayed replica (recovery_min_apply_delay is GUC parameter only in PG 12+)
-                if client.version_tuple >= (12, 0):
-                    delay_row = client.query_one("SHOW recovery_min_apply_delay;")
-                    if delay_row and delay_row[0] and delay_row[0] != "0":
-                        row_res["role"] = ROLE_DELAYED
-
-                # Check if cascading replica (standby with downstream streaming replicas)
-                casc_row = client.query_one("SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';")
-                if casc_row and safe_int(casc_row[0]) > 0:
-                    row_res["role"] = ROLE_CASCADING
-
-            # Per-node snapshot details
-            row_res["version_num"] = safe_int(client.version_num)
-            up_row = client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()))::int;")
-            if up_row and up_row[0] is not None:
-                row_res["uptime_s"] = safe_int(up_row[0])
-            act_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active';")
-            if act_q and act_q[0] is not None:
-                row_res["active_queries"] = safe_int(act_q[0])
-            idle_q = client.query_one("SELECT count(*) FROM pg_stat_activity WHERE state LIKE 'idle in transaction%';")
-            if idle_q and idle_q[0] is not None:
-                row_res["idle_in_txn"] = safe_int(idle_q[0])
-            lq = client.query_one("SELECT coalesce(max(extract(epoch from (now() - query_start)))::int, 0) FROM pg_stat_activity WHERE state = 'active';")
-            if lq and lq[0] is not None:
-                row_res["longest_query_s"] = safe_int(lq[0])
-
-            # Oldest active transaction age in seconds
-            xa_row = client.query_one("SELECT coalesce(max(extract(epoch from (now() - xact_start)))::int, 0) FROM pg_stat_activity WHERE xact_start IS NOT NULL;")
-            if xa_row and xa_row[0] is not None:
-                row_res["xact_age_s"] = safe_int(xa_row[0])
-
-            # Temp bytes from database stats
-            tb_row = client.query_one("SELECT coalesce(sum(temp_bytes)::bigint, 0) FROM pg_stat_database;")
-            if tb_row and tb_row[0] is not None:
-                row_res["temp_bytes"] = safe_int(tb_row[0])
-
-            # Dead tuples from user tables
-            dt_row = client.query_one("SELECT coalesce(sum(n_dead_tup)::bigint, 0) FROM pg_stat_user_tables;")
-            if dt_row and dt_row[0] is not None:
-                row_res["dead_tuples"] = safe_int(dt_row[0])
-        else:
-            row_res["status"] = STATUS_DOWN
-            # Patroni and pg_stat_replication both report member lag in BYTES.
-            # It must not be written into replay_lag_s, which is seconds.
-            if spec.get("patroni_lag_bytes") is not None:
-                row_res["replay_lag_bytes"] = safe_int(spec.get("patroni_lag_bytes"))
-            if p_state_int in (PATRONI_STATE_STOPPED, PATRONI_STATE_CRASHED):
-                row_res["status_reason"] = "stopped (Patroni)"
-            else:
-                row_res["status_reason"] = client.warnings[-1][:100] if client.warnings else "unreachable"
-            row_res["auth_failed"] = getattr(client, "auth_failed", False)
-            row_res["auth_error"] = getattr(client, "auth_error", "")
-            row_res["client_warnings"] = list(client.warnings)
-
-            # Stopped node must not automatically be classified as a replica
-            # Use last known role from prev_state only if trustworthy, otherwise ROLE_UNKNOWN
-            prev_info = prev_state.get("nodes", {}).get(n_name, {})
-            last_r = prev_info.get("last_role")
-            if last_r and (t0 - float(prev_info.get("ts_ok", 0))) <= 3600:
-                row_res["role"] = last_r
-            else:
-                row_res["role"] = ROLE_UNKNOWN
-
-        return row_res
 
     # Fan out probes with DaemonThreadPoolExecutor bounded by cycle_deadline
     workers_count = min(16, max(len(node_specs), 1))
     executor = DaemonThreadPoolExecutor(max_workers=workers_count)
-    future_map = {executor.submit(probe_single_node, spec): spec for spec in node_specs}
+    future_map = {
+        executor.submit(probe_node, spec, conn_cfg, prev_state, t0): spec
+        for spec in node_specs
+    }
 
     time_spent = time.time() - t0
     remaining_probe_time = max(1.0, cycle_deadline - time_spent - 5.0)
