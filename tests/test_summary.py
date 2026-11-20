@@ -426,7 +426,7 @@ class TestDynamicClusterThresholds(unittest.TestCase):
         self.assertTrue(h.severity >= 2)
 
 
-class TestHAProxySeedDiscovery(unittest.TestCase):
+class TestProxyStatsParsing(unittest.TestCase):
     """Verifies HAProxy seed endpoint deduction and CSV status parsing."""
 
     def test_fetch_haproxy_stats_parses_csv(self):
@@ -451,7 +451,7 @@ class TestHAProxySeedDiscovery(unittest.TestCase):
             self.assertEqual(stats["primary_be"]["pg-node1"], "DOWN")
             self.assertEqual(stats["replica_be"]["pg-node2"], "UP")
 
-    def test_discover_primary_via_proxy_deduction(self):
+    def test_discover_cluster_via_sql_deduction(self):
         """Mocks NodeClient to test primary deduction from pg_stat_replication."""
         from unittest.mock import patch, MagicMock
         mock_client = MagicMock()
@@ -471,9 +471,9 @@ class TestHAProxySeedDiscovery(unittest.TestCase):
 
         with patch.object(pc, "NodeClient", return_value=mock_client), \
              patch.object(pc, "fetch_haproxy_stats", return_value={}):
-            ok, p_spec, sb_specs, msg = pc.discover_primary_via_proxy(
-                proxy_host="127.0.0.1",
-                proxy_port=5500,
+            ok, p_spec, sb_specs, msg = pc.discover_cluster_via_sql(
+                seed_host="127.0.0.1",
+                seed_port=5500,
                 username="site24x7",
                 password="pw",
                 dbname="postgres",
@@ -493,5 +493,107 @@ class TestHAProxySeedDiscovery(unittest.TestCase):
             self.assertEqual(sb_names, {"pg-node1", "pg-node2"})
 
 
+class TestSqlOnlyDiscovery(unittest.TestCase):
+    """Discovery must work with no HA manager and no proxy: plain streaming replication."""
+
+    def _client(self, is_recovery, query_one, query_all):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.connect.return_value = True
+        c.is_recovery = is_recovery
+        c.requires.return_value = True
+        c.system_identifier = "7100000000000000001"
+        c.query_one.side_effect = query_one if callable(query_one) else (lambda *a, **k: query_one)
+        c.query_all.return_value = query_all
+        return c
+
+    def test_plain_streaming_pair_no_haproxy_no_patroni(self):
+        """Two-node streaming pair, seed = primary, no proxy stats, no Patroni.
+
+        This is the case that used to fall through to 'single node': HAProxy discovery
+        was only attempted when a stats endpoint answered, and Patroni discovery needs
+        Patroni. Topology must now come from pg_stat_replication alone.
+        """
+        from unittest.mock import patch
+        client = self._client(
+            is_recovery=False,
+            query_one=("", "10.0.0.1", "5432"),
+            query_all=[("pgstandby", "10.0.0.2", 50102, "async", 0, 4096)],
+        )
+        with patch.object(pc, "NodeClient", return_value=client):
+            ok, p_spec, sb_specs, msg = pc.discover_cluster_via_sql(
+                seed_host="10.0.0.1", seed_port=5432,
+                username="site24x7", password="pw", dbname="postgres",
+                address_map={},          # no operator aliases
+                stats_port=0,            # no proxy stats endpoint at all
+            )
+        self.assertTrue(ok, msg)
+        self.assertEqual(p_spec["name"], "10.0.0.1:5432")
+        self.assertEqual((p_spec["host"], p_spec["port"]), ("10.0.0.1", 5432))
+        self.assertEqual(len(sb_specs), 1)
+        self.assertEqual(sb_specs[0]["name"], "pgstandby")
+        # Lag from pg_stat_replication is bytes and must be labelled as bytes.
+        self.assertEqual(sb_specs[0]["patroni_lag_bytes"], 4096)
+        self.assertNotIn("patroni_lag", sb_specs[0])
+
+    def test_seed_is_a_standby_follows_upstream_to_primary(self):
+        """Pointing the plugin at a standby must still find the whole cluster."""
+        from unittest.mock import patch
+        standby = self._client(
+            is_recovery=True,
+            query_one=("10.0.0.1", 5432),   # pg_stat_wal_receiver -> upstream
+            query_all=[],
+        )
+        primary = self._client(
+            is_recovery=False,
+            query_one=("", "10.0.0.1", "5432"),
+            query_all=[("pgstandby", "10.0.0.2", 50102, "sync", 1, 0)],
+        )
+        seq = [standby, primary]
+        with patch.object(pc, "NodeClient", side_effect=lambda *a, **k: seq.pop(0)):
+            ok, p_spec, sb_specs, msg = pc.discover_cluster_via_sql(
+                seed_host="10.0.0.2", seed_port=5432,
+                username="site24x7", password="pw", dbname="postgres",
+                address_map={}, stats_port=0,
+            )
+        self.assertTrue(ok, msg)
+        self.assertIn("followed upstream", msg)
+        self.assertEqual((p_spec["host"], p_spec["port"]), ("10.0.0.1", 5432))
+        self.assertEqual(len(sb_specs), 1)
+
+    def test_standby_with_no_wal_receiver_fails_clearly(self):
+        """A standby that is not streaming cannot locate the primary: say so plainly."""
+        from unittest.mock import patch
+        orphan = self._client(is_recovery=True, query_one=None, query_all=[])
+        with patch.object(pc, "NodeClient", return_value=orphan):
+            ok, p_spec, sb_specs, msg = pc.discover_cluster_via_sql(
+                seed_host="10.0.0.2", seed_port=5432,
+                username="site24x7", password="pw", dbname="postgres",
+                address_map={}, stats_port=0,
+            )
+        self.assertFalse(ok)
+        self.assertIsNone(p_spec)
+        self.assertIn("no active WAL receiver", msg)
+
+    def test_proxy_stats_only_consulted_when_a_stats_port_is_given(self):
+        """fetch_haproxy_stats must not be called when stats_port is 0."""
+        from unittest.mock import patch, MagicMock
+        client = self._client(
+            is_recovery=False,
+            query_one=("", "10.0.0.1", "5432"),
+            query_all=[],
+        )
+        spy = MagicMock(return_value={})
+        with patch.object(pc, "NodeClient", return_value=client), \
+             patch.object(pc, "fetch_haproxy_stats", spy):
+            pc.discover_cluster_via_sql(
+                seed_host="10.0.0.1", seed_port=5432,
+                username="u", password="p", dbname="postgres",
+                address_map={}, stats_port=0,
+            )
+        spy.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
+

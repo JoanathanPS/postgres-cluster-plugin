@@ -2203,37 +2203,13 @@ def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, stats_uri: str 
     return result
 
 
-def discover_primary_via_proxy(
-    proxy_host: str,
-    proxy_port: int,
-    username: str,
-    password: str,
-    dbname: str,
-    address_map: Dict[str, str],
-    sslmode: str = "prefer",
-    sslrootcert: str = "",
-    sslcert: str = "",
-    sslkey: str = "",
-    connect_timeout: int = 3,
-    haproxy_stats_port: int = 7000,
-    haproxy_stats_uri: str = "/;csv",
-    read_port: int = 0,
-    node_ports: Optional[List[int]] = None,
-) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
-    """
-    Connects to HAProxy primary write port (e.g. 5000 / 5500) to discover the active
-    leader and all attached standby nodes from pg_stat_replication.
-
-    Returns:
-      (success, primary_spec, standby_specs, message)
-    """
-    if not proxy_host or not proxy_port:
-        return False, None, [], "no proxy host/port specified"
-
-    client = NodeClient(
-        name="haproxy_primary_seed",
-        host=proxy_host,
-        port=proxy_port,
+def _seed_client(host, port, username, password, dbname, sslmode,
+                 sslrootcert, sslcert, sslkey, connect_timeout, name="discovery_seed"):
+    """Builds a short-lived NodeClient used only for topology discovery."""
+    return NodeClient(
+        name=name,
+        host=host,
+        port=port,
         user=username,
         password=password,
         dbname=dbname,
@@ -2244,52 +2220,111 @@ def discover_primary_via_proxy(
         connect_timeout=connect_timeout,
         statement_timeout_ms=3000,
     )
+
+
+def discover_cluster_via_sql(
+    seed_host: str,
+    seed_port: int,
+    username: str,
+    password: str,
+    dbname: str,
+    address_map: Dict[str, str],
+    sslmode: str = "prefer",
+    sslrootcert: str = "",
+    sslcert: str = "",
+    sslkey: str = "",
+    connect_timeout: int = 3,
+    stats_port: int = 0,
+    stats_uri: str = "/;csv",
+    read_port: int = 0,
+    node_ports: Optional[List[int]] = None,
+    _follow_depth: int = 0,
+) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """
+    Discovers cluster topology from any reachable PostgreSQL endpoint, using SQL only.
+
+    This works against plain streaming replication, a VIP, a floating IP, or an
+    HAProxy/pgpool write port. No HA manager and no proxy stats endpoint is required:
+    a proxy, when present, is used only to put a friendly name on the primary.
+
+    Steps:
+      1. Connect to the seed endpoint.
+      2. If the seed turns out to be a standby, follow pg_stat_wal_receiver upstream
+         to the primary and retry once, so any node may be given as the seed.
+      3. Read the primary's own identity (inet_server_addr, port, cluster_name).
+      4. Read pg_stat_replication for every attached standby.
+      5. Name the primary from proxy stats when reachable, else from address_map,
+         else cluster_name, else its own address.
+
+    Returns (success, primary_spec, standby_specs, message).
+    """
+    if not seed_host or not seed_port:
+        return False, None, [], "no seed host/port specified"
+
+    client = _seed_client(seed_host, seed_port, username, password, dbname,
+                          sslmode, sslrootcert, sslcert, sslkey, connect_timeout)
     if not client.connect():
         warn = client.warnings[0] if client.warnings else "connection failed"
-        return False, None, [], f"failed to connect to proxy seed {proxy_host}:{proxy_port} ({warn})"
+        return False, None, [], f"seed {seed_host}:{seed_port} unreachable ({warn})"
 
     try:
-        # 1. Verify this is the writable primary (not in recovery)
+        # 2. Seed is a standby: follow its upstream to the primary and retry once.
         if client.is_recovery:
-            return False, None, [], f"proxy {proxy_host}:{proxy_port} connected to node in recovery (standby)"
+            if _follow_depth >= 1:
+                return False, None, [], (
+                    f"seed {seed_host}:{seed_port} is a standby and its upstream is also "
+                    f"in recovery; give the primary or a cascading root as the seed"
+                )
+            up = None
+            if client.requires("pg_stat_wal_receiver"):
+                up = client.query_one(
+                    "SELECT sender_host, sender_port FROM pg_stat_wal_receiver;"
+                )
+            if not up or not up[0]:
+                return False, None, [], (
+                    f"seed {seed_host}:{seed_port} is a standby with no active WAL receiver; "
+                    f"cannot locate the primary from it"
+                )
+            up_host = normalize_host(str(up[0]))
+            up_port = safe_int(up[1], default=5432)
+            client.close()
+            # The upstream address is as the standby sees it, so translate it the same
+            # way as any other discovered endpoint before dialling it.
+            m_host, m_port = resolve_mapped_endpoint(
+                name="", host=up_host, port=up_port,
+                address_map=address_map, cluster_host="", node_ports=None,
+            )
+            return discover_cluster_via_sql(
+                seed_host=m_host, seed_port=m_port,
+                username=username, password=password, dbname=dbname,
+                address_map=address_map, sslmode=sslmode, sslrootcert=sslrootcert,
+                sslcert=sslcert, sslkey=sslkey, connect_timeout=connect_timeout,
+                stats_port=stats_port, stats_uri=stats_uri, read_port=read_port,
+                node_ports=node_ports, _follow_depth=_follow_depth + 1,
+            )
 
-        # 2. Discover primary identity
-        ident_row = client.query_one("""
-            SELECT 
-                coalesce(current_setting('cluster_name', true), ''),
-                coalesce(inet_server_addr()::text, ''),
-                current_setting('port', true)
-        """)
+        # 3. Primary identity.
+        ident_row = client.query_one(
+            "SELECT coalesce(current_setting('cluster_name', true), ''), "
+            "coalesce(inet_server_addr()::text, ''), "
+            "current_setting('port', true);"
+        )
         c_name = ident_row[0] if ident_row and len(ident_row) > 0 and ident_row[0] else ""
-        s_addr = ident_row[1] if ident_row and len(ident_row) > 1 and ident_row[1] else proxy_host
+        s_addr = ident_row[1] if ident_row and len(ident_row) > 1 and ident_row[1] else seed_host
         if "/" in s_addr:
             s_addr = s_addr.split("/")[0]
-        s_port = safe_int(ident_row[2] if ident_row and len(ident_row) > 2 else proxy_port, default=5432)
+        s_port = safe_int(ident_row[2] if ident_row and len(ident_row) > 2 else seed_port,
+                          default=5432)
 
-        # 3. Query pg_stat_replication for all attached standbys
-        if client.requires("pg_wal_lsn_diff"):
-            rep_sql = """
-                SELECT 
-                    application_name, 
-                    coalesce(client_addr::text, ''), 
-                    client_port, 
-                    sync_state, 
-                    sync_priority,
-                    coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0) AS replay_lag_bytes
-                FROM pg_stat_replication;
-            """
-        else:
-            rep_sql = """
-                SELECT 
-                    application_name, 
-                    coalesce(client_addr::text, ''), 
-                    client_port, 
-                    sync_state, 
-                    sync_priority,
-                    coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location), 0) AS replay_lag_bytes
-                FROM pg_stat_replication;
-            """
-        rep_rows = client.query_all(rep_sql) or []
+        # 4. Attached standbys.
+        lag_expr = ("coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)"
+                    if client.requires("pg_wal_lsn_diff")
+                    else "coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location), 0)")
+        rep_rows = client.query_all(
+            "SELECT application_name, coalesce(client_addr::text, ''), client_port, "
+            "sync_state, sync_priority, " + lag_expr + " AS replay_lag_bytes "
+            "FROM pg_stat_replication;"
+        ) or []
 
         standby_specs: List[Dict[str, Any]] = []
         standby_names: Set[str] = set()
@@ -2298,7 +2333,6 @@ def discover_primary_via_proxy(
             c_addr = str(r[1] or "").strip()
             if "/" in c_addr:
                 c_addr = c_addr.split("/")[0]
-            c_port = safe_int(r[2], default=5432)
             sync_st = str(r[3] or "async").strip()
             lag_b = safe_int(r[5], default=0)
 
@@ -2307,7 +2341,7 @@ def discover_primary_via_proxy(
                 host=c_addr or app_name,
                 port=5432,
                 address_map=address_map,
-                cluster_host=proxy_host,
+                cluster_host=seed_host,
                 node_ports=node_ports,
                 node_index=r_idx + 1,
             )
@@ -2320,33 +2354,30 @@ def discover_primary_via_proxy(
                 "patroni_role": "standby",
                 "patroni_state": PATRONI_STATE_RUNNING,
                 "patroni_tl": 0,
-                "patroni_lag": lag_b,
+                "patroni_lag_bytes": lag_b,
                 "sync_state": sync_st,
             })
 
-        # 4. Resolve Primary Name:
-        # Check HAProxy stats if available
+        # 5. Name the primary. A proxy stats endpoint is a convenience, not a dependency.
         primary_name = ""
-        hp_stats = fetch_haproxy_stats(proxy_host, stats_port=haproxy_stats_port, stats_uri=haproxy_stats_uri)
-        for px_name, sv_dict in hp_stats.items():
-            if any(k in px_name.lower() for k in ("primary", "master", "write")):
-                for sv_name, sv_st in sv_dict.items():
-                    if sv_st == "UP" and sv_name not in ("FRONTEND", "BACKEND"):
-                        primary_name = sv_name
-                        break
-            if primary_name:
-                break
+        if stats_port > 0:
+            for px_name, sv_dict in fetch_haproxy_stats(
+                seed_host, stats_port=stats_port, stats_uri=stats_uri
+            ).items():
+                if any(k in px_name.lower() for k in ("primary", "master", "write")):
+                    for sv_name, sv_st in sv_dict.items():
+                        if sv_st == "UP" and sv_name not in ("FRONTEND", "BACKEND"):
+                            primary_name = sv_name
+                            break
+                if primary_name:
+                    break
 
-        # If HAProxy stats port not reachable, deduce by subtraction from known nodes
         if not primary_name:
-            known_aliases: List[str] = []
+            # Deduce by subtraction from the aliases the operator declared.
             for k in address_map:
                 alias = k.split(":")[0]
-                if alias not in known_aliases:
-                    known_aliases.append(alias)
-            for a in known_aliases:
-                if a not in standby_names:
-                    primary_name = a
+                if alias and alias not in standby_names:
+                    primary_name = alias
                     break
 
         if not primary_name:
@@ -2357,7 +2388,7 @@ def discover_primary_via_proxy(
             host=s_addr,
             port=s_port,
             address_map=address_map,
-            cluster_host=proxy_host,
+            cluster_host=seed_host,
             node_ports=node_ports,
             node_index=0,
         )
@@ -2369,23 +2400,29 @@ def discover_primary_via_proxy(
             "patroni_role": "primary",
             "patroni_state": PATRONI_STATE_RUNNING,
             "patroni_tl": 0,
-            "patroni_lag": 0,
+            "patroni_lag_bytes": 0,
             "system_identifier": getattr(client, "system_identifier", ""),
         }
 
+        # A read endpoint is only worth probing when the primary reports no standbys
+        # of its own (e.g. a proxy hides them behind a single read address).
         if not standby_specs and read_port > 0:
             standby_specs.append({
-                "name": f"proxy_standby_{read_port}",
-                "host": proxy_host,
+                "name": f"read_endpoint_{read_port}",
+                "host": seed_host,
                 "port": read_port,
                 "patroni_role": "standby",
                 "patroni_state": PATRONI_STATE_RUNNING,
                 "patroni_tl": 0,
-                "patroni_lag": 0,
+                "patroni_lag_bytes": 0,
                 "sync_state": "unknown",
             })
 
-        return True, primary_spec, standby_specs, f"discovered primary {primary_name} ({p_host}:{p_port}) and {len(standby_specs)} standbys via proxy {proxy_host}:{proxy_port}"
+        followed = " (followed upstream from a standby)" if _follow_depth else ""
+        return True, primary_spec, standby_specs, (
+            f"discovered primary {primary_name} ({p_host}:{p_port}) and "
+            f"{len(standby_specs)} standby(s) by SQL from {seed_host}:{seed_port}{followed}"
+        )
     finally:
         client.close()
 
@@ -3001,6 +3038,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     prev_state = store.load()
     new_state: Dict[str, Any] = {"nodes": dict(prev_state.get("nodes") or {})}
 
+    all_warnings: List[str] = []
     discovered_members: List[Dict[str, Any]] = []
     cluster_manager = 0  # 0=unknown, 1=Patroni, 2=repmgr, 3=Native
     cluster_manager_str = "unknown"
@@ -3046,21 +3084,65 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             stats_uri=discovery_uri,
         )
 
-    # 1. PRIMARY DISCOVERY: HAProxy Discovery (Write Port & Stats CSV)
-    # Automatically try standard HAProxy write ports (5000, 5500) if cluster_host is given
-    use_haproxy_seed = bool(seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes)
-    if use_haproxy_seed:
-        hp_h = proxy_host or cluster_host or seed_host or "127.0.0.1"
-        if write_port:
-            candidate_ports = [write_port]
-        elif hp_stats:
-            candidate_ports = [5000, 5500]
-        else:
-            candidate_ports = []
-        for hp_p in candidate_ports:
-            hp_ok, p_spec, sb_specs, hp_msg = discover_primary_via_proxy(
-                proxy_host=hp_h,
-                proxy_port=hp_p,
+    # -------------------------------------------------------------------------
+    # TOPOLOGY DISCOVERY
+    #
+    # Ordered by how authoritative the source is, not by how exotic it is:
+    #
+    #   1. Patroni REST  -- exact names, roles, states, timelines and failover
+    #                       history. Authoritative whenever Patroni is present.
+    #   2. SQL from seed -- pg_stat_replication / pg_stat_wal_receiver from any
+    #                       reachable endpoint. Covers plain streaming replication,
+    #                       a VIP, a floating IP, HAProxy or pgpool. Needs no HA
+    #                       manager and no proxy stats endpoint.
+    #   3. Explicit list -- whatever the operator configured in `nodes`.
+    #   4. Single node   -- the configured cluster_host on its own.
+    #
+    # Only step 1 requires Patroni and only the optional naming lookup inside
+    # step 2 touches a proxy, so a bare two-node streaming pair is fully supported.
+    # -------------------------------------------------------------------------
+    can_discover = bool(seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes)
+
+    # 1. Patroni REST API (/cluster & /history)
+    patroni_probe_status = "not_applicable"
+    patroni_endpoint_used = None
+    if can_discover:
+        patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
+            seed_host=seed_host,
+            seed_port=patroni_port,
+            address_map=address_map,
+            prev_state=prev_state,
+            raw_nodes=raw_nodes,
+            timeout=1.0,
+            patroni_ports=patroni_ports,
+        )
+        if patroni_probe_status == "positive":
+            cluster_manager = TOPOLOGY_PATRONI
+            cluster_manager_str = "patroni"
+            payload["Topology_Type"] = TOPOLOGY_PATRONI
+            if patroni_data and "members" in patroni_data:
+                discovered_members = patroni_data.get("members", [])
+            if patroni_endpoint_used:
+                eps = list(prev_state.get("patroni_endpoints") or [])
+                if patroni_endpoint_used not in eps:
+                    eps.insert(0, patroni_endpoint_used)
+                new_state["patroni_endpoints"] = eps[:5]
+
+    # 2. SQL topology discovery from the seed endpoint.
+    # Candidates: an explicitly configured write/proxy port, then the plain
+    # PostgreSQL port, then the conventional HAProxy write ports -- but those last
+    # two only when a proxy stats endpoint actually answered, so we never dial
+    # 5000/5500 speculatively on a host that has no proxy.
+    if can_discover and not discovered_members:
+        seed_h = proxy_host or cluster_host or seed_host or "127.0.0.1"
+        candidate_ports: List[int] = []
+        for cand in ([write_port] if write_port else []) + [port_default] + ([5000, 5500] if hp_stats else []):
+            if cand and cand not in candidate_ports:
+                candidate_ports.append(cand)
+        for sql_port in candidate_ports:
+            sql_ok, p_spec, sb_specs, sql_msg = discover_cluster_via_sql(
+                seed_host=seed_h,
+                seed_port=sql_port,
                 username=username,
                 password=password,
                 dbname=dbname,
@@ -3070,43 +3152,19 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 sslcert=sslcert,
                 sslkey=sslkey,
                 connect_timeout=2,
-                haproxy_stats_port=discovery_port,
-                haproxy_stats_uri=discovery_uri,
+                stats_port=discovery_port if hp_stats else 0,
+                stats_uri=discovery_uri,
                 read_port=read_port,
                 node_ports=node_ports,
             )
-            if hp_ok and p_spec:
+            if sql_ok and p_spec:
                 node_specs = [p_spec] + sb_specs
-                cluster_manager = TOPOLOGY_PATRONI
-                cluster_manager_str = "haproxy"
-                payload["Topology_Type"] = TOPOLOGY_PATRONI
+                # The real manager is identified later by probe_cluster_managers()
+                # against a live connection; do not guess it from the port used.
+                all_warnings.append(f"discovery: {sql_msg}")
                 break
-
-    # 2. Patroni REST API (/cluster & /history)
-    patroni_probe_status = "not_applicable"
-    patroni_endpoint_used = None
-    if seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes:
-        if not node_specs or patroni_ports or patroni_port:
-            patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
-                seed_host=seed_host,
-                seed_port=patroni_port,
-                address_map=address_map,
-                prev_state=prev_state,
-                raw_nodes=raw_nodes,
-                timeout=1.0,
-                patroni_ports=patroni_ports,
-            )
-            if patroni_probe_status == "positive":
-                cluster_manager = TOPOLOGY_PATRONI
-                cluster_manager_str = "patroni"
-                payload["Topology_Type"] = TOPOLOGY_PATRONI
-                if not node_specs and patroni_data and "members" in patroni_data:
-                    discovered_members = patroni_data.get("members", [])
-                if patroni_endpoint_used:
-                    eps = list(prev_state.get("patroni_endpoints") or [])
-                    if patroni_endpoint_used not in eps:
-                        eps.insert(0, patroni_endpoint_used)
-                    new_state["patroni_endpoints"] = eps[:5]
+            if sql_msg:
+                all_warnings.append(f"discovery: {sql_msg}")
 
     if node_specs:
         pass
@@ -3138,7 +3196,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 "patroni_role": m_role_str,
                 "patroni_state": PATRONI_STATE_MAP.get(m_state_str, PATRONI_STATE_UNKNOWN),
                 "patroni_tl": m_tl,
-                "patroni_lag": m_lag
+                "patroni_lag_bytes": m_lag
             })
 
         # Include any expected cluster members declared in address_map, HAProxy stats, or raw_nodes
@@ -3169,7 +3227,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                                 "patroni_role": "unknown",
                                 "patroni_state": PATRONI_STATE_STOPPED,
                                 "patroni_tl": 0,
-                                "patroni_lag": None,
+                                "patroni_lag_bytes": None,
                             })
                             discovered_names.add(sv_name)
                             discovered_endpoints.add((h_h, h_p))
@@ -3184,7 +3242,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                         "patroni_role": "unknown",
                         "patroni_state": PATRONI_STATE_STOPPED,
                         "patroni_tl": 0,
-                        "patroni_lag": None
+                        "patroni_lag_bytes": None
                     })
                     discovered_names.add(name)
                     discovered_endpoints.add((host, port))
@@ -3207,7 +3265,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                         "patroni_role": "unknown",
                         "patroni_state": PATRONI_STATE_STOPPED,
                         "patroni_tl": 0,
-                        "patroni_lag": None
+                        "patroni_lag_bytes": None
                     })
                     discovered_names.add(n_alias)
                     discovered_endpoints.add((dst_h, dst_p))
@@ -3220,7 +3278,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 "patroni_role": "unknown",
                 "patroni_state": PATRONI_STATE_NA,
                 "patroni_tl": 0,
-                "patroni_lag": 0
+                "patroni_lag_bytes": 0
             })
     elif cluster_host:
         node_specs.append({
@@ -3230,7 +3288,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             "patroni_role": "unknown",
             "patroni_state": PATRONI_STATE_NA,
             "patroni_tl": 0,
-            "patroni_lag": 0
+            "patroni_lag_bytes": 0
         })
     else:
         node_specs.append({
@@ -3240,14 +3298,13 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             "patroni_role": "unknown",
             "patroni_state": PATRONI_STATE_NA,
             "patroni_tl": 0,
-            "patroni_lag": 0
+            "patroni_lag_bytes": 0
         })
 
     # 2. Parallel / Multi-node probing
     node_rows: List[Dict[str, Any]] = []
     primary_client: Optional[NodeClient] = None
     standby_client: Optional[NodeClient] = None
-    all_warnings: List[str] = []
     queries_count = 0
     slot_rows: Optional[List[Tuple]] = []
     rep_rows: Optional[List[Tuple]] = []
@@ -3405,8 +3462,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             row_res["status"] = STATUS_DOWN
             # Patroni and pg_stat_replication both report member lag in BYTES.
             # It must not be written into replay_lag_s, which is seconds.
-            if spec.get("patroni_lag") is not None:
-                row_res["replay_lag_bytes"] = safe_int(spec.get("patroni_lag"))
+            if spec.get("patroni_lag_bytes") is not None:
+                row_res["replay_lag_bytes"] = safe_int(spec.get("patroni_lag_bytes"))
             if p_state_int in (PATRONI_STATE_STOPPED, PATRONI_STATE_CRASHED):
                 row_res["status_reason"] = "stopped (Patroni)"
             else:
