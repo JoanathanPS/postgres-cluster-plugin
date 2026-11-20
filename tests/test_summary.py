@@ -146,115 +146,72 @@ class TestSummaryOperationalMessage(unittest.TestCase):
         self.assertIn("no primary reachable", msg)
         self.assertIn("hint: patronictl list; failover --candidate", msg)
 
-    def test_replication_lag_warning_degraded(self):
-        """High replication lag: DEGRADED c11 with lag details and saturation hint."""
+    def test_replication_lag_is_reported_not_judged(self):
+        """Replay lag no longer sets severity; it is emitted for the console to threshold.
+
+        The plugin used to return WARN whenever lag passed a 60s constant compiled into
+        this file. Max_Replay_Lag_s is emitted every cycle, so the limit belongs in a
+        threshold profile. A primary serving its standbys is available whatever the lag.
+        """
         h = pc.evaluate_cluster_health(
             has_primary=True,
-            primary_name="pg-node3",
+            primary_name="pg1",
             nodes_up=3,
             nodes_total=3,
-            timeline=2,
+            timeline=1,
             primaries_count=1,
             expected_standbys=2,
             streaming_standbys=2,
-            max_replay_lag_s=85.4,
-            replay_warn_s=60.0
+            max_replay_lag_s=900.0,
         )
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
-        self.assertEqual(h.code, pc.HEALTH_CODE_STANDBY_LAG_HIGH)
-
-        msg = h.format_msg()
-        self.assertLessEqual(len(msg), pc.MAX_MSG_CHARS)
-        self.assertTrue(msg.startswith("DEGRADED c11:"))
-        self.assertIn("standby replay lag exceeds threshold (lag: 85.4s)", msg)
-        self.assertIn("hint: check standby I/O saturation", msg)
+        self.assertEqual(h.severity, pc.HEALTH_OK)
+        # The measurement still reaches the operator, in the message context.
+        self.assertIn("900.0s", h.format_msg())
 
 
 class TestFailoverAndRecoverySemantics(unittest.TestCase):
     """Verifies failover detection and unconfirmed vs confirmed recovery semantics."""
 
-    def test_failover_recovery_unconfirmed(self):
-        """When previous primary has not re-joined as a streaming standby, state remains DEGRADED."""
+    def test_failover_recovery_is_not_a_severity(self):
+        """A completed failover is not a fault, so it no longer produces WARN.
+
+        The plugin used to warn for 900s after any promotion, and again whenever it
+        judged the previous primary had not "recovered". Both were guesses layered on
+        Failover_Age_s and Failover_Count_24h, which are emitted and can be alerted on
+        directly. A freshly promoted primary serving writes is healthy.
+        """
         h = pc.evaluate_cluster_health(
             has_primary=True,
-            primary_name="pg-node3",
+            primary_name="pg2",
+            nodes_up=3,
+            nodes_total=3,
+            timeline=5,
+            primaries_count=1,
+            expected_standbys=2,
+            streaming_standbys=2,
+        )
+        self.assertEqual(h.severity, pc.HEALTH_OK)
+        self.assertEqual(h.code, pc.HEALTH_CODE_OK)
+
+    def test_node_still_down_after_failover_is_warn_not_critical(self):
+        """The one node-level condition that survives: an unreachable node is WARN.
+
+        After a promotion the old primary is often still down. That is reported as
+        node-down (severity 1), not as an outage, because the cluster is serving.
+        """
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg2",
             nodes_up=2,
             nodes_total=3,
-            timeline=2,
+            timeline=5,
             primaries_count=1,
             expected_standbys=2,
             streaming_standbys=1,
-            failover_age_s=180,
-            failover_window_s=900,
-            prev_primary_name="pg-node2",
-            prev_primary_recovered=False
-        )
-        # Higher precedence Rule 7 (node down) or Rule 11 (recent failover) triggers WARN
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
-
-        # When all nodes are reachable but previous primary is not streaming (unrecovered)
-        h2 = pc.evaluate_cluster_health(
-            has_primary=True,
-            primary_name="pg-node3",
-            nodes_up=3,
-            nodes_total=3,
-            timeline=2,
-            primaries_count=1,
-            expected_standbys=2,
-            streaming_standbys=1,
-            failover_age_s=1200,  # Expired window
-            failover_window_s=900,
-            prev_primary_name="pg-node2",
-            prev_primary_recovered=False
-        )
-        self.assertEqual(h2.severity, pc.HEALTH_WARN)
-        self.assertEqual(h2.code, pc.HEALTH_CODE_RECENT_FAILOVER)
-        msg2 = h2.format_msg()
-        self.assertIn("failover recovery incomplete: pg-node2 not streaming", msg2)
-        self.assertIn("hint: verify pg-node2 re-joins as standby", msg2)
-
-    def test_failover_recovery_confirmed(self):
-        """When previous primary has successfully re-joined as a streaming replica, recovery is confirmed."""
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primary_name="pg-node3",
-            nodes_up=3,
-            nodes_total=3,
-            timeline=2,
-            primaries_count=1,
-            expected_standbys=2,
-            streaming_standbys=2,
-            failover_age_s=180,
-            failover_window_s=900,
-            prev_primary_name="pg-node2",
-            prev_primary_recovered=True
         )
         self.assertEqual(h.severity, pc.HEALTH_WARN)
-        self.assertEqual(h.code, pc.HEALTH_CODE_RECENT_FAILOVER)
-        msg = h.format_msg()
-        self.assertIn("pg-node2 recovered as standby", msg)
-        self.assertIn("Attention: None", msg)
-
-        # After window expires with confirmed recovery -> Fully HEALTHY (0)
-        h_recovered = pc.evaluate_cluster_health(
-            has_primary=True,
-            primary_name="pg-node3",
-            nodes_up=3,
-            nodes_total=3,
-            timeline=2,
-            primaries_count=1,
-            expected_standbys=2,
-            streaming_standbys=2,
-            failover_age_s=1200,  # Window expired
-            failover_window_s=900,
-            prev_primary_name="pg-node2",
-            prev_primary_recovered=True
-        )
-        self.assertEqual(h_recovered.severity, pc.HEALTH_OK)
-        self.assertEqual(h_recovered.code, pc.HEALTH_CODE_OK)
-        msg_rec = h_recovered.format_msg()
-        self.assertTrue(msg_rec.startswith("HEALTHY c0:"))
-        self.assertIn("primary: pg-node3 | 2/2 streaming (lag: 0.0s)", msg_rec)
+        self.assertEqual(h.code, pc.HEALTH_CODE_NODE_DOWN)
+        self.assertIn("1/2 streaming", h.format_msg())
 
 
 class TestStateStorePersistence(unittest.TestCase):
@@ -318,8 +275,15 @@ class TestDynamicClusterThresholds(unittest.TestCase):
         self.assertFalse(nodes_down >= 1, "Nodes_Down >= 1 must NOT trigger on healthy 2-node cluster")
         self.assertFalse(standby_disconnect_flag == 1, "Standby_Disconnect_Flag must be 0")
 
-    def test_2_node_cluster_standby_down_triggers_critical(self):
-        """In a 2-node cluster, loss of the sole standby leaves 0 standbys streaming -> CRITICAL."""
+    def test_2_node_cluster_standby_down_is_warn_not_critical(self):
+        """Losing the only standby is degraded, not an outage.
+
+        This previously returned CRITICAL via the zero-standbys-streaming rule, which
+        made a serving primary look like downtime and distorted the availability figure
+        in the Site24x7 report. The primary still accepts writes, so it is WARN; the
+        loss is visible through Standbys_Streaming, Standby_Disconnect_Flag and the
+        node row, all of which a threshold profile can alert on.
+        """
         h = pc.evaluate_cluster_health(
             has_primary=True,
             primary_name="pg1",
@@ -329,18 +293,12 @@ class TestDynamicClusterThresholds(unittest.TestCase):
             primaries_count=1,
             expected_standbys=1,
             streaming_standbys=0,
-            max_replay_lag_s=0.0
         )
-        nodes_down = 2 - 1
-        standby_disconnect_flag = 1 if 1 > 0 else 0
-
-        # Rule 3 triggers CRITICAL (0 of 1 streaming)
-        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
-        self.assertEqual(h.code, pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
-        self.assertTrue(h.severity >= 1)
-        self.assertTrue(h.severity >= 2, "Cluster_Health >= 2 must trigger Critical when sole replica is lost")
-        self.assertTrue(nodes_down >= 1)
-        self.assertEqual(standby_disconnect_flag, 1)
+        self.assertEqual(h.severity, pc.HEALTH_WARN)
+        self.assertEqual(h.code, pc.HEALTH_CODE_NODE_DOWN)
+        # Still >= 1, so the user's existing "Trouble" threshold profile keeps firing.
+        self.assertGreaterEqual(h.severity, 1)
+        self.assertLess(h.severity, 2)
 
     def test_3_node_cluster_single_standby_down_triggers_trouble_not_critical(self):
         """In a 3-node cluster, loss of 1 standby leaves 1 standby still streaming -> TROUBLE (DEGRADED)."""
@@ -389,26 +347,22 @@ class TestDynamicClusterThresholds(unittest.TestCase):
         self.assertTrue(nodes_down >= 1)
         self.assertEqual(standby_disconnect_flag, 1)
 
-    def test_high_replication_lag_triggers_trouble(self):
-        """Replication lag > 60s triggers Trouble state while nodes are fully online."""
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primary_name="pg-node3",
-            nodes_up=3,
-            nodes_total=3,
-            timeline=2,
-            primaries_count=1,
-            expected_standbys=2,
-            streaming_standbys=2,
-            max_replay_lag_s=75.5,
-            replay_warn_s=60.0
-        )
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
-        self.assertEqual(h.code, pc.HEALTH_CODE_STANDBY_LAG_HIGH)
-        # Threshold: Max_Replay_Lag_s > 60 triggers Trouble
-        self.assertTrue(75.5 > 60.0)
-        self.assertTrue(h.severity >= 1)
-        self.assertFalse(h.severity >= 2)
+    def test_high_replication_lag_does_not_change_severity(self):
+        """Lag of any size leaves severity at OK when every node is reachable."""
+        for lag in (0.0, 61.0, 3600.0, 86400.0):
+            with self.subTest(lag_s=lag):
+                h = pc.evaluate_cluster_health(
+                    has_primary=True,
+                    primary_name="pg1",
+                    nodes_up=3,
+                    nodes_total=3,
+                    timeline=1,
+                    primaries_count=1,
+                    expected_standbys=2,
+                    streaming_standbys=2,
+                    max_replay_lag_s=lag,
+                )
+                self.assertEqual(h.severity, pc.HEALTH_OK)
 
     def test_primary_loss_triggers_critical(self):
         """Total loss of primary node triggers CRITICAL / DOWN state."""

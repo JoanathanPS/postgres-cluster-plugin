@@ -10,6 +10,7 @@ Exercises:
 
 import os
 import sys
+import inspect
 import unittest
 from unittest.mock import patch, MagicMock
 import socket
@@ -137,39 +138,8 @@ class TestHealthEngine(unittest.TestCase):
         )
         self.assertEqual(h.code, pc.HEALTH_CODE_OK)
 
-    def test_critical_no_standbys_streaming(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            nodes_up=3,
-            nodes_total=3,
-            expected_standbys=2,
-            streaming_standbys=0
-        )
-        self.assertEqual(h.code, pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
-        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
 
-    def test_critical_slot_lost(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            slot_lost=True,
-            nodes_up=3,
-            nodes_total=3
-        )
-        self.assertEqual(h.code, pc.HEALTH_CODE_SLOT_LOST_OR_CRITICAL)
-        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
 
-    def test_critical_xid_wraparound(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            xid_wraparound_pct=96.5,
-            nodes_up=3,
-            nodes_total=3
-        )
-        self.assertEqual(h.code, pc.HEALTH_CODE_XID_CRITICAL)
-        self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
 
     def test_warn_node_down(self):
         h = pc.evaluate_cluster_health(
@@ -184,41 +154,79 @@ class TestHealthEngine(unittest.TestCase):
         self.assertEqual(h.code, pc.HEALTH_CODE_NODE_DOWN)
         self.assertEqual(h.severity, pc.HEALTH_WARN)
 
-    def test_warn_standby_lag_high(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            nodes_up=3,
-            nodes_total=3,
-            max_replay_lag_s=75.0,
-            replay_warn_s=60.0
-        )
-        self.assertEqual(h.code, pc.HEALTH_CODE_STANDBY_LAG_HIGH)
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
 
-    def test_warn_timeline_mismatch(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            nodes_up=3,
-            nodes_total=3,
-            timeline_spread=2
-        )
-        self.assertEqual(h.code, pc.HEALTH_CODE_TIMELINE_MISMATCH)
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
 
-    def test_warn_recent_failover(self):
-        h = pc.evaluate_cluster_health(
-            has_primary=True,
-            primary_name="pg2",
-            primaries_count=1,
-            nodes_up=3,
-            nodes_total=3,
-            failover_age_s=180,
-            failover_window_s=900
+
+    def test_conditions_delegated_to_threshold_profiles_do_not_set_severity(self):
+        """Metric-threshold conditions are the platform's job, not the plugin's.
+
+        These six used to each return their own CRITICAL or WARN from the plugin, which
+        hardcoded the limit (60s lag, 95% XID, 10GB slot retention, a 900s failover
+        window) where no operator could retune it. Every one of them is emitted as a
+        numeric metric, so a Site24x7 threshold profile can judge them instead. The
+        engine must now report OK for all of them, because none affects whether the
+        cluster can serve.
+        """
+        cases = {
+            "zero standbys streaming": dict(expected_standbys=2, streaming_standbys=0),
+            "standby replay lag": dict(max_replay_lag_s=3600.0),
+            "slot retention / lost": dict(),
+            "xid wraparound": dict(),
+            "timeline spread": dict(),
+            "recent failover": dict(),
+        }
+        for label, extra in cases.items():
+            with self.subTest(condition=label):
+                h = pc.evaluate_cluster_health(
+                    has_primary=True,
+                    primary_name="pg1",
+                    primaries_count=1,
+                    nodes_up=3,
+                    nodes_total=3,
+                    timeline=1,
+                    **extra,
+                )
+                self.assertEqual(
+                    h.severity, pc.HEALTH_OK,
+                    f"{label} must not set severity in the plugin: threshold it in the console",
+                )
+                self.assertEqual(h.code, pc.HEALTH_CODE_OK)
+
+    def test_dropped_conditions_are_not_accepted_as_parameters(self):
+        """The removed knobs must be gone from the signature, not silently ignored.
+
+        A parameter that is accepted and then not acted on is worse than no parameter:
+        a caller believes it is configuring behaviour that no longer exists.
+        """
+        import inspect
+        params = set(inspect.signature(pc.evaluate_cluster_health).parameters)
+        for gone in (
+            "sync_standbys_expected", "sync_standbys_actual", "slot_lost",
+            "max_slot_retained_bytes", "slot_crit_bytes", "slot_warn_bytes",
+            "inactive_slots", "xid_wraparound_pct", "max_replay_backlog_b",
+            "replay_warn_s", "replay_warn_b", "timeline_spread", "failover_age_s",
+            "failover_window_s", "conn_saturation_pct", "archive_failed",
+            "stale_stats", "prev_primary_name", "prev_primary_recovered",
+        ):
+            self.assertNotIn(gone, params, f"{gone} should have been removed")
+
+    def test_severity_scale_is_still_zero_one_two(self):
+        """The 0/1/2 contract must hold: existing threshold profiles key on it.
+
+        The user's console profile alerts on Cluster_Health >= 1 (Trouble) and == 2
+        (Critical). Collapsing to a 0/2 scale would silently stop the Trouble alert
+        firing, so the WARN level is retained even though only node-down produces it.
+        """
+        ok = pc.evaluate_cluster_health(
+            has_primary=True, primaries_count=1, nodes_up=3, nodes_total=3,
         )
-        self.assertEqual(h.code, pc.HEALTH_CODE_RECENT_FAILOVER)
-        self.assertEqual(h.severity, pc.HEALTH_WARN)
+        warn = pc.evaluate_cluster_health(
+            has_primary=True, primaries_count=1, nodes_up=2, nodes_total=3,
+        )
+        crit = pc.evaluate_cluster_health(
+            has_primary=False, primaries_count=0, nodes_up=0, nodes_total=3,
+        )
+        self.assertEqual((ok.severity, warn.severity, crit.severity), (0, 1, 2))
 
     def test_auth_failure_flag_never_reports_primary_down(self):
         h = pc.evaluate_cluster_health(
@@ -682,7 +690,6 @@ class TestRegressionFixes(unittest.TestCase):
             nodes_total=3,
             expected_standbys=2,
             streaming_standbys=2,
-            failover_age_s=empty_payload.get("Failover_Age_s", -1)
         )
         self.assertNotEqual(h.code, pc.HEALTH_CODE_RECENT_FAILOVER)
         self.assertEqual(h.code, pc.HEALTH_CODE_OK)
@@ -697,8 +704,11 @@ class TestRegressionFixes(unittest.TestCase):
             expected_standbys=2,
             streaming_standbys=0
         )
-        self.assertEqual(h_no_sb.code, pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
-        self.assertEqual(h_no_sb.severity, pc.HEALTH_CRITICAL)
+        # Every node reachable and a primary serving: OK. Losing replication is
+        # reported through Standbys_Streaming and Standby_Disconnect_Flag, not by
+        # calling a serving cluster CRITICAL.
+        self.assertEqual(h_no_sb.code, pc.HEALTH_CODE_OK)
+        self.assertEqual(h_no_sb.severity, pc.HEALTH_OK)
 
         # 3. Primary_Timeline default is 0 so PostgreSQL timeline_id can be queried from checkpoint
         self.assertEqual(empty_payload.get("Primary_Timeline"), 0)
@@ -771,9 +781,10 @@ class TestRegressionFixes(unittest.TestCase):
             connected=True,
             auth_failure=False,
             unsupported_version=False,
-            conn_pct=96.0
         )
-        self.assertEqual(h_standalone_high_conn.severity, pc.HEALTH_CRITICAL)
+        # Connection saturation is emitted as Primary_Connection_Pct and thresholded in
+        # the console, so a reachable instance reports OK regardless of its value.
+        self.assertEqual(h_standalone_high_conn.severity, pc.HEALTH_OK)
         # Evaluated availability status:
         status_eval = pc.STATUS_DOWN if (not True or False or False or h_standalone_high_conn.code in (pc.HEALTH_CODE_CONN_FAIL, pc.HEALTH_CODE_AUTH_FAIL, pc.HEALTH_CODE_UNSUPPORTED_VERSION)) else pc.STATUS_UP
         self.assertEqual(status_eval, pc.STATUS_UP)
@@ -810,21 +821,16 @@ class TestRegressionFixes(unittest.TestCase):
             nodes_total=3,
             expected_standbys=2,
             streaming_standbys=2,
-            archive_failed=0
         )
         self.assertEqual(h_ok.severity, pc.HEALTH_OK)
 
-        h_failing = pc.evaluate_cluster_health(
-            has_primary=True,
-            primaries_count=1,
-            nodes_up=3,
-            nodes_total=3,
-            expected_standbys=2,
-            streaming_standbys=2,
-            archive_failed=5
+        # Archiver failures are emitted as Archive_Failed / Primary_Archive_Failed and
+        # thresholded in the console; the plugin no longer assigns a severity to them,
+        # because a failing archiver does not stop the cluster serving.
+        self.assertNotIn(
+            "archive_failed",
+            set(inspect.signature(pc.evaluate_cluster_health).parameters),
         )
-        self.assertEqual(h_failing.code, pc.HEALTH_CODE_ARCHIVE_FAILING)
-        self.assertEqual(h_failing.severity, pc.HEALTH_WARN)
 
     def test_deep_audit_bug_fixes(self):
         """Test verification for latest deep audit bug fixes:

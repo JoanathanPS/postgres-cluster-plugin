@@ -70,8 +70,6 @@ class TestStandaloneHealthEngine(unittest.TestCase):
             is_recovery=False,
             uptime_s=3600,
             active_queries=2,
-            conn_pct=15.0,
-            xid_wraparound_pct=5.0
         )
         self.assertEqual(h.severity, pc.HEALTH_OK)
         self.assertEqual(h.code, pc.HEALTH_CODE_OK)
@@ -83,8 +81,6 @@ class TestStandaloneHealthEngine(unittest.TestCase):
             is_recovery=True,
             uptime_s=1800,
             active_queries=1,
-            conn_pct=10.0,
-            xid_wraparound_pct=2.0
         )
         self.assertEqual(h.severity, pc.HEALTH_OK)
         self.assertEqual(h.code, pc.HEALTH_CODE_OK)
@@ -117,35 +113,24 @@ class TestStandaloneHealthEngine(unittest.TestCase):
         self.assertEqual(h.severity, pc.HEALTH_CRITICAL)
         self.assertEqual(h.code, pc.HEALTH_CODE_UNSUPPORTED_VERSION)
 
-    def test_standalone_xid_wraparound_warnings(self):
-        h_warn = pc.evaluate_database_health(
-            connected=True,
-            xid_wraparound_pct=75.0
-        )
-        self.assertEqual(h_warn.severity, pc.HEALTH_WARN)
-        self.assertEqual(h_warn.code, pc.HEALTH_CODE_XID_WARN)
+    def test_resource_thresholds_are_not_judged_by_the_plugin(self):
+        """XID wraparound and connection saturation belong in a threshold profile.
 
-        h_crit = pc.evaluate_database_health(
-            connected=True,
-            xid_wraparound_pct=92.0
-        )
-        self.assertEqual(h_crit.severity, pc.HEALTH_CRITICAL)
-        self.assertEqual(h_crit.code, pc.HEALTH_CODE_XID_CRITICAL)
+        Both used to return WARN/CRITICAL from here against percentages hardcoded in
+        this file (70/90 and 90/95). They are emitted as Primary_XID_Wrap_Pct and
+        Primary_Connection_Pct, so an operator can set a limit that suits their
+        workload. A reachable instance is available regardless of either value.
+        """
+        h = pc.evaluate_database_health(connected=True, uptime_s=3600, active_queries=1)
+        self.assertEqual(h.severity, pc.HEALTH_OK)
+        self.assertEqual(h.code, pc.HEALTH_CODE_OK)
 
-    def test_standalone_conn_saturation_warnings(self):
-        h_warn = pc.evaluate_database_health(
-            connected=True,
-            conn_pct=91.0
-        )
-        self.assertEqual(h_warn.severity, pc.HEALTH_WARN)
-        self.assertEqual(h_warn.code, pc.HEALTH_CODE_HIGH_CONNECTIONS)
+        import inspect
+        params = set(inspect.signature(pc.evaluate_database_health).parameters)
+        for gone in ("conn_pct", "xid_wraparound_pct", "longest_query_s", "archive_failed"):
+            self.assertNotIn(gone, params, f"{gone} should have been removed")
 
-        h_crit = pc.evaluate_database_health(
-            connected=True,
-            conn_pct=96.0
-        )
-        self.assertEqual(h_crit.severity, pc.HEALTH_CRITICAL)
-        self.assertEqual(h_crit.code, pc.HEALTH_CODE_HIGH_CONNECTIONS)
+
 
 
 class TestStandaloneScenarios(unittest.TestCase):

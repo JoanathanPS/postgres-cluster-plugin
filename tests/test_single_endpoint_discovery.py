@@ -355,7 +355,14 @@ class TestSingleEndpointDiscoveryScenarios(unittest.TestCase):
         self.assertEqual(res["Primary_Up"], 1)
         self.assertEqual(res["Primary_Node"], "pg-node1")
         self.assertEqual(res["Standbys_Streaming"], 0)
-        self.assertEqual(res["Health_Code"], pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
+        # The standbys are unreachable, so this is node-down (WARN), not an outage:
+        # the primary is still serving writes. Standbys_Streaming == 0 and
+        # Standby_Disconnect_Flag == 1 carry the replication loss for the console to
+        # threshold on.
+        self.assertEqual(res["Health_Code"], pc.HEALTH_CODE_NODE_DOWN)
+        self.assertEqual(res["Cluster_Health"], pc.HEALTH_WARN)
+        self.assertEqual(res["status"], pc.STATUS_UP)
+        self.assertEqual(res["Standby_Disconnect_Flag"], 1)
 
     @patch("postgres_cluster.fetch_patroni_cluster")
     @patch("postgres_cluster.NodeClient")

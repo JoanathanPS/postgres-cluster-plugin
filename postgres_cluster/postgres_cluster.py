@@ -92,27 +92,33 @@ HEALTH_OK = 0
 HEALTH_WARN = 1
 HEALTH_CRITICAL = 2
 
-# Health Condition Codes (Stable, alertable, documented)
+# Health condition codes: stable, alertable, documented.
+#
+# A code is part of the published contract, so numbers are never reused. The codes
+# marked RETIRED were emitted by earlier versions for conditions that are now left to
+# Site24x7 threshold profiles (see evaluate_cluster_health). They are kept so the
+# numbering cannot drift onto a different meaning and silently change what an existing
+# alert matches; nothing emits them any more.
 HEALTH_CODE_OK = 0
 HEALTH_CODE_PRIMARY_DOWN = 1
 HEALTH_CODE_SPLIT_BRAIN = 2
-HEALTH_CODE_NO_STANDBYS_STREAMING = 3
-HEALTH_CODE_SYNC_STANDBYS_DEFICIT = 4
-HEALTH_CODE_SLOT_LOST_OR_CRITICAL = 5
-HEALTH_CODE_XID_CRITICAL = 6
+HEALTH_CODE_NO_STANDBYS_STREAMING = 3      # RETIRED: use Standbys_Streaming
+HEALTH_CODE_SYNC_STANDBYS_DEFICIT = 4      # RETIRED: use Sync_Standby_Count
+HEALTH_CODE_SLOT_LOST_OR_CRITICAL = 5      # RETIRED: use Slot_Risk, Max_Slot_Retained_MB
+HEALTH_CODE_XID_CRITICAL = 6               # RETIRED: use XID_Wraparound_Pct
 HEALTH_CODE_NO_FAILOVER_CANDIDATE = 7
 HEALTH_CODE_AUTH_FAIL = 8
 HEALTH_CODE_CONN_FAIL = 9
 
 HEALTH_CODE_NODE_DOWN = 10
-HEALTH_CODE_STANDBY_LAG_HIGH = 11
-HEALTH_CODE_INACTIVE_SLOT_WARN = 12
-HEALTH_CODE_TIMELINE_MISMATCH = 13
-HEALTH_CODE_RECENT_FAILOVER = 14
-HEALTH_CODE_XID_WARN = 15
-HEALTH_CODE_HIGH_CONNECTIONS = 16
-HEALTH_CODE_ARCHIVE_FAILING = 17
-HEALTH_CODE_STALE_STATS = 18
+HEALTH_CODE_STANDBY_LAG_HIGH = 11          # RETIRED: use Max_Replay_Lag_s, Max_Replay_Backlog
+HEALTH_CODE_INACTIVE_SLOT_WARN = 12        # RETIRED: use Inactive_Slots_Count
+HEALTH_CODE_TIMELINE_MISMATCH = 13         # RETIRED: use Timeline_Spread
+HEALTH_CODE_RECENT_FAILOVER = 14           # RETIRED: use Failover_Age_s, Failover_Count_24h
+HEALTH_CODE_XID_WARN = 15                  # RETIRED: use XID_Wraparound_Pct
+HEALTH_CODE_HIGH_CONNECTIONS = 16          # RETIRED: use Primary_Connection_Pct
+HEALTH_CODE_ARCHIVE_FAILING = 17           # RETIRED: use Archive_Failed
+HEALTH_CODE_STALE_STATS = 18               # RETIRED: never emitted
 HEALTH_CODE_UNSUPPORTED_VERSION = 19
 
 # Version Capability Map (query/feature -> minimum version tuple)
@@ -654,7 +660,6 @@ def evaluate_cluster_health(
     has_primary: bool,
     primary_name: str = "",
     primary_last_seen_s: int = 0,
-    primary_last_seen_iso: str = "",
     nodes_up: int = 0,
     nodes_total: int = 0,
     timeline: int = 0,
@@ -662,60 +667,61 @@ def evaluate_cluster_health(
     is_multi_master: bool = False,
     expected_standbys: int = 0,
     streaming_standbys: int = 0,
-    sync_standbys_expected: int = 0,
-    sync_standbys_actual: int = 0,
-    has_failover_candidate: bool = True,
-    slot_lost: bool = False,
-    max_slot_retained_bytes: int = 0,
-    slot_crit_bytes: int = 10 * 1024 * 1024 * 1024,
-    slot_warn_bytes: int = 1024 * 1024 * 1024,
-    inactive_slots: int = 0,
-    xid_wraparound_pct: float = 0.0,
     max_replay_lag_s: float = 0.0,
-    max_replay_backlog_b: int = 0,
-    replay_warn_s: float = 60.0,
-    replay_warn_b: int = 100 * 1024 * 1024,
-    timeline_spread: int = 0,
-    failover_age_s: int = -1,
-    failover_window_s: int = 900,
-    conn_saturation_pct: float = 0.0,
-    archive_failed: int = 0,
-    stale_stats: int = 0,
+    has_failover_candidate: bool = True,
     auth_failure: bool = False,
     auth_msg: str = "",
-    prev_primary_name: str = "",
-    prev_primary_recovered: bool = True,
 ) -> Health:
     """
-    Pure health reasoning engine. Evaluates criteria in strict precedence order:
-    CRITICAL -> WARN -> OK.
+    Decides cluster *availability*. It deliberately does not decide alerting policy.
+
+    Severity is limited to conditions the monitoring platform cannot evaluate for
+    itself -- whether the cluster can accept writes at all, and whether a node is
+    unreachable. Everything of the form "one emitted metric crossed a threshold"
+    (replay lag, slot retention, XID age, connection saturation, archiver failures,
+    timeline spread, inactive slots, failover recency) is left to Site24x7 threshold
+    profiles, where the customer can retune it without editing this file. Every one of
+    those values is still emitted as a numeric metric, so nothing is lost by not
+    judging it here.
+
+    The 0 / 1 / 2 scale is part of the published contract: existing threshold profiles
+    key on Cluster_Health >= 1 (Trouble) and == 2 (Critical), so the WARN level is
+    retained even though only one condition now produces it.
     """
-    # 0. Auth failure is classified separately and MUST NOT masquerade as primary down
+    # CRITICAL: the monitor cannot authenticate, so it can see nothing. Classified
+    # separately so it never masquerades as "primary down".
     if auth_failure:
-        fact_str = auth_msg if auth_msg else "authentication failure on one or more cluster nodes"
         return Health(
             code=HEALTH_CODE_AUTH_FAIL,
             severity=HEALTH_CRITICAL,
-            fact=fact_str,
+            fact=auth_msg or "authentication failure on one or more cluster nodes",
             quantified="auth error",
             context=f"{nodes_up}/{nodes_total} nodes up",
-            hint="check monitor credentials in cfg"
+            hint="check monitor credentials in cfg",
         )
 
-    # 1. CRITICAL: No primary reachable
+    # CRITICAL: no writable primary, so the cluster cannot accept writes.
     if not has_primary or primaries_count == 0:
-        last_seen = f"last seen {primary_name} {primary_last_seen_s}s ago" if primary_name else "no prior primary"
-        cand_hint = "failover --candidate" if has_failover_candidate else "manual recovery needed: no candidate"
+        last_seen = (
+            f"last seen {primary_name} {primary_last_seen_s}s ago"
+            if primary_name else "no prior primary"
+        )
+        cand_hint = (
+            "failover --candidate" if has_failover_candidate
+            else "manual recovery needed: no candidate"
+        )
         return Health(
             code=HEALTH_CODE_PRIMARY_DOWN if has_failover_candidate else HEALTH_CODE_NO_FAILOVER_CANDIDATE,
             severity=HEALTH_CRITICAL,
             fact="no primary reachable",
             quantified=last_seen,
             context=f"{nodes_up}/{nodes_total} nodes up, timeline {timeline}",
-            hint=f"patronictl list; {cand_hint}"
+            hint=f"patronictl list; {cand_hint}",
         )
 
-    # 2. CRITICAL: Split Brain (>1 concurrent writable primaries without active-active mesh)
+    # CRITICAL: two writable primaries outside an active-active mesh means divergent
+    # writes. Not a threshold -- it is categorically broken, and only this plugin is in
+    # a position to see it, because it is the only thing talking to every node at once.
     if primaries_count > 1 and not is_multi_master:
         return Health(
             code=HEALTH_CODE_SPLIT_BRAIN,
@@ -723,58 +729,12 @@ def evaluate_cluster_health(
             fact="split brain detected: multiple concurrent primaries",
             quantified=f"{primaries_count} primaries active",
             context=f"{nodes_up}/{nodes_total} nodes up",
-            hint="fence rogue primary immediately"
+            hint="fence rogue primary immediately",
         )
 
-    # 3. CRITICAL: 0 of N expected standbys streaming
-    if expected_standbys > 0 and streaming_standbys == 0:
-        return Health(
-            code=HEALTH_CODE_NO_STANDBYS_STREAMING,
-            severity=HEALTH_CRITICAL,
-            fact="zero standbys streaming WAL from primary",
-            quantified=f"0/{expected_standbys} streaming",
-            context=f"timeline {timeline}",
-            hint="check standby pg_is_in_recovery() and walsender logs"
-        )
-
-    # 4. CRITICAL: Sync Standbys Deficit
-    if sync_standbys_expected > 0 and sync_standbys_actual < sync_standbys_expected:
-        return Health(
-            code=HEALTH_CODE_SYNC_STANDBYS_DEFICIT,
-            severity=HEALTH_CRITICAL,
-            fact="synchronous standbys below required quorum",
-            quantified=f"{sync_standbys_actual}/{sync_standbys_expected} sync",
-            context="durability compromised",
-            hint="check synchronous_standby_names"
-        )
-
-    # 5. CRITICAL: Slot Lost or Critical WAL Retention
-    if slot_lost or max_slot_retained_bytes >= slot_crit_bytes:
-        retained_mb = round(max_slot_retained_bytes / (1024 * 1024), 1)
-        return Health(
-            code=HEALTH_CODE_SLOT_LOST_OR_CRITICAL,
-            severity=HEALTH_CRITICAL,
-            fact="replication slot lost or retaining dangerous WAL volume",
-            quantified=f"slot WAL: {retained_mb} MB",
-            context="risk of disk exhaustion",
-            hint="pg_drop_replication_slot() or advance standby"
-        )
-
-    # 6. CRITICAL: Transaction ID Wraparound >= 95%
-    if xid_wraparound_pct >= 95.0:
-        return Health(
-            code=HEALTH_CODE_XID_CRITICAL,
-            severity=HEALTH_CRITICAL,
-            fact="urgent: transaction ID wraparound impending",
-            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
-            context="server forced read-only soon",
-            hint="VACUUM FREEZE in single-user mode"
-        )
-
-    # -------------------------------------------------------------------------
-    # WARNINGS
-    # -------------------------------------------------------------------------
-    # 7. WARN: Any Node Down
+    # WARN: a node is unreachable. Kept because it needs no tuning -- a node either
+    # answers or it does not -- and because node reachability is not expressible as a
+    # single metric the platform could threshold on its own.
     if nodes_up < nodes_total:
         ctx = f"primary: {primary_name}"
         if expected_standbys > 0 or streaming_standbys > 0:
@@ -785,120 +745,9 @@ def evaluate_cluster_health(
             fact=f"{nodes_total - nodes_up} cluster node(s) unreachable",
             quantified=f"{nodes_up}/{nodes_total} up",
             context=ctx,
-            hint="inspect offline node postmaster"
+            hint="inspect offline node postmaster",
         )
 
-    # 8. WARN: Standby Lag High
-    if max_replay_lag_s > replay_warn_s or max_replay_backlog_b > replay_warn_b:
-        lag_txt = f"{max_replay_lag_s:.1f}s" if max_replay_lag_s > replay_warn_s else f"{max_replay_backlog_b // (1024*1024)} MB"
-        return Health(
-            code=HEALTH_CODE_STANDBY_LAG_HIGH,
-            severity=HEALTH_WARN,
-            fact="standby replay lag exceeds threshold",
-            quantified=f"lag: {lag_txt}",
-            context=f"threshold: {replay_warn_s}s",
-            hint="check standby I/O saturation"
-        )
-
-    # 9. WARN: Inactive Slot or Warn WAL Retention
-    if inactive_slots > 0 or max_slot_retained_bytes >= slot_warn_bytes:
-        return Health(
-            code=HEALTH_CODE_INACTIVE_SLOT_WARN,
-            severity=HEALTH_WARN,
-            fact=f"{inactive_slots} inactive slot(s) retaining WAL",
-            quantified=f"{max_slot_retained_bytes // (1024*1024)} MB",
-            context="WAL accumulating",
-            hint="verify slot consumer is running"
-        )
-
-    # 10. WARN: Timeline Mismatch
-    if timeline_spread > 0:
-        return Health(
-            code=HEALTH_CODE_TIMELINE_MISMATCH,
-            severity=HEALTH_WARN,
-            fact="timeline disagreement across cluster nodes",
-            quantified=f"spread: {timeline_spread}",
-            context="stale standby on old timeline",
-            hint="pg_rewind standby to primary"
-        )
-
-    # 11. WARN: Recent Failover within Window
-    if 0 < failover_age_s <= failover_window_s:
-        age_m = failover_age_s // 60
-        if not prev_primary_recovered and prev_primary_name:
-            fail_ctx = f"promoted: {primary_name} | previous {prev_primary_name} unrecovered"
-            fail_hint = f"verify {prev_primary_name} re-joins as standby"
-        elif prev_primary_recovered and prev_primary_name:
-            fail_ctx = f"promoted: {primary_name} | {prev_primary_name} recovered as standby"
-            fail_hint = "none"
-        else:
-            fail_ctx = f"promoted: {primary_name}"
-            fail_hint = "verify previous primary re-joined as standby"
-        return Health(
-            code=HEALTH_CODE_RECENT_FAILOVER,
-            severity=HEALTH_WARN,
-            fact="recent failover occurred within warning window",
-            quantified=f"{age_m}m ago",
-            context=fail_ctx,
-            hint=fail_hint
-        )
-
-    # 12. WARN: XID Wraparound >= 70%
-    if xid_wraparound_pct >= 70.0:
-        return Health(
-            code=HEALTH_CODE_XID_WARN,
-            severity=HEALTH_WARN,
-            fact="autovacuum freeze required soon",
-            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
-            context="approaching freeze max age",
-            hint="check autovacuum settings"
-        )
-
-    # 13. WARN: High Connection Saturation >= 90%
-    if conn_saturation_pct >= 90.0:
-        return Health(
-            code=HEALTH_CODE_HIGH_CONNECTIONS,
-            severity=HEALTH_WARN,
-            fact="connection pool near exhaustion",
-            quantified=f"{conn_saturation_pct:.1f}% used",
-            context="max_connections threshold",
-            hint="scale connection pooler (pgBouncer)"
-        )
-
-    # 14. WARN: Archiver Failures Accumulating
-    if archive_failed > 0:
-        return Health(
-            code=HEALTH_CODE_ARCHIVE_FAILING,
-            severity=HEALTH_WARN,
-            fact="WAL archiver errors detected",
-            quantified=f"{archive_failed} failed archives",
-            context="backup continuity at risk",
-            hint="check archive_command script & storage"
-        )
-
-    # 15. WARN: Stale Statistics
-    if stale_stats > 0:
-        return Health(
-            code=HEALTH_CODE_STALE_STATS,
-            severity=HEALTH_WARN,
-            fact="tables with stale statistics detected",
-            quantified=f"{stale_stats} tables",
-            context="query planner degraded",
-            hint="run ANALYZE"
-        )
-
-    # 16. WARN: Unconfirmed Failover Recovery (even if failover_age_s > failover_window_s)
-    if prev_primary_name and not prev_primary_recovered:
-        return Health(
-            code=HEALTH_CODE_RECENT_FAILOVER,
-            severity=HEALTH_WARN,
-            fact=f"failover recovery incomplete: {prev_primary_name} not streaming",
-            quantified="unrecovered standby",
-            context=f"primary: {primary_name}",
-            hint=f"verify {prev_primary_name} re-joins as standby"
-        )
-
-    # Healthy OK State
     ctx = f"primary: {primary_name}"
     if expected_standbys > 0 or streaming_standbys > 0:
         ctx += f" | {streaming_standbys}/{expected_standbys} streaming (lag: {max_replay_lag_s:.1f}s)"
@@ -908,7 +757,7 @@ def evaluate_cluster_health(
         fact=f"Cluster healthy: {nodes_up}/{nodes_total} nodes active",
         quantified=f"timeline {timeline}",
         context=ctx,
-        hint="none"
+        hint="none",
     )
 
 
@@ -954,45 +803,40 @@ def evaluate_database_health(
     auth_msg: str = "",
     unsupported_version: bool = False,
     version_str: str = "",
-    conn_pct: float = 0.0,
-    xid_wraparound_pct: float = 0.0,
     active_queries: int = 0,
-    longest_query_s: int = 0,
     status_reason: str = "",
     is_recovery: bool = False,
     uptime_s: int = 0,
-    archive_failed: int = 0,
 ) -> Health:
     """
-    Health evaluation for standalone PostgreSQL instances.
-    Evaluates database availability, authentication, resource utilization, and version.
-    Never checks or requires primary/replica cluster topology.
+    Decides *availability* for a standalone instance, on the same principle as
+    evaluate_cluster_health(): only conditions that mean the instance cannot be used.
+
+    Connection saturation and XID wraparound used to be judged here. They are emitted
+    as Primary_Connection_Pct and Primary_XID_Wrap_Pct and belong in a Site24x7
+    threshold profile, where an operator can set a limit that suits their workload
+    instead of inheriting the 70/90/95 percentages that were hardcoded here.
     """
-    # 0. Auth failure
     if auth_failure:
-        fact_str = auth_msg if auth_msg else "authentication failed for user"
         return Health(
             code=HEALTH_CODE_AUTH_FAIL,
             severity=HEALTH_CRITICAL,
-            fact=fact_str,
+            fact=auth_msg or "authentication failed for user",
             quantified="auth error",
             context="standalone instance",
-            hint="check monitor credentials in cfg"
+            hint="check monitor credentials in cfg",
         )
 
-    # 1. Connectivity failure
     if not connected:
-        fact_str = status_reason if status_reason else "connection refused or timed out"
         return Health(
             code=HEALTH_CODE_CONN_FAIL,
             severity=HEALTH_CRITICAL,
-            fact=fact_str,
+            fact=status_reason or "connection refused or timed out",
             quantified="unreachable",
             context="standalone instance",
-            hint="check host, port and pg_hba.conf"
+            hint="check host, port and pg_hba.conf",
         )
 
-    # 2. Unsupported version
     if unsupported_version:
         return Health(
             code=HEALTH_CODE_UNSUPPORTED_VERSION,
@@ -1000,61 +844,9 @@ def evaluate_database_health(
             fact=f"unsupported_version: PostgreSQL {version_str} < 9.6 floor",
             quantified="version unsupported",
             context="standalone instance",
-            hint="upgrade PostgreSQL to 9.6 or later"
+            hint="upgrade PostgreSQL to 9.6 or later",
         )
 
-    # 3. WARN / CRIT: XID wraparound
-    if xid_wraparound_pct >= 90.0:
-        return Health(
-            code=HEALTH_CODE_XID_CRITICAL,
-            severity=HEALTH_CRITICAL,
-            fact="transaction ID wraparound imminent",
-            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
-            context="critical freeze danger",
-            hint="run VACUUM FREEZE immediately"
-        )
-    elif xid_wraparound_pct >= 70.0:
-        return Health(
-            code=HEALTH_CODE_XID_WARN,
-            severity=HEALTH_WARN,
-            fact="autovacuum freeze required soon",
-            quantified=f"{xid_wraparound_pct:.1f}% wraparound",
-            context="approaching freeze max age",
-            hint="check autovacuum settings"
-        )
-
-    # 4. WARN / CRIT: Connection saturation
-    if conn_pct >= 95.0:
-        return Health(
-            code=HEALTH_CODE_HIGH_CONNECTIONS,
-            severity=HEALTH_CRITICAL,
-            fact="connection pool exhausted",
-            quantified=f"{conn_pct:.1f}% used",
-            context="max_connections saturated",
-            hint="increase max_connections or scale connection pooler"
-        )
-    elif conn_pct >= 90.0:
-        return Health(
-            code=HEALTH_CODE_HIGH_CONNECTIONS,
-            severity=HEALTH_WARN,
-            fact="connection pool near exhaustion",
-            quantified=f"{conn_pct:.1f}% used",
-            context="max_connections threshold",
-            hint="scale connection pooler (pgBouncer)"
-        )
-
-    # 5. WARN: Archive failed
-    if archive_failed > 0:
-        return Health(
-            code=HEALTH_CODE_ARCHIVE_FAILING,
-            severity=HEALTH_WARN,
-            fact="WAL archiver errors detected",
-            quantified=f"{archive_failed} failed archives",
-            context="backup continuity at risk",
-            hint="check archive_command script & storage"
-        )
-
-    # OK: Standalone instance healthy
     role_label = "read-only standby" if is_recovery else "writable standalone"
     return Health(
         code=HEALTH_CODE_OK,
@@ -1062,7 +854,7 @@ def evaluate_database_health(
         fact=f"standalone database healthy ({role_label})",
         quantified=f"uptime {uptime_s}s, {active_queries} active queries",
         context=role_label,
-        hint="none"
+        hint="none",
     )
 
 
@@ -4925,14 +4717,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             auth_msg=auth_msg,
             unsupported_version=unsupported,
             version_str=str(target_row.get("version_num", "")),
-            conn_pct=payload.get("Primary_Connection_Pct", 0.0),
-            xid_wraparound_pct=payload.get("Primary_XID_Wrap_Pct", 0.0),
             active_queries=payload.get("Primary_Active_Queries", 0),
-            longest_query_s=payload.get("Primary_Longest_Txn_s", 0),
             status_reason=str(target_row.get("status_reason", "")),
             is_recovery=is_recovery,
             uptime_s=payload.get("Primary_Uptime_s", 0),
-            archive_failed=active_archive_failing,
         )
 
         payload["Cluster_Health"] = health.severity
@@ -4948,20 +4736,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         else:
             payload["status"] = STATUS_UP
     else:
-        # Determine previous primary and whether failover recovery is confirmed
+        # The previous primary's name is still needed for the Health_Reason sentence.
         prev_primary_name = str(prev_state.get("primary_name") or "")
-        cur_primary_name = str(payload.get("Primary_Node") or "")
-        prev_primary_recovered = True
-        if prev_primary_name and cur_primary_name and prev_primary_name != cur_primary_name:
-            prev_row = next((r for r in node_rows if r.get("name") == prev_primary_name), None)
-            if not prev_row or prev_row.get("status") != STATUS_UP:
-                prev_primary_recovered = False
-            elif prev_row.get("role") != ROLE_STANDBY:
-                prev_primary_recovered = False
-            elif payload.get("Standbys_Streaming", 0) < payload.get("Standbys_Expected", 0):
-                prev_primary_recovered = False
-            elif prev_row.get("replay_lag_s", 0.0) > 60.0:
-                prev_primary_recovered = False
 
         health = evaluate_cluster_health(
             has_primary=any(r["role"] == ROLE_PRIMARY and r["status"] == STATUS_UP for r in node_rows),
@@ -4972,21 +4748,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             primaries_count=len([r for r in node_rows if r["role"] == ROLE_PRIMARY and r["status"] == STATUS_UP]),
             expected_standbys=payload.get("Standbys_Expected", 0),
             streaming_standbys=payload.get("Standbys_Streaming", 0),
-            sync_standbys_expected=0,
-            sync_standbys_actual=payload.get("Sync_Standby_Count", 0),
-            inactive_slots=payload.get("Inactive_Slots_Count", 0),
-            xid_wraparound_pct=payload.get("Primary_XID_Wrap_Pct", 0.0),
             max_replay_lag_s=payload.get("Max_Replay_Lag_s", 0.0),
-            max_replay_backlog_b=payload.get("Max_Replay_Backlog", 0),
-            timeline_spread=payload.get("Timeline_Spread", 0),
-            failover_age_s=payload.get("Failover_Age_s", -1),
-            conn_saturation_pct=payload.get("Primary_Connection_Pct", 0.0),
-            archive_failed=active_archive_failing,
             auth_failure=auth_failure,
             auth_msg=auth_msg,
             is_multi_master=is_multi_master,
-            prev_primary_name=prev_primary_name,
-            prev_primary_recovered=prev_primary_recovered
         )
 
         payload["Cluster_Health"] = health.severity
