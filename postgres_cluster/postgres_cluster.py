@@ -83,32 +83,14 @@ ROLE_CASCADING = 5
 ROLE_DELAYED = 6
 ROLE_STANDBY_LEADER = 7
 
-ROLE_NAMES = {
-    ROLE_UNKNOWN: "unknown",
-    ROLE_PRIMARY: "primary",
-    ROLE_STANDBY: "standby",
-    ROLE_WITNESS: "witness",
-    ROLE_OFFLINE: "offline",
-    ROLE_CASCADING: "cascading",
-    ROLE_DELAYED: "delayed",
-    ROLE_STANDBY_LEADER: "standby_leader",
-}
-
 # Standby Sync States
 SYNC_ASYNC = 0
 SYNC_SYNC = 1
-SYNC_QUORUM = 2
 
 # Cluster Health Severities
 HEALTH_OK = 0
 HEALTH_WARN = 1
 HEALTH_CRITICAL = 2
-
-HEALTH_NAMES = {
-    HEALTH_OK: "OK",
-    HEALTH_WARN: "WARN",
-    HEALTH_CRITICAL: "CRITICAL",
-}
 
 # Health Condition Codes (Stable, alertable, documented)
 HEALTH_CODE_OK = 0
@@ -132,15 +114,6 @@ HEALTH_CODE_HIGH_CONNECTIONS = 16
 HEALTH_CODE_ARCHIVE_FAILING = 17
 HEALTH_CODE_STALE_STATS = 18
 HEALTH_CODE_UNSUPPORTED_VERSION = 19
-
-# Error Taxonomy Codes
-ERR_CONFIG_INVALID = "config_error"
-ERR_AUTH_FAILURE = "auth_failure"
-ERR_UNREACHABLE = "unreachable"
-ERR_METRIC_UNAVAILABLE = "metric_unavailable"
-ERR_POOLER_DETECTED = "pooler_detected"
-ERR_UNSUPPORTED_CLUSTER = "unsupported_cluster"
-ERR_BUDGET_EXCEEDED = "budget_exceeded"
 
 # Version Capability Map (query/feature -> minimum version tuple)
 REQUIRES: Dict[str, Tuple[int, int]] = {
@@ -193,25 +166,6 @@ PATRONI_STATE_MAP = {
     "paused": PATRONI_STATE_PAUSED,
     "creating replica": PATRONI_STATE_CREATING_STANDBY,
 }
-
-# Replication Slot Risk
-RISK_OK = 0
-RISK_WARN = 1
-RISK_CRITICAL = 2
-RISK_LOST = 3
-
-# Replication Link Types & States
-LINK_PHYSICAL = 0
-LINK_LOGICAL = 1
-
-LINK_STATE_STREAMING = 0
-LINK_STATE_CATCHUP = 1
-LINK_STATE_STOPPED = 2
-LINK_STATE_PAUSED = 3
-LINK_STATE_UNKNOWN = 4
-
-SLOT_PHYSICAL = 0
-SLOT_LOGICAL = 1
 
 
 # -----------------------------------------------------------------------------
@@ -351,7 +305,7 @@ def resolve_mapped_endpoint(
         mapped_target = str(mapped_target).strip()
         # Case A: Pure port number (e.g. '5441')
         if mapped_target.isdigit():
-            c_host = cluster_host or ("127.0.0.1" if host in ("localhost", "127.0.0.1", "") else host)
+            c_host = cluster_host or "127.0.0.1"
             return c_host, int(mapped_target)
         # Case B: 'host:port'
         if ":" in mapped_target:
@@ -362,13 +316,17 @@ def resolve_mapped_endpoint(
 
     # 2. Check node_ports list
     if node_ports and len(node_ports) > 0:
-        c_host = cluster_host or ("127.0.0.1" if host in ("localhost", "127.0.0.1", "") else host)
-        # Try matching trailing digits in name (e.g. pg-node1 -> 1, node2 -> 2)
-        match = re.search(r"(\d+)$", name)
-        if match:
-            idx = int(match.group(1)) - 1
-            if 0 <= idx < len(node_ports):
-                return c_host, node_ports[idx]
+        c_host = cluster_host or "127.0.0.1"
+        # Try matching trailing digits in node name (e.g. pg-node1 -> 1, node2 -> 2)
+        # Strip port first so '172.30.0.12:5432' does not match 5432!
+        base_name = name.split(":")[0] if name else ""
+        if base_name and not re.match(r"^\d+\.\d+\.\d+\.\d+$", base_name):
+            match = re.search(r"(\d+)$", base_name)
+            if match:
+                digit_str = match.group(1)
+                idx = 0 if digit_str == "0" else int(digit_str) - 1
+                if 0 <= idx < len(node_ports):
+                    return c_host, node_ports[idx]
         if 0 <= node_index < len(node_ports):
             return c_host, node_ports[node_index]
 
@@ -483,6 +441,7 @@ class NodeClient:
         self.auth_error: str = ""
         self.last_error_code: Optional[str] = None
         self.last_error_class: Optional[str] = None
+        self.query_count: int = 0
 
     def requires(self, feature: str) -> bool:
         """Returns True if this node meets or exceeds the required version for feature."""
@@ -607,6 +566,7 @@ class NodeClient:
         tagged_sql = f"/* service='site24x7_pgcluster' */ {sql}"
         cur = None
         try:
+            self.query_count += 1
             cur = self.conn.cursor()
             cur.execute(tagged_sql, params)
             self.last_error_code = None
@@ -863,7 +823,7 @@ def evaluate_cluster_health(
         )
 
     # 11. WARN: Recent Failover within Window
-    if 0 <= failover_age_s <= failover_window_s:
+    if 0 < failover_age_s <= failover_window_s:
         age_m = failover_age_s // 60
         if not prev_primary_recovered and prev_primary_name:
             fail_ctx = f"promoted: {primary_name} | previous {prev_primary_name} unrecovered"
@@ -1309,8 +1269,6 @@ OFFICIAL_COMPAT_METRICS_MAP: Dict[str, List[str]] = {
     ],
 }
 
-OFFICIAL_COMPAT_TABS = OFFICIAL_COMPAT_METRICS_MAP
-
 # -----------------------------------------------------------------------------
 # 3. METRIC CATALOGUE (Single Source of Truth)
 # -----------------------------------------------------------------------------
@@ -1340,7 +1298,7 @@ METRICS: List[Dict[str, Any]] = [
      "desc": "Current timeline ID of the primary node"},
     {"name": "Timeline_Spread", "unit": "timeline", "tab": "Cluster", "type": int,
      "desc": "Spread between maximum and minimum observed node timelines"},
-    {"name": "Failover_Age_s", "unit": "s", "tab": "Cluster", "type": int,
+    {"name": "Failover_Age_s", "unit": "s", "tab": "Cluster", "type": int, "default": -1,
      "desc": "Seconds elapsed since the last detected failover"},
     {"name": "Failover_Count_24h", "unit": "failovers", "tab": "Cluster", "type": int,
      "desc": "Total failovers detected in the last 24 hours"},
@@ -1800,7 +1758,9 @@ def get_empty_payload() -> Dict[str, Any]:
     for m in METRICS:
         mname = m["name"]
         mtype = m.get("type", int)
-        if mtype == int:
+        if "default" in m:
+            payload[mname] = m["default"]
+        elif mtype == int:
             payload[mname] = 0
         elif mtype == float:
             payload[mname] = 0.0
@@ -2014,7 +1974,7 @@ def probe_cluster_managers(primary_client: Optional[NodeClient], patroni_probe_s
         wal_rec = primary_client.query_one("SELECT count(*) FROM pg_stat_wal_receiver WHERE status = 'streaming';")
         if wal_rec and safe_int(wal_rec[0]) > 0:
             has_streaming_evidence = True
-        elif primary_client.is_recovery:
+        elif primary_client.is_recovery and primary_client.version_tuple >= (12, 0):
             p_ci = primary_client.query_one("SHOW primary_conninfo;")
             if p_ci and p_ci[0]:
                 has_streaming_evidence = True
@@ -2214,7 +2174,7 @@ def discover_patroni_cluster(
     return "negative", None, [], None, candidates
 
 
-def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, timeout: float = 1.0) -> Dict[str, Dict[str, str]]:
+def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, stats_uri: str = "/;csv", timeout: float = 1.0) -> Dict[str, Dict[str, str]]:
     """
     Fetches HAProxy backend server states via CSV endpoint (http://host:port/;csv).
     Returns mapping of {pxname: {svname: status}}.
@@ -2222,7 +2182,8 @@ def fetch_haproxy_stats(stats_host: str, stats_port: int = 7000, timeout: float 
     result: Dict[str, Dict[str, str]] = {}
     if not stats_host or not stats_port:
         return result
-    url = f"http://{normalize_host(stats_host)}:{stats_port}/;csv"
+    uri = stats_uri if stats_uri.startswith("/") else f"/{stats_uri}"
+    url = f"http://{normalize_host(stats_host)}:{stats_port}{uri}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "site24x7_pgcluster"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -2255,6 +2216,8 @@ def discover_primary_via_proxy(
     sslkey: str = "",
     connect_timeout: int = 3,
     haproxy_stats_port: int = 7000,
+    haproxy_stats_uri: str = "/;csv",
+    read_port: int = 0,
     node_ports: Optional[List[int]] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
     """
@@ -2304,16 +2267,29 @@ def discover_primary_via_proxy(
         s_port = safe_int(ident_row[2] if ident_row and len(ident_row) > 2 else proxy_port, default=5432)
 
         # 3. Query pg_stat_replication for all attached standbys
-        rep_rows = client.query_all("""
-            SELECT 
-                application_name, 
-                coalesce(client_addr::text, ''), 
-                client_port, 
-                sync_state, 
-                sync_priority,
-                coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0) AS replay_lag_bytes
-            FROM pg_stat_replication;
-        """) or []
+        if client.requires("pg_wal_lsn_diff"):
+            rep_sql = """
+                SELECT 
+                    application_name, 
+                    coalesce(client_addr::text, ''), 
+                    client_port, 
+                    sync_state, 
+                    sync_priority,
+                    coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0) AS replay_lag_bytes
+                FROM pg_stat_replication;
+            """
+        else:
+            rep_sql = """
+                SELECT 
+                    application_name, 
+                    coalesce(client_addr::text, ''), 
+                    client_port, 
+                    sync_state, 
+                    sync_priority,
+                    coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location), 0) AS replay_lag_bytes
+                FROM pg_stat_replication;
+            """
+        rep_rows = client.query_all(rep_sql) or []
 
         standby_specs: List[Dict[str, Any]] = []
         standby_names: Set[str] = set()
@@ -2343,7 +2319,7 @@ def discover_primary_via_proxy(
                 "port": sb_port,
                 "patroni_role": "standby",
                 "patroni_state": PATRONI_STATE_RUNNING,
-                "patroni_tl": 1,
+                "patroni_tl": 0,
                 "patroni_lag": lag_b,
                 "sync_state": sync_st,
             })
@@ -2351,7 +2327,7 @@ def discover_primary_via_proxy(
         # 4. Resolve Primary Name:
         # Check HAProxy stats if available
         primary_name = ""
-        hp_stats = fetch_haproxy_stats(proxy_host, stats_port=haproxy_stats_port)
+        hp_stats = fetch_haproxy_stats(proxy_host, stats_port=haproxy_stats_port, stats_uri=haproxy_stats_uri)
         for px_name, sv_dict in hp_stats.items():
             if any(k in px_name.lower() for k in ("primary", "master", "write")):
                 for sv_name, sv_st in sv_dict.items():
@@ -2392,9 +2368,22 @@ def discover_primary_via_proxy(
             "port": p_port,
             "patroni_role": "primary",
             "patroni_state": PATRONI_STATE_RUNNING,
-            "patroni_tl": 1,
+            "patroni_tl": 0,
             "patroni_lag": 0,
+            "system_identifier": getattr(client, "system_identifier", ""),
         }
+
+        if not standby_specs and read_port > 0:
+            standby_specs.append({
+                "name": f"proxy_standby_{read_port}",
+                "host": proxy_host,
+                "port": read_port,
+                "patroni_role": "standby",
+                "patroni_state": PATRONI_STATE_RUNNING,
+                "patroni_tl": 0,
+                "patroni_lag": 0,
+                "sync_state": "unknown",
+            })
 
         return True, primary_spec, standby_specs, f"discovered primary {primary_name} ({p_host}:{p_port}) and {len(standby_specs)} standbys via proxy {proxy_host}:{proxy_port}"
     finally:
@@ -2456,10 +2445,10 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
             "Total Sessions Fatal": 0,
             "Total Sessions Killed": 0,
         })
-    metrics.update(defaults)
-
     if not client or not getattr(client, "is_connected", False) or not client.conn:
-        return metrics, db_stats_rows, txn_session_rows
+        return {}, [], []
+
+    metrics.update(defaults)
 
     major_version = client.version_tuple[0] if client.version_tuple else 0
     middle_version = client.version_tuple[1] if client.version_tuple else 0
@@ -2480,11 +2469,19 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
 
     str_lockStat = "SELECT COUNT(*) as locks_count FROM pg_locks;"
     str_MaxConn = "select setting::int max_connections from pg_settings where name='max_connections';"
-    str_dbStats = "SELECT sum(numbackends) as active_connections, sum(xact_commit) as total_commits, sum(xact_rollback) as total_rollbacks, sum(conflicts) as total_conflicts FROM pg_stat_database;"
+    str_dbStats = "SELECT sum(numbackends) as active_connections, sum(xact_commit) as total_commits, sum(xact_rollback) as total_rollbacks, coalesce(sum(conflicts), 0) as total_conflicts FROM pg_stat_database;"
     str_iostats = "SELECT sum(tup_inserted) as total_rows_inserted, sum(tup_updated) as total_rows_updated, sum(tup_deleted) as total_rows_deleted, sum(tup_fetched) as total_rows_fetched, sum(tup_returned) as total_rows_returned, sum(blks_read) as total_block_reads, sum(blks_hit) as total_block_hits FROM pg_stat_database;"
 
     if major_version >= 17:
-        str_bgStats = "SELECT c.num_timed AS checkpoints_timed, c.num_requested AS checkpoints_req, c.write_time AS checkpoint_write_time, c.sync_time AS checkpoint_sync_time, c.buffers_written AS buffers_checkpoint, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc FROM pg_stat_checkpointer c, pg_stat_bgwriter b;"
+        str_bgStats = (
+            "SELECT c.num_timed AS checkpoints_timed, c.num_requested AS checkpoints_req, "
+            "c.write_time AS checkpoint_write_time, c.sync_time AS checkpoint_sync_time, "
+            "c.buffers_written AS buffers_checkpoint, b.buffers_clean, b.maxwritten_clean, "
+            "coalesce((SELECT sum(writes) FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation'), 0) AS buffers_backend, "
+            "coalesce((SELECT sum(fsyncs) FROM pg_stat_io WHERE backend_type = 'client backend'), 0) AS buffers_backend_fsync, "
+            "b.buffers_alloc "
+            "FROM pg_stat_checkpointer c, pg_stat_bgwriter b;"
+        )
     else:
         str_bgStats = "SELECT checkpoints_timed,checkpoints_req,checkpoint_write_time,checkpoint_sync_time,buffers_checkpoint,buffers_clean,maxwritten_clean,buffers_backend,buffers_backend_fsync,buffers_alloc FROM pg_stat_bgwriter;"
 
@@ -2538,7 +2535,9 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
                             metrics[m_name] = f_val if "." in str(val) else int(f_val)
                         except (ValueError, TypeError):
                             metrics[m_name] = str(val)[:MAX_STRING_CHARS]
-        except Exception:
+        except Exception as e:
+            if client:
+                client.warnings.append(f"compat query {q_key} failed: {e}")
             if client.conn:
                 try:
                     client.conn.rollback()
@@ -2577,7 +2576,7 @@ def collect_official_compat(client: Optional[NodeClient]) -> Tuple[Dict[str, Any
                 pass
 
     # 2. Stats_per_DB
-    db_sql = "SELECT d.datname AS name, s.numbackends as active_connections, ROUND(pg_database_size(d.datname) / 1024 / 1024, 2) AS size_in_mb, tup_inserted as rows_inserted, tup_updated as rows_updated, tup_deleted as rows_deleted, tup_fetched as rows_fetched, tup_returned as rows_returned, blks_read as block_reads, blks_hit as block_hits FROM pg_database d JOIN pg_stat_database s ON d.oid = s.datid WHERE d.datname IS NOT NULL;"
+    db_sql = "SELECT d.datname AS name, s.numbackends as active_connections, ROUND((CASE WHEN has_database_privilege(d.datname, 'CONNECT') THEN pg_database_size(d.datname) ELSE 0 END) / 1024 / 1024, 2) AS size_in_mb, tup_inserted as rows_inserted, tup_updated as rows_updated, tup_deleted as rows_deleted, tup_fetched as rows_fetched, tup_returned as rows_returned, blks_read as block_reads, blks_hit as block_hits FROM pg_database d JOIN pg_stat_database s ON d.oid = s.datid WHERE d.datname IS NOT NULL;"
     try:
         cur = client.conn.cursor()
         cur.execute(db_sql)
@@ -2884,8 +2883,8 @@ class StateStore:
         for alias, entry in (nodes or {}).items():
             if not isinstance(entry, dict):
                 continue
-            seen = max(float(entry.get("ts_ok") or 0), float(entry.get("ts_fail") or 0))
-            if seen and seen < cutoff:
+            last_ok = float(entry.get("ts_ok") or 0.0)
+            if last_ok <= 0.0 or last_ok < cutoff:
                 continue
             out[alias] = entry
         return out
@@ -3019,8 +3018,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     read_port = safe_int(merged.get("read_port"), default=0)
     proxy_host = merged.get("proxy_host", merged.get("haproxy_host", ""))
 
-    hp_stats = fetch_haproxy_stats(proxy_host or cluster_host or "127.0.0.1", stats_port=discovery_port)
-
     # Single-endpoint Discovery Precedence:
     # 1. If explicit nodes or specific postgres_port provided by caller, isolate to explicit target
     if ("nodes" in param or "node" in param) and "cluster_host" not in param:
@@ -3041,56 +3038,75 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     else:
         seed_host = cluster_host or proxy_host or ("127.0.0.1" if not raw_nodes else "")
 
-    # 1. PRIMARY DISCOVERY: HAProxy Discovery (Write Port & Stats CSV)
-    use_haproxy_seed = bool(proxy_host or write_port or port_default in (5000, 5500))
-    if not raw_nodes and use_haproxy_seed and monitor_mode != MODE_STANDALONE:
-        hp_h = proxy_host or cluster_host or "127.0.0.1"
-        hp_p = write_port or (port_default if port_default in (5000, 5500) else 5000)
-        hp_ok, p_spec, sb_specs, hp_msg = discover_primary_via_proxy(
-            proxy_host=hp_h,
-            proxy_port=hp_p,
-            username=username,
-            password=password,
-            dbname=dbname,
-            address_map=address_map,
-            sslmode=sslmode,
-            sslrootcert=sslrootcert,
-            sslcert=sslcert,
-            sslkey=sslkey,
-            connect_timeout=3,
-            haproxy_stats_port=discovery_port,
-            node_ports=node_ports,
+    hp_stats: Dict[str, Dict[str, str]] = {}
+    if discovery_port > 0 and seed_host:
+        hp_stats = fetch_haproxy_stats(
+            stats_host=proxy_host or cluster_host or seed_host or "127.0.0.1",
+            stats_port=discovery_port,
+            stats_uri=discovery_uri,
         )
-        if hp_ok and p_spec:
-            node_specs = [p_spec] + sb_specs
-            cluster_manager = TOPOLOGY_PATRONI
-            cluster_manager_str = "haproxy"
-            payload["Topology_Type"] = TOPOLOGY_PATRONI
 
-    # 2. FALLBACK DISCOVERY: Patroni REST API (/cluster) if HAProxy did not discover cluster
+    # 1. PRIMARY DISCOVERY: HAProxy Discovery (Write Port & Stats CSV)
+    # Automatically try standard HAProxy write ports (5000, 5500) if cluster_host is given
+    use_haproxy_seed = bool(seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes)
+    if use_haproxy_seed:
+        hp_h = proxy_host or cluster_host or seed_host or "127.0.0.1"
+        if write_port:
+            candidate_ports = [write_port]
+        elif hp_stats:
+            candidate_ports = [5000, 5500]
+        else:
+            candidate_ports = []
+        for hp_p in candidate_ports:
+            hp_ok, p_spec, sb_specs, hp_msg = discover_primary_via_proxy(
+                proxy_host=hp_h,
+                proxy_port=hp_p,
+                username=username,
+                password=password,
+                dbname=dbname,
+                address_map=address_map,
+                sslmode=sslmode,
+                sslrootcert=sslrootcert,
+                sslcert=sslcert,
+                sslkey=sslkey,
+                connect_timeout=2,
+                haproxy_stats_port=discovery_port,
+                haproxy_stats_uri=discovery_uri,
+                read_port=read_port,
+                node_ports=node_ports,
+            )
+            if hp_ok and p_spec:
+                node_specs = [p_spec] + sb_specs
+                cluster_manager = TOPOLOGY_PATRONI
+                cluster_manager_str = "haproxy"
+                payload["Topology_Type"] = TOPOLOGY_PATRONI
+                break
+
+    # 2. Patroni REST API (/cluster & /history)
     patroni_probe_status = "not_applicable"
     patroni_endpoint_used = None
-    if not node_specs and seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes:
-        patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
-            seed_host=seed_host,
-            seed_port=patroni_port,
-            address_map=address_map,
-            prev_state=prev_state,
-            raw_nodes=raw_nodes,
-            timeout=1.0,
-            patroni_ports=patroni_ports,
-        )
-        if patroni_probe_status == "positive" and patroni_data and "members" in patroni_data:
-            cluster_manager = TOPOLOGY_PATRONI
-            cluster_manager_str = "patroni"
-            payload["Topology_Type"] = TOPOLOGY_PATRONI
-            discovered_members = patroni_data.get("members", [])
-            # Persist discovered endpoint into state for future fallback
-            if patroni_endpoint_used:
-                eps = list(prev_state.get("patroni_endpoints") or [])
-                if patroni_endpoint_used not in eps:
-                    eps.insert(0, patroni_endpoint_used)
-                new_state["patroni_endpoints"] = eps[:5]
+    if seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes:
+        if not node_specs or patroni_ports or patroni_port:
+            patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
+                seed_host=seed_host,
+                seed_port=patroni_port,
+                address_map=address_map,
+                prev_state=prev_state,
+                raw_nodes=raw_nodes,
+                timeout=1.0,
+                patroni_ports=patroni_ports,
+            )
+            if patroni_probe_status == "positive":
+                cluster_manager = TOPOLOGY_PATRONI
+                cluster_manager_str = "patroni"
+                payload["Topology_Type"] = TOPOLOGY_PATRONI
+                if not node_specs and patroni_data and "members" in patroni_data:
+                    discovered_members = patroni_data.get("members", [])
+                if patroni_endpoint_used:
+                    eps = list(prev_state.get("patroni_endpoints") or [])
+                    if patroni_endpoint_used not in eps:
+                        eps.insert(0, patroni_endpoint_used)
+                    new_state["patroni_endpoints"] = eps[:5]
 
     if node_specs:
         pass
@@ -3128,6 +3144,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         # Include any expected cluster members declared in address_map, HAProxy stats, or raw_nodes
         # that are missing from live Patroni discovery (e.g. stopped nodes)
         discovered_names = {s["name"] for s in node_specs}
+        discovered_endpoints = {(s["host"], s["port"]) for s in node_specs}
 
         # Check HAProxy stats backends for any additional cluster nodes
         if hp_stats:
@@ -3143,6 +3160,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                                 cluster_host=cluster_host,
                                 node_ports=node_ports,
                             )
+                            if (h_h, h_p) in discovered_endpoints:
+                                continue
                             node_specs.append({
                                 "name": sv_name,
                                 "host": h_h,
@@ -3153,10 +3172,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                                 "patroni_lag": None,
                             })
                             discovered_names.add(sv_name)
+                            discovered_endpoints.add((h_h, h_p))
 
         if raw_nodes:
             for name, host, port in parse_node_specs(raw_nodes, default_port=port_default):
-                if name not in discovered_names and f"{host}:{port}" not in discovered_names:
+                if name not in discovered_names and f"{host}:{port}" not in discovered_names and (host, port) not in discovered_endpoints:
                     node_specs.append({
                         "name": name,
                         "host": host,
@@ -3167,18 +3187,19 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                         "patroni_lag": None
                     })
                     discovered_names.add(name)
+                    discovered_endpoints.add((host, port))
         if address_map:
             for src, dst in address_map.items():
                 n_alias = src.split(":")[0]
-                if n_alias not in discovered_names:
-                    dst_h, dst_p = resolve_mapped_endpoint(
-                        name=n_alias,
-                        host=cluster_host or "127.0.0.1",
-                        port=port_default,
-                        address_map=address_map,
-                        cluster_host=cluster_host,
-                        node_ports=node_ports,
-                    )
+                dst_h, dst_p = resolve_mapped_endpoint(
+                    name=n_alias,
+                    host=cluster_host or "127.0.0.1",
+                    port=port_default,
+                    address_map=address_map,
+                    cluster_host=cluster_host,
+                    node_ports=node_ports,
+                )
+                if n_alias not in discovered_names and (dst_h, dst_p) not in discovered_endpoints:
                     node_specs.append({
                         "name": n_alias,
                         "host": dst_h,
@@ -3189,6 +3210,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                         "patroni_lag": None
                     })
                     discovered_names.add(n_alias)
+                    discovered_endpoints.add((dst_h, dst_p))
     elif raw_nodes:
         for name, host, port in parse_node_specs(raw_nodes, default_port=port_default):
             node_specs.append({
@@ -3245,6 +3267,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
         row_res = {
             "name": safe_name(n_name),
+            "raw_name": n_name,
+            "host": n_host,
+            "port": n_port,
             "role": ROLE_UNKNOWN,
             "status": STATUS_DOWN,
             "status_reason": "connection failed",
@@ -3265,6 +3290,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             "longest_query_s": 0,
             "temp_bytes": 0,
             "dead_tuples": 0,
+            "system_identifier": "",
             "client": None,
             "is_primary": False
         }
@@ -3288,6 +3314,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 row_res["status"] = STATUS_DOWN
                 row_res["status_reason"] = f"unsupported_version: PostgreSQL {client.version_tuple[0]}.{client.version_tuple[1]} < 9.6"
                 row_res["version_num"] = safe_int(client.version_num)
+                row_res["system_identifier"] = getattr(client, "system_identifier", "")
                 row_res["client_warnings"] = list(client.warnings)
                 row_res["client"] = client
                 return row_res
@@ -3296,9 +3323,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             row_res["status"] = STATUS_UP
             row_res["status_reason"] = "healthy"
             row_res["resp_ms"] = resp_ms
+            row_res["system_identifier"] = getattr(client, "system_identifier", "")
             row_res["client"] = client
 
-            is_prim = (not client.is_recovery) or (p_role_str == "leader")
+            is_prim = not client.is_recovery
             row_res["is_primary"] = is_prim
             row_res["role"] = ROLE_PRIMARY if is_prim else ROLE_STANDBY
 
@@ -3315,7 +3343,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 row_res["conn_pct"] = c_pct
 
             # Timeline
-            if row_res["timeline"] == 0:
+            if row_res["timeline"] == 0 and client.requires("pg_control_checkpoint"):
                 tl_row = client.query_one("SELECT timeline_id FROM pg_control_checkpoint();")
                 if tl_row and tl_row[0]:
                     row_res["timeline"] = safe_int(tl_row[0])
@@ -3324,16 +3352,20 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             if not is_prim:
                 lag_row = client.query_one("SELECT extract(epoch from (now() - pg_last_xact_replay_timestamp()));")
                 if lag_row and lag_row[0] is not None:
-                    row_res["replay_lag_s"] = round(safe_float(lag_row[0]), 2)
+                    row_res["replay_lag_s"] = round(max(0.0, safe_float(lag_row[0])), 2)
 
-                b_row = client.query_one("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
+                if client.requires("pg_wal_lsn_diff"):
+                    b_row = client.query_one("SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
+                else:
+                    b_row = client.query_one("SELECT pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location());")
                 if b_row and b_row[0] is not None:
                     row_res["replay_lag_bytes"] = safe_int(b_row[0])
 
-                # Check if delayed replica
-                delay_row = client.query_one("SHOW recovery_min_apply_delay;")
-                if delay_row and delay_row[0] and delay_row[0] != "0":
-                    row_res["role"] = ROLE_DELAYED
+                # Check if delayed replica (recovery_min_apply_delay is GUC parameter only in PG 12+)
+                if client.version_tuple >= (12, 0):
+                    delay_row = client.query_one("SHOW recovery_min_apply_delay;")
+                    if delay_row and delay_row[0] and delay_row[0] != "0":
+                        row_res["role"] = ROLE_DELAYED
 
                 # Check if cascading replica (standby with downstream streaming replicas)
                 casc_row = client.query_one("SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';")
@@ -3354,8 +3386,27 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             lq = client.query_one("SELECT coalesce(max(extract(epoch from (now() - query_start)))::int, 0) FROM pg_stat_activity WHERE state = 'active';")
             if lq and lq[0] is not None:
                 row_res["longest_query_s"] = safe_int(lq[0])
+
+            # Oldest active transaction age in seconds
+            xa_row = client.query_one("SELECT coalesce(max(extract(epoch from (now() - xact_start)))::int, 0) FROM pg_stat_activity WHERE xact_start IS NOT NULL;")
+            if xa_row and xa_row[0] is not None:
+                row_res["xact_age_s"] = safe_int(xa_row[0])
+
+            # Temp bytes from database stats
+            tb_row = client.query_one("SELECT coalesce(sum(temp_bytes)::bigint, 0) FROM pg_stat_database;")
+            if tb_row and tb_row[0] is not None:
+                row_res["temp_bytes"] = safe_int(tb_row[0])
+
+            # Dead tuples from user tables
+            dt_row = client.query_one("SELECT coalesce(sum(n_dead_tup)::bigint, 0) FROM pg_stat_user_tables;")
+            if dt_row and dt_row[0] is not None:
+                row_res["dead_tuples"] = safe_int(dt_row[0])
         else:
             row_res["status"] = STATUS_DOWN
+            # Patroni and pg_stat_replication both report member lag in BYTES.
+            # It must not be written into replay_lag_s, which is seconds.
+            if spec.get("patroni_lag") is not None:
+                row_res["replay_lag_bytes"] = safe_int(spec.get("patroni_lag"))
             if p_state_int in (PATRONI_STATE_STOPPED, PATRONI_STATE_CRASHED):
                 row_res["status_reason"] = "stopped (Patroni)"
             else:
@@ -3393,7 +3444,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             if res.get("client_warnings"):
                 all_warnings.extend(res["client_warnings"])
             if res["client"]:
-                queries_count += 4
+                queries_count += getattr(res["client"], "query_count", 0)
                 if res["client"].warnings:
                     all_warnings.extend(res["client"].warnings)
                 if res["is_primary"]:
@@ -3489,52 +3540,101 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             entry["ts_ok"] = t0
             entry["last_role"] = r["role"]
             entry["timeline"] = r["timeline"]
+            entry["system_identifier"] = str(r.get("system_identifier") or "")
+            entry["host"] = str(r.get("host") or "")
+            entry["port"] = safe_int(r.get("port"), default=0)
+            new_state["nodes"][alias] = entry
         else:
             entry["ts_fail"] = t0
             entry["last_reason"] = r["status_reason"]
             if "ts_ok" in entry:
                 r["last_seen_s"] = int(t0 - float(entry["ts_ok"]))
-        new_state["nodes"][alias] = entry
+                new_state["nodes"][alias] = entry
 
     seen_aliases = {r["name"] for r in node_rows}
+    seen_safe_names = {safe_name(r["name"]) for r in node_rows}
+    seen_endpoints = set()
+    seen_sysids = set()
+    for r in node_rows:
+        h = str(r.get("host") or "")
+        p = safe_int(r.get("port"), default=0)
+        if h and p:
+            seen_endpoints.add(f"{h}:{p}")
+            seen_endpoints.add(f"{normalize_host(h)}:{p}")
+            seen_endpoints.add(f"{safe_name(h)}_{p}")
+            seen_endpoints.add(f"{h}_{p}")
+        rn = str(r.get("raw_name") or "")
+        if rn:
+            seen_aliases.add(rn)
+            seen_safe_names.add(safe_name(rn))
+        sysid = str(r.get("system_identifier") or "")
+        if sysid and sysid.isdigit():
+            seen_sysids.add(sysid)
+
     if effective_mode != MODE_STANDALONE:
         for alias, entry in prev_state.get("nodes", {}).items():
-            if alias not in seen_aliases:
-                last_ok = float(entry.get("ts_ok") or 0.0)
-                if (t0 - last_ok) <= NODE_TTL_DAYS * 86400:
-                    offline_row = {
-                        "name": safe_name(alias),
-                        "role": ROLE_OFFLINE,
-                        "status": STATUS_DOWN,
-                        "status_reason": f"offline (down {int((t0 - last_ok)/60)}m)" if last_ok > 0 else "offline",
-                        "last_seen_s": int(t0 - last_ok) if last_ok > 0 else -1,
-                        "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ok)) if last_ok > 0 else "unknown",
-                        "timeline": int(entry.get("timeline") or 0),
-                        "replay_lag_s": 0.0,
-                        "replay_lag_bytes": 0,
-                        "conn_pct": 0.0,
-                        "resp_ms": 0.0,
-                        "sync": SYNC_ASYNC,
-                        "patroni_state": PATRONI_STATE_UNKNOWN,
-                        "xact_age_s": 0,
-                        "uptime_s": 0,
-                        "version_num": 0,
-                        "active_queries": 0,
-                        "idle_in_txn": 0,
-                        "longest_query_s": 0,
-                        "temp_bytes": 0,
-                        "dead_tuples": 0,
-                        "client": None,
-                        "is_primary": False
-                    }
-                    node_rows.append(offline_row)
-                    new_state["nodes"][alias] = entry
+            s_alias = safe_name(alias)
+            if alias in seen_aliases or s_alias in seen_safe_names or alias in seen_endpoints or s_alias in seen_endpoints:
+                continue
+            e_sysid = str(entry.get("system_identifier") or "")
+            if e_sysid and e_sysid in seen_sysids:
+                continue
+            e_host = str(entry.get("host") or "")
+            e_port = safe_int(entry.get("port"), default=0)
+            if e_host and e_port:
+                if f"{e_host}:{e_port}" in seen_endpoints or f"{safe_name(e_host)}_{e_port}" in seen_endpoints:
+                    continue
 
-    # Sort node rows deterministically: Primary first, then DOWN, then WARN, then name
+            last_ok = float(entry.get("ts_ok") or 0.0)
+            if last_ok > 0 and (t0 - last_ok) <= NODE_TTL_DAYS * 86400:
+                offline_row = {
+                    "name": safe_name(alias),
+                    "role": ROLE_OFFLINE,
+                    "status": STATUS_DOWN,
+                    "status_reason": f"offline (down {int((t0 - last_ok)/60)}m)",
+                    "last_seen_s": int(t0 - last_ok),
+                    "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ok)),
+                    "timeline": int(entry.get("timeline") or 0),
+                    "replay_lag_s": 0.0,
+                    "replay_lag_bytes": 0,
+                    "conn_pct": 0.0,
+                    "resp_ms": 0.0,
+                    "sync": SYNC_ASYNC,
+                    "patroni_state": PATRONI_STATE_UNKNOWN,
+                    "xact_age_s": 0,
+                    "uptime_s": 0,
+                    "version_num": 0,
+                    "active_queries": 0,
+                    "idle_in_txn": 0,
+                    "longest_query_s": 0,
+                    "temp_bytes": 0,
+                    "dead_tuples": 0,
+                    "client": None,
+                    "is_primary": False
+                }
+                node_rows.append(offline_row)
+                new_state["nodes"][alias] = entry
+
+    # Cross-check system_identifier across UP nodes (Bug 10 protection against alien nodes)
+    primary_sys_id = ""
+    for r in node_rows:
+        if r.get("role") == ROLE_PRIMARY and r.get("status") == STATUS_UP:
+            primary_sys_id = str(r.get("system_identifier") or "")
+            break
+    if primary_sys_id and primary_sys_id.isdigit():
+        for r in node_rows:
+            n_sys_id = str(r.get("system_identifier") or "")
+            if n_sys_id and n_sys_id.isdigit() and n_sys_id != primary_sys_id and r.get("status") == STATUS_UP:
+                r["status"] = STATUS_DOWN
+                r["status_reason"] = f"mismatched system_identifier ({n_sys_id} != {primary_sys_id})"
+                all_warnings.append(f"node {r['name']} rejected: mismatched system_identifier")
+
+    # Sort node rows deterministically: Live primary first, then live standbys, then down primary, then down standbys
     def sort_key(r):
-        is_prim = 0 if r["role"] == ROLE_PRIMARY else 1
-        is_down = 0 if r["status"] == STATUS_DOWN else 1
-        return (is_prim, is_down, r["name"])
+        is_live_prim = 0 if (r["role"] == ROLE_PRIMARY and r["status"] == STATUS_UP) else 1
+        is_live_sb = 0 if (r["role"] != ROLE_PRIMARY and r["status"] == STATUS_UP) else 1
+        is_down_prim = 0 if (r["role"] == ROLE_PRIMARY and r["status"] != STATUS_UP) else 1
+        return (is_live_prim, is_live_sb, is_down_prim, r["name"])
 
     node_rows.sort(key=sort_key)
 
@@ -3616,6 +3716,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     compat_metrics: Dict[str, Any] = {}
     compat_db_stats: List[Dict[str, Any]] = []
     compat_txn_sessions: List[Dict[str, Any]] = []
+    active_archive_failing: int = 0
     if active_client:
         if not active_client.is_supported:
             payload["Primary_Up"] = 0
@@ -3637,9 +3738,15 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             SELECT sum(numbackends), sum(xact_commit), sum(xact_rollback),
                    sum(tup_inserted), sum(tup_updated), sum(tup_deleted),
                    sum(tup_fetched), sum(tup_returned), sum(blks_read), sum(blks_hit),
-                   max(age(datfrozenxid))
+                   (SELECT max(age(datfrozenxid)) FROM pg_database WHERE NOT datistemplate)
             FROM pg_stat_database;
         """
+        # Baselines are resolved BEFORE the aggregate query runs: if that query fails, the
+        # sections below (WAL rate, archiver, checkpoints, scans) must still find these bound.
+        prev_primary_name = str(prev_state.get("primary_name") or "")
+        is_same_primary = (not prev_primary_name) or (prev_primary_name == active_client.name)
+        prev_counters = prev_state.get("primary_counters") or {}
+        max_xid_age = 0
         row = active_client.query_one(db_sql)
         queries_count += 1
         commits, rollbacks, ins, upd, dels, blks_r, blks_h = 0, 0, 0, 0, 0, 0, 0
@@ -3659,9 +3766,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
             # Rate calculation from state deltas
             prev_ts = float(prev_state.get("primary_ts") or 0.0)
-            prev_counters = prev_state.get("primary_counters") or {}
             dt = t0 - prev_ts
-            if prev_counters and 0.5 <= dt <= 900.0:
+            if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
                 payload["Primary_Commits_s"] = round(max(0.0, commits - safe_float(prev_counters.get("commits", commits))) / dt, 2)
                 payload["Primary_Rollbacks_s"] = round(max(0.0, rollbacks - safe_float(prev_counters.get("rollbacks", rollbacks))) / dt, 2)
                 payload["Primary_Tup_Inserted_s"] = round(max(0.0, ins - safe_float(prev_counters.get("ins", ins))) / dt, 2)
@@ -3693,6 +3799,20 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 wrap_pct = round(100.0 * max_xid_age / freeze_max, 2)
                 payload["Primary_XID_Wrap_Pct"] = wrap_pct
                 payload["XID_Wraparound_Pct"] = wrap_pct
+        elif active_client.last_error_class is not None:
+            # The core aggregate failed: drop every metric it feeds rather than emitting zeros.
+            err_cls = active_client.last_error_class
+            for _m in (
+                "Primary_Connections", "Active_Sessions",
+                "Primary_Commits_s", "Primary_Rollbacks_s",
+                "Primary_Tup_Inserted_s", "Primary_Tup_Updated_s", "Primary_Tup_Deleted_s",
+                "Primary_Blks_Read_s", "Blks_Read_s", "Blks_Hit_s",
+                "Primary_Cache_Hit_Ratio", "Cache_Hit_Ratio",
+                "Primary_XID_Age", "Primary_XID_Wrap_Pct", "XID_Wraparound_Pct",
+            ):
+                prune_omitted_metric(payload, _m)
+            payload["Rate_Warmup_Flag"] = 1
+            all_warnings.append(f"metric_unavailable: Primary_Connections ({err_cls})")
 
         # 3.2 Max connections and connection percentage
         max_conn = safe_int(active_client.settings.get("max_connections", 100), default=100)
@@ -3702,14 +3822,15 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["Primary_Connection_Pct"] = conn_pct
 
         # 3.3 Active & Idle-in-transaction queries
-        act_sql = """
+        backend_clause = "WHERE (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else "WHERE 1=1"
+        act_sql = f"""
             SELECT
                 count(*) FILTER (WHERE state = 'active'),
                 count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
                 count(*) FILTER (WHERE state = 'idle'),
                 coalesce(max(extract(epoch from (now() - xact_start))), 0)
             FROM pg_stat_activity
-            WHERE (backend_type = 'client backend' OR backend_type IS NULL);
+            {backend_clause};
         """
         act_row = active_client.query_one(act_sql)
         queries_count += 1
@@ -3742,10 +3863,13 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             prev_counters = prev_state.get("primary_counters") or {}
             prev_ts = float(prev_state.get("primary_ts") or 0.0)
             dt = t0 - prev_ts
-            if prev_counters and 0.5 <= dt <= 900.0:
+            if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
                 p_wal = prev_counters.get("wal_bytes", wal_bytes)
                 payload["Primary_WAL_Rate_MBs"] = round(max(0.0, wal_bytes - p_wal) / (1024 * 1024 * dt), 2)
                 payload["WAL_Rate_MBs"] = payload["Primary_WAL_Rate_MBs"]
+            else:
+                payload["Primary_WAL_Rate_MBs"] = 0.0
+                payload["WAL_Rate_MBs"] = 0.0
 
         # 3.5 Uptime
         uptime_row = active_client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()));")
@@ -3754,10 +3878,18 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["Primary_Uptime_s"] = int(uptime_row[0])
 
         # 3.6 Replication Standbys & Slots
+        # Standbys_Expected must reflect the cluster, not just the config. With a single seed
+        # address len(node_specs) is 1, which previously reported "N/0 streaming", emptied
+        # Health_Reason and disabled the zero-standbys-streaming CRITICAL check entirely.
+        configured_standbys = max(len(node_specs) - 1, 0)
+        discovered_standbys = len([
+            r for r in node_rows
+            if r.get("role") in (ROLE_STANDBY, ROLE_DELAYED, ROLE_CASCADING, ROLE_STANDBY_LEADER)
+        ])
         if effective_mode == MODE_STANDALONE:
             payload["Standbys_Expected"] = 0
         else:
-            payload["Standbys_Expected"] = max(len(node_specs) - 1, 0)
+            payload["Standbys_Expected"] = max(configured_standbys, discovered_standbys)
 
         rep_sql = """
             SELECT application_name, client_addr::text, state, sync_state,
@@ -3777,10 +3909,17 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             all_warnings.append(f"metric_unavailable: Standbys_Streaming ({err_cls})")
             all_warnings.append(f"metric_unavailable: Sync_Standby_Count ({err_cls})")
         else:
-            streaming_count = len([r for r in rep_rows if str(r[2] if len(r) > 2 else r[1]).lower() == "streaming"])
-            sync_count = len([r for r in rep_rows if str(r[3] if len(r) > 3 else r[2]).lower() in ("sync", "quorum")])
+            # Columns 2 and 3 are state and sync_state. A short row means the query
+            # shape changed, so skip it rather than compare the wrong column.
+            streaming_count = len([r for r in rep_rows if len(r) > 2 and str(r[2]).lower() == "streaming"])
+            sync_count = len([r for r in rep_rows if len(r) > 3 and str(r[3]).lower() in ("sync", "quorum")])
             payload["Standbys_Streaming"] = streaming_count
             payload["Sync_Standby_Count"] = sync_count
+            # A standby the primary is actively streaming to is by definition expected.
+            if effective_mode != MODE_STANDALONE:
+                payload["Standbys_Expected"] = max(
+                    safe_int(payload.get("Standbys_Expected", 0)), streaming_count
+                )
 
         if active_client.version_tuple >= (10, 0):
             slot_sql = """
@@ -3829,11 +3968,13 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             payload["Slot_Risk"] = slot_risk
 
         # 3.7 Archiver status
+        active_archive_failing = 0
         if active_client.settings.get("archive_mode", "off") != "off":
             payload["Archive_Mode"] = active_client.settings.get("archive_mode")
             arch_row = active_client.query_one("""
                 SELECT archived_count, failed_count, last_archived_wal,
-                       coalesce(extract(epoch from (now() - last_archived_time))::int, 0) as lag_s
+                       coalesce(extract(epoch from (now() - last_archived_time))::int, 0) as lag_s,
+                       CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END as is_failing
                 FROM pg_stat_archiver;
             """)
             queries_count += 1
@@ -3848,10 +3989,15 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             elif arch_row:
                 payload["Primary_Archive_Ok"] = safe_int(arch_row[0])
                 payload["Archive_Success"] = safe_int(arch_row[0])
-                payload["Primary_Archive_Failed"] = safe_int(arch_row[1])
-                payload["Archive_Failed"] = safe_int(arch_row[1])
+                cur_arch_failed = safe_int(arch_row[1])
+                payload["Primary_Archive_Failed"] = cur_arch_failed
+                payload["Archive_Failed"] = cur_arch_failed
                 payload["Last_Archived_WAL"] = str(arch_row[2] or "none")[:MAX_STRING_CHARS]
                 payload["Primary_Archive_Lag_s"] = safe_int(arch_row[3])
+                arch_is_failing = bool(safe_int(arch_row[4])) if len(arch_row) > 4 else False
+                prev_arch_failed = safe_int(prev_counters.get("arch_failed", cur_arch_failed))
+                if arch_is_failing or (cur_arch_failed > prev_arch_failed and is_same_primary):
+                    active_archive_failing = cur_arch_failed
 
             if active_client.version_tuple >= (10, 0):
                 ready_row = active_client.query_one("SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
@@ -3878,7 +4024,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             prune_omitted_metric(payload, "Primary_Archive_Lag_s")
 
         # 3.8 Database sizes
-        db_size_sql = "SELECT count(*), coalesce(sum(pg_database_size(oid)) / (1024*1024), 0) FROM pg_database WHERE datallowconn;"
+        db_size_sql = "SELECT count(*), coalesce(sum(CASE WHEN has_database_privilege(oid, 'CONNECT') THEN pg_database_size(oid) ELSE 0 END) / (1024*1024), 0) FROM pg_database WHERE datallowconn;"
         db_size_row = active_client.query_one(db_size_sql)
         queries_count += 1
         if active_client.last_error_class is not None:
@@ -3893,10 +4039,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         # 3.9 Additional Health and Activity Metrics (Finding 4)
         # Long running queries
         lq_sec = safe_int(merged.get("long_query_seconds", 300), default=300)
+        lq_backend = "AND (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else ""
         lq_sql = f"""
             SELECT count(*) FROM pg_stat_activity
             WHERE state = 'active'
-              AND (backend_type = 'client backend' OR backend_type IS NULL)
+              {lq_backend}
               AND (now() - query_start) > interval '{lq_sec} seconds';
         """
         lq_row = active_client.query_one(lq_sql)
@@ -3967,7 +4114,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 prune_omitted_metric(payload, "Subscription_Apply_Errors")
                 prune_omitted_metric(payload, "Subscription_Conflicts")
 
-            sub_lag = active_client.query_one("SELECT coalesce(max(extract(epoch from (now() - latest_end_time))), 0.0) FROM pg_stat_subscription WHERE latest_end_time IS NOT NULL;")
+            sub_lag = active_client.query_one("""
+                SELECT coalesce(max(CASE WHEN received_lsn = latest_end_lsn THEN 0.0 ELSE extract(epoch from (now() - latest_end_time)) END), 0.0)
+                FROM pg_stat_subscription
+                WHERE latest_end_time IS NOT NULL;
+            """)
             queries_count += 1
             if sub_lag and sub_lag[0] is not None:
                 payload["Max_Logical_Lag_s"] = round(safe_float(sub_lag[0]), 2)
@@ -4023,32 +4174,42 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         active_client_is_recovery = active_client.is_recovery
         active_client_version = active_client.version_tuple
         if active_client.is_recovery:
-            standby_wal_rec = active_client.query_one("""
-                SELECT sender_host, sender_port, status, slot_name,
-                       coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
-                       coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0) as replay_lag_b
-                FROM pg_stat_wal_receiver;
-            """)
+            if active_client.requires("pg_wal_lsn_diff"):
+                wal_rec_sql = """
+                    SELECT sender_host, sender_port, status, slot_name,
+                           coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
+                           coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0) as replay_lag_b
+                    FROM pg_stat_wal_receiver;
+                """
+            else:
+                wal_rec_sql = """
+                    SELECT sender_host, sender_port, status, slot_name,
+                           coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
+                           coalesce(pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()), 0) as replay_lag_b
+                    FROM pg_stat_wal_receiver;
+                """
+            standby_wal_rec = active_client.query_one(wal_rec_sql)
             queries_count += 1
 
         # Detect cluster manager before closing active connection
         if effective_mode == MODE_STANDALONE:
             cluster_manager = 0
             cluster_manager_str = "standalone"
-        else:
+        elif cluster_manager not in (TOPOLOGY_PATRONI, TOPOLOGY_REPMGR, TOPOLOGY_CITUS, TOPOLOGY_CNPG, TOPOLOGY_STOLON):
             mgr_code, mgr_str, probe_res = probe_cluster_managers(active_client, patroni_probe_status)
-            cluster_manager = mgr_code
-            cluster_manager_str = mgr_str
+            if mgr_code != TOPOLOGY_UNKNOWN or not cluster_manager:
+                cluster_manager = mgr_code
+                cluster_manager_str = mgr_str
 
         # Query real per-database statistics using datid
         db_stats_query_sql = """
             SELECT datname,
                    numbackends,
-                   round((pg_database_size(datid) / (1024*1024)::numeric), 2) as size_mb,
-                   round(CASE WHEN (xact_commit + xact_rollback) = 0 THEN 100.0
-                              ELSE (100.0 * xact_commit / (xact_commit + xact_rollback))::numeric END, 2) as commit_ratio,
-                   round(CASE WHEN (blks_hit + blks_read) = 0 THEN 100.0
-                              ELSE (100.0 * blks_hit / (blks_hit + blks_read))::numeric END, 2) as cache_hit_ratio
+                   round((CASE WHEN has_database_privilege(datname, 'CONNECT') THEN pg_database_size(datid) ELSE 0 END / (1024*1024)::numeric), 2) as size_mb,
+                   round(CASE WHEN (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)) = 0 THEN 100.0
+                              ELSE (100.0 * coalesce(xact_commit, 0) / (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)))::numeric END, 2) as commit_ratio,
+                   round(CASE WHEN (coalesce(blks_hit, 0) + coalesce(blks_read, 0)) = 0 THEN 100.0
+                              ELSE (100.0 * coalesce(blks_hit, 0) / (coalesce(blks_hit, 0) + coalesce(blks_read, 0)))::numeric END, 2) as cache_hit_ratio
             FROM pg_stat_database
             WHERE datname IS NOT NULL AND datname NOT IN ('template0', 'template1')
             ORDER BY size_mb DESC;
@@ -4057,13 +4218,13 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         queries_count += 1
 
         # Query real wait events from active client sessions
-        we_query_sql = """
+        we_backend = "WHERE (backend_type = 'client backend' OR backend_type IS NULL) AND state = 'active'" if active_client.requires("pg_stat_activity_backend_type") else "WHERE state = 'active'"
+        we_query_sql = f"""
             SELECT coalesce(wait_event_type, 'CPU') as event_type,
                    coalesce(wait_event, 'running') as event,
                    count(*) as sessions
             FROM pg_stat_activity
-            WHERE (backend_type = 'client backend' OR backend_type IS NULL)
-              AND state = 'active'
+            {we_backend}
             GROUP BY wait_event_type, wait_event
             ORDER BY sessions DESC;
         """
@@ -4074,7 +4235,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         if active_client.version_tuple >= (17, 0):
             chk_sql = """
                 SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time,
-                       b.buffers_backend, b.maxwritten_clean, b.buffers_backend_fsync
+                       coalesce((SELECT sum(writes) FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation'), 0),
+                       b.maxwritten_clean,
+                       coalesce((SELECT sum(fsyncs) FROM pg_stat_io WHERE backend_type = 'client backend'), 0)
                 FROM pg_stat_checkpointer c, pg_stat_bgwriter b;
             """
         else:
@@ -4099,7 +4262,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             prev_chk_req = safe_int(prev_counters.get("checkpoints_req", cur_chk_req))
             prev_ts = float(prev_state.get("primary_ts") or 0.0)
             dt = t0 - prev_ts
-            if 0 < dt <= 7200:
+            if is_same_primary and 0 < dt <= 7200:
                 req_delta = max(0, cur_chk_req - prev_chk_req)
                 payload["Primary_Chkpts_Req_1h"] = safe_int(round(req_delta * (3600.0 / dt))) if dt < 3600 else req_delta
             else:
@@ -4142,7 +4305,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             prev_idx = safe_int(prev_counters.get("idx_scans", cur_idx))
             prev_ts = float(prev_state.get("primary_ts") or 0.0)
             dt = t0 - prev_ts
-            if 0.5 <= dt <= 900.0:
+            if is_same_primary and 0.5 <= dt <= 900.0:
                 payload["Seq_Scans_s"] = round(max(0.0, cur_seq - prev_seq) / dt, 2)
                 payload["Idx_Scans_s"] = round(max(0.0, cur_idx - prev_idx) / dt, 2)
             else:
@@ -4183,19 +4346,21 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         elif payload.get("DB_Count", 0) > 0:
             payload["Largest_DB"] = safe_name(dbname or "postgres")
 
-        if raw_we_rows:
+        if raw_we_rows and payload.get("Primary_Active_Queries", 0) > 0:
             ev_t = str(raw_we_rows[0][0] or "CPU")[:50]
             ev_n = str(raw_we_rows[0][1] or "running")[:50]
             payload["Wait_Event_Top"] = safe_name(f"{ev_t}_{ev_n}")
         else:
-            payload["Wait_Event_Top"] = "CPU_running"
+            payload["Wait_Event_Top"] = "none"
 
-        # Update primary_counters with checkpoint and scan metrics
+        # Update primary_counters with checkpoint, scan, and archive metrics
         new_state["primary_counters"]["checkpoints_req"] = payload.get("Checkpoints_Req", 0)
         new_state["primary_counters"]["seq_scans"] = cur_seq
         new_state["primary_counters"]["idx_scans"] = cur_idx
+        new_state["primary_counters"]["arch_failed"] = payload.get("Primary_Archive_Failed", 0)
 
         # Fix 9: Collect official postgres plugin backward compat metrics
+        compat_client_version = getattr(active_client, "version_tuple", (0, 0))
         if compat_official == 1:
             compat_metrics, compat_db_stats, compat_txn_sessions = collect_official_compat(active_client)
 
@@ -4205,6 +4370,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     else:
         active_client_is_recovery = False
         active_client_version = (0, 0)
+        compat_client_version = (0, 0)
         standby_wal_rec = None
         if effective_mode == MODE_STANDALONE:
             cluster_manager = 0
@@ -4223,6 +4389,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 if c and getattr(c, "is_connected", False):
                     local_client = c
                     break
+            if local_client:
+                compat_client_version = getattr(local_client, "version_tuple", (0, 0))
             compat_metrics, compat_db_stats, compat_txn_sessions = collect_official_compat(local_client)
         # Primary is down / unreachable: Apply Clamp if available within 900s
         prev_metrics = prev_state.get("primary_metrics") or {}
@@ -4318,7 +4486,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         omitted = len(node_rows) - MAX_ROWS
         payload["Nodes_Omitted"] = omitted
         cluster_nodes_table.append({
-            "name": f"<{omitted} more nodes>",
+            "name": safe_name(f"{omitted}_more_nodes"),
             "role": ROLE_UNKNOWN,
             "status": STATUS_DOWN,
             "status_reason": f"{omitted} nodes omitted by 25-row limit",
@@ -4329,6 +4497,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             "replay_lag_bytes": 0,
             "conn_pct": 0.0,
             "resp_ms": 0.0,
+            "sync": 0,
             "patroni_state": PATRONI_STATE_UNKNOWN,
             "xact_age_s": 0
         })
@@ -4352,9 +4521,14 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
     # 4.3 Replication_Links (Finding 3: ONLY real rows)
     replication_links_table: List[Dict[str, Any]] = []
+    seen_link_names: Set[str] = set()
     if rep_link_data:
         for idx, rl in enumerate(rep_link_data[:MAX_ROWS]):
-            link_name = safe_name(rl["client_addr"] or rl["app_name"] or f"replica_{idx+1}")
+            raw_base = rl.get("app_name") or rl.get("application_name") or rl.get("client_addr") or f"replica_{idx+1}"
+            link_name = safe_name(raw_base)
+            if link_name in seen_link_names or not link_name:
+                link_name = safe_name(f"{raw_base}_{idx+1}")
+            seen_link_names.add(link_name)
             replication_links_table.append({
                 "name": link_name,
                 "status": 1 if rl["state"].lower() == "streaming" else 0,
@@ -4427,15 +4601,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 "commit_ratio": d_commit,
                 "cache_hit_ratio": d_cache
             })
-    elif payload.get("DB_Count", 0) > 0:
-        db_stats_table.append({
-            "name": safe_name(dbname or "postgres"),
-            "status": 1,
-            "size_mb": float(payload.get("DB_Total_Size_MB", 0.0)),
-            "connections": int(payload.get("Primary_Connections", 0)),
-            "commit_ratio": 100.0,
-            "cache_hit_ratio": float(payload.get("Primary_Cache_Hit_Ratio", 100.0))
-        })
     payload["Database_Stats"] = db_stats_table[:MAX_ROWS]
 
     # 4.6 Wait_Events
@@ -4452,14 +4617,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 "event": ev_name,
                 "sessions": ev_sess
             })
-    else:
-        wait_events_table.append({
-            "name": "CPU_running",
-            "status": 1,
-            "event_type": "CPU",
-            "event": "running",
-            "sessions": int(payload.get("Primary_Active_Queries", 0))
-        })
     payload["Wait_Events"] = wait_events_table[:MAX_ROWS]
 
     # 4.7 Topology & Multi-Master / Manager Detection
@@ -4487,7 +4644,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     else:
         is_multi_master = bool(int(merged.get("is_multi_master") or 0)) or str(merged.get("topology_type", "")).lower() in ("multi_master", "4")
 
-        writable_nodes = [r for r in node_rows if r.get("role") == ROLE_PRIMARY]
+        writable_nodes = [r for r in node_rows if r.get("role") == ROLE_PRIMARY and r.get("status") == STATUS_UP]
         if len(writable_nodes) > 1:
             if payload.get("Logical_Replication_Used") == 1 or payload.get("Mesh_Links_Active", 0) > 0:
                 is_multi_master = True
@@ -4537,7 +4694,8 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             first_auth = auth_failed_nodes[0]
             auth_msg = first_auth.get("auth_error") or f"auth failed for user {username} on {first_auth.get('name')}"
         else:
-            auth_msg = f"auth failed for user {username} on pg1"
+            target = payload.get("Primary_Node") or cluster_host or "cluster node"
+            auth_msg = f"auth failed for user {username} on {target}"
 
     if effective_mode == MODE_STANDALONE:
         target_row = node_rows[0] if node_rows else {}
@@ -4558,7 +4716,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             status_reason=str(target_row.get("status_reason", "")),
             is_recovery=is_recovery,
             uptime_s=payload.get("Primary_Uptime_s", 0),
-            archive_failed=payload.get("Primary_Archive_Failed", 0),
+            archive_failed=active_archive_failing,
         )
 
         payload["Cluster_Health"] = health.severity
@@ -4567,7 +4725,9 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         payload["Action_Hint"] = health.hint[:MAX_STRING_CHARS]
         payload["msg"] = health.format_msg()
 
-        if health.severity == HEALTH_CRITICAL or auth_failure or not connected or unsupported:
+        # Availability in standalone mode:
+        # status = 0 (OUTAGE) ONLY when instance is down, unreachable, auth failed, or unsupported version.
+        if not connected or auth_failure or unsupported or health.code in (HEALTH_CODE_CONN_FAIL, HEALTH_CODE_AUTH_FAIL, HEALTH_CODE_UNSUPPORTED_VERSION):
             payload["status"] = STATUS_DOWN
         else:
             payload["status"] = STATUS_UP
@@ -4605,7 +4765,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             timeline_spread=payload.get("Timeline_Spread", 0),
             failover_age_s=payload.get("Failover_Age_s", -1),
             conn_saturation_pct=payload.get("Primary_Connection_Pct", 0.0),
-            archive_failed=payload.get("Primary_Archive_Failed", 0),
+            archive_failed=active_archive_failing,
             auth_failure=auth_failure,
             auth_msg=auth_msg,
             is_multi_master=is_multi_master,
@@ -4615,11 +4775,36 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
 
         payload["Cluster_Health"] = health.severity
         payload["Health_Code"] = health.code
-        payload["Health_Reason"] = health.fact[:MAX_STRING_CHARS]
         payload["Action_Hint"] = health.hint[:MAX_STRING_CHARS]
         payload["msg"] = health.format_msg()
 
-        if health.severity == HEALTH_CRITICAL or auth_failure:
+        # Compose descriptive, plain-language health sentence for Health_Reason
+        down_nodes = [r for r in node_rows if r.get("status") != STATUS_UP]
+        health_parts = []
+        if down_nodes:
+            down_names = ", ".join(r.get("name", "unknown") for r in down_nodes)
+            health_parts.append(f"{down_names} stopped")
+        if prev_primary_name and payload.get("Last_Failover_To") and payload.get("Last_Failover_To") != "none":
+            health_parts.append(f"failed over to {payload.get('Last_Failover_To')}")
+        nodes_up_count = int(payload.get("Nodes_Up", 0))
+        nodes_total_count = int(payload.get("Nodes_Total", 0))
+        standbys_streaming_count = int(payload.get("Standbys_Streaming", 0))
+        expected_standbys_count = int(payload.get("Standbys_Expected", 0))
+        if nodes_total_count > 0:
+            health_parts.append(f"{nodes_up_count} of {nodes_total_count} nodes up")
+        if expected_standbys_count > 0:
+            health_parts.append(f"{standbys_streaming_count} of {expected_standbys_count} standbys streaming")
+
+        if health_parts:
+            payload["Health_Reason"] = "; ".join(health_parts)[:MAX_STRING_CHARS]
+        else:
+            payload["Health_Reason"] = health.fact[:MAX_STRING_CHARS]
+
+        # Availability definition:
+        # status = 0 (OUTAGE) ONLY when primary is DOWN/absent, split brain, or complete auth failure.
+        # If primary is UP and serving writes, status = 1 (UP), while Cluster_Health reflects severity (WARN/CRITICAL).
+        has_healthy_primary = any(r["role"] == ROLE_PRIMARY and r["status"] == STATUS_UP for r in node_rows)
+        if not has_healthy_primary or auth_failure or health.code in (HEALTH_CODE_PRIMARY_DOWN, HEALTH_CODE_SPLIT_BRAIN, HEALTH_CODE_AUTH_FAIL):
             payload["status"] = STATUS_DOWN
         else:
             payload["status"] = STATUS_UP
@@ -4639,7 +4824,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     payload["Collect_Time_ms"] = round((time.time() - t0) * 1000.0, 2)
 
     # Fix 9: Backward compatibility injection for official postgres plugin
-    if compat_official == 1:
+    if compat_official == 1 and compat_metrics:
         # Check metric budget: platform cap is 200
         cur_metric_count = len([k for k, v in payload.items() if k not in RESERVED_KEYS and not isinstance(v, (list, dict))]) + len(compat_metrics)
         if cur_metric_count > 190:
@@ -4657,11 +4842,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             if target_tab_name in target_tabs:
                 cur_tablist = target_tabs[target_tab_name].setdefault("tablist", [])
                 for m_item in m_list:
-                    if m_item not in cur_tablist:
+                    if m_item in compat_metrics and m_item not in cur_tablist:
                         cur_tablist.append(m_item)
 
         # Finding 7: On PG < 14, prune Total Sessions* from units, tabs, and tables
-        if active_client_version < (14, 0):
+        if compat_client_version < (14, 0):
             for s_key in ("Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal", "Total Sessions Killed"):
                 compat_units.pop(s_key, None)
                 for t_info in target_tabs.values():
@@ -4672,7 +4857,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         payload["units"]["Stats_per_DB"] = copy.deepcopy(OFFICIAL_COMPAT_TABLE_UNITS["Stats_per_DB"])
 
         txn_units = copy.deepcopy(OFFICIAL_COMPAT_TABLE_UNITS["Transactions_Per_Database"])
-        if active_client_version < (14, 0):
+        if compat_client_version < (14, 0):
             for sc in ("sessions", "sessions_abandoned", "sessions_fatal", "sessions_killed", "session_time", "sessions_active_time", "idle_in_txn_time"):
                 txn_units.pop(sc, None)
         payload["units"]["Transactions_Per_Database"] = txn_units
@@ -4700,7 +4885,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     # 7. Validate payload integrity
     violations = validate_output(payload)
     if violations:
-        payload["msg"] = f"schema: {'; '.join(violations[:2])}"[:MAX_MSG_CHARS]
+        all_warnings.append(f"schema: {'; '.join(violations[:2])}")
+        payload["Collect_Warnings"] = len(all_warnings)
+        # Never clobber existing operational outage message
+        if payload.get("status") == STATUS_UP and not payload.get("msg"):
+            payload["msg"] = f"schema: {'; '.join(violations[:2])}"[:MAX_MSG_CHARS]
 
     return payload
 
@@ -4729,7 +4918,7 @@ def main():
         parser.add_argument("--address_map", type=str, default="", help="Address translation map (e.g. pg1:5432=127.0.0.1:5441)")
         parser.add_argument("--username", type=str, default="", help="Monitoring username")
         parser.add_argument("--password", type=str, default="", help="Monitoring password")
-        parser.add_argument("--db", type=str, default="postgres", help="Target database name")
+        parser.add_argument("--db", type=str, default="", help="Target database name")
         parser.add_argument("--cluster_name", type=str, default="", help="Cluster name override")
         parser.add_argument("--state_dir", type=str, default="", help="State file directory override")
         parser.add_argument("--sslmode", type=str, default="prefer", help="PostgreSQL SSL mode")

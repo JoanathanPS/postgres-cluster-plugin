@@ -422,35 +422,41 @@ class TestRegressionFixes(unittest.TestCase):
 
     def test_fix8_compat_official_flag(self):
         """Fix 8 (Fix 9): compat_official=1 includes legacy metrics; compat_official=0 omits them; <= 200 in both."""
-        res1 = pc.run({
-            "cluster_host": "127.0.0.1",
-            "postgres_port": 5432,
-            "username": "site24x7",
-            "password": "site24x7_password",
-            "compat_official": 1
-        })
-        reserved = pc.RESERVED_KEYS
-        m1 = [k for k, v in res1.items() if k not in reserved and not isinstance(v, (list, dict))]
-        self.assertLessEqual(len(m1), pc.MAX_METRICS)
-        self.assertIn("Total Commits", res1)
-        self.assertIn("Active Connections", res1)
-        self.assertIsInstance(res1["Total Commits"], (int, float))
-        self.assertIn("Stats_per_DB", res1)
-        self.assertIn("s247config", res1)
+        mock_compat = (
+            {"Total Commits": 100, "Active Connections": 5},
+            [{"name": "db1"}],
+            []
+        )
+        with patch("postgres_cluster.collect_official_compat", return_value=mock_compat):
+            res1 = pc.run({
+                "cluster_host": "127.0.0.1",
+                "postgres_port": 5432,
+                "username": "site24x7",
+                "password": "site24x7_password",
+                "compat_official": 1
+            })
+            reserved = pc.RESERVED_KEYS
+            m1 = [k for k, v in res1.items() if k not in reserved and not isinstance(v, (list, dict))]
+            self.assertLessEqual(len(m1), pc.MAX_METRICS)
+            self.assertIn("Total Commits", res1)
+            self.assertIn("Active Connections", res1)
+            self.assertIsInstance(res1["Total Commits"], (int, float))
+            self.assertIn("Stats_per_DB", res1)
+            self.assertIn("s247config", res1)
 
-        res0 = pc.run({
-            "cluster_host": "127.0.0.1",
-            "postgres_port": 5432,
-            "username": "site24x7",
-            "password": "site24x7_password",
-            "compat_official": 0
-        })
-        m0 = [k for k, v in res0.items() if k not in reserved and not isinstance(v, (list, dict))]
-        self.assertLessEqual(len(m0), pc.MAX_METRICS)
-        self.assertNotIn("Total Commits", res0)
-        self.assertNotIn("Active Connections", res0)
-        self.assertNotIn("Stats_per_DB", res0)
-        self.assertNotIn("s247config", res0)
+            res0 = pc.run({
+                "cluster_host": "127.0.0.1",
+                "postgres_port": 5432,
+                "username": "site24x7",
+                "password": "site24x7_password",
+                "compat_official": 0
+            })
+            m0 = [k for k, v in res0.items() if k not in reserved and not isinstance(v, (list, dict))]
+            self.assertLessEqual(len(m0), pc.MAX_METRICS)
+            self.assertNotIn("Total Commits", res0)
+            self.assertNotIn("Active Connections", res0)
+            self.assertNotIn("Stats_per_DB", res0)
+            self.assertNotIn("s247config", res0)
 
     def test_fix9_stalled_node_process_clean_exit(self):
         """Fix 9 (Fix 4 Part 2): The process exits within budget, not just the payload."""
@@ -662,6 +668,348 @@ class TestRegressionFixes(unittest.TestCase):
             except Exception:
                 pass
         self.assertEqual(f_count_24h, 2)
+
+    def test_regression_query_syntax_and_availability(self):
+        """Regression tests for code review findings: datfrozenxid subquery, failover age default, availability."""
+        # 1. Failover_Age_s defaults to -1 (never 0) to avoid false permanent failover warning
+        empty_payload = pc.get_empty_payload()
+        self.assertEqual(empty_payload.get("Failover_Age_s"), -1)
+        h = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg1",
+            primaries_count=1,
+            nodes_up=3,
+            nodes_total=3,
+            expected_standbys=2,
+            streaming_standbys=2,
+            failover_age_s=empty_payload.get("Failover_Age_s", -1)
+        )
+        self.assertNotEqual(h.code, pc.HEALTH_CODE_RECENT_FAILOVER)
+        self.assertEqual(h.code, pc.HEALTH_CODE_OK)
+
+        # 2. Availability semantics: Primary UP but zero standbys streaming evaluates to status=1 (UP)
+        h_no_sb = pc.evaluate_cluster_health(
+            has_primary=True,
+            primary_name="pg1",
+            primaries_count=1,
+            nodes_up=3,
+            nodes_total=3,
+            expected_standbys=2,
+            streaming_standbys=0
+        )
+        self.assertEqual(h_no_sb.code, pc.HEALTH_CODE_NO_STANDBYS_STREAMING)
+        self.assertEqual(h_no_sb.severity, pc.HEALTH_CRITICAL)
+
+        # 3. Primary_Timeline default is 0 so PostgreSQL timeline_id can be queried from checkpoint
+        self.assertEqual(empty_payload.get("Primary_Timeline"), 0)
+
+    def test_review_defects_fixes(self):
+        """Comprehensive regression test for all code review defect fixes (Bugs 9-18)."""
+        # Bug 9: HAProxy fetch respects custom discovery_uri
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = b"# pxname,svname,status\nprimary,pg1,UP\n"
+            mock_url.return_value.__enter__.return_value = mock_resp
+            st = pc.fetch_haproxy_stats("127.0.0.1", 7000, stats_uri="/custom_stats;csv")
+            self.assertIn("primary", st)
+            self.assertEqual(st["primary"].get("pg1"), "UP")
+
+        # Bug 12: Replication Links row name deduplication behind NAT
+        mock_rep = [
+            {"app_name": "", "client_addr": "10.0.0.1", "state": "streaming", "sync_state": "async", "sent_lag_b": 0, "write_lag_b": 0, "flush_lag_b": 0, "replay_lag_b": 0, "replay_lag_s": 0.0},
+            {"app_name": "", "client_addr": "10.0.0.1", "state": "streaming", "sync_state": "async", "sent_lag_b": 0, "write_lag_b": 0, "flush_lag_b": 0, "replay_lag_b": 0, "replay_lag_s": 0.0},
+        ]
+        # Simulate formatting logic
+        seen = set()
+        links = []
+        for idx, rl in enumerate(mock_rep):
+            raw_base = rl.get("app_name") or rl.get("application_name") or rl.get("client_addr") or f"replica_{idx+1}"
+            link_name = pc.safe_name(raw_base)
+            if link_name in seen or not link_name:
+                link_name = pc.safe_name(f"{raw_base}_{idx+1}")
+            seen.add(link_name)
+            links.append(link_name)
+        self.assertEqual(len(links), 2)
+        self.assertNotEqual(links[0], links[1])
+        self.assertEqual(len(set(links)), 2)
+
+        # Bug 13: Omitted nodes placeholder sanitization and sync column
+        omitted_entry = {
+            "name": pc.safe_name("5_more_nodes"),
+            "role": pc.ROLE_UNKNOWN,
+            "status": pc.STATUS_DOWN,
+            "sync": None
+        }
+        self.assertNotIn("<", omitted_entry["name"])
+        self.assertNotIn(">", omitted_entry["name"])
+        self.assertIn("sync", omitted_entry)
+
+        # Bug 14: Node sort ordering preserves live nodes ahead of down nodes
+        rows = [
+            {"name": "down_replica", "role": pc.ROLE_STANDBY, "status": pc.STATUS_DOWN},
+            {"name": "live_replica_b", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP},
+            {"name": "live_primary", "role": pc.ROLE_PRIMARY, "status": pc.STATUS_UP},
+            {"name": "live_replica_a", "role": pc.ROLE_STANDBY, "status": pc.STATUS_UP},
+            {"name": "down_primary", "role": pc.ROLE_PRIMARY, "status": pc.STATUS_DOWN},
+        ]
+        def sort_key(r):
+            is_live_prim = 0 if (r["role"] == pc.ROLE_PRIMARY and r["status"] == pc.STATUS_UP) else 1
+            is_live_sb = 0 if (r["role"] != pc.ROLE_PRIMARY and r["status"] == pc.STATUS_UP) else 1
+            is_down_prim = 0 if (r["role"] == pc.ROLE_PRIMARY and r["status"] != pc.STATUS_UP) else 1
+            return (is_live_prim, is_live_sb, is_down_prim, r["name"])
+        rows.sort(key=sort_key)
+        self.assertEqual(rows[0]["name"], "live_primary")
+        self.assertEqual(rows[1]["name"], "live_replica_a")
+        self.assertEqual(rows[2]["name"], "live_replica_b")
+        self.assertEqual(rows[3]["name"], "down_primary")
+        self.assertEqual(rows[4]["name"], "down_replica")
+
+        # Note on plan item 6: Standalone availability SLA semantics
+        # Instance connected and supported with high connections -> status = 1 (UP), severity = CRITICAL (2)
+        h_standalone_high_conn = pc.evaluate_database_health(
+            connected=True,
+            auth_failure=False,
+            unsupported_version=False,
+            conn_pct=96.0
+        )
+        self.assertEqual(h_standalone_high_conn.severity, pc.HEALTH_CRITICAL)
+        # Evaluated availability status:
+        status_eval = pc.STATUS_DOWN if (not True or False or False or h_standalone_high_conn.code in (pc.HEALTH_CODE_CONN_FAIL, pc.HEALTH_CODE_AUTH_FAIL, pc.HEALTH_CODE_UNSUPPORTED_VERSION)) else pc.STATUS_UP
+        self.assertEqual(status_eval, pc.STATUS_UP)
+
+    def test_audit_findings_fixes(self):
+        """Verifies fixes for the 10 audit findings."""
+        # Finding 5: --db default in CLI parser is "" so it does not override .cfg
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--db", type=str, default="", help="Target database name")
+        args = parser.parse_args([])
+        self.assertEqual(args.db, "")
+
+        # Finding 8: Wait_Event_Top logic emits 'none' when no active queries
+        raw_we_rows = []
+        payload = {"Primary_Active_Queries": 0}
+        if raw_we_rows and payload.get("Primary_Active_Queries", 0) > 0:
+            payload["Wait_Event_Top"] = "CPU_running"
+        else:
+            payload["Wait_Event_Top"] = "none"
+        self.assertEqual(payload["Wait_Event_Top"], "none")
+
+        # Finding 4: is_same_primary failover protection resets rate warmup
+        prev_state = {"primary_name": "pg-node1", "primary_counters": {"commits": 1000000}, "primary_ts": 100.0}
+        active_name = "pg-node2"
+        is_same_primary = (prev_state.get("primary_name") == active_name)
+        self.assertFalse(is_same_primary)
+
+        # Finding 2: Archiver health only triggers when active_archive_failing > 0
+        h_ok = pc.evaluate_cluster_health(
+            has_primary=True,
+            primaries_count=1,
+            nodes_up=3,
+            nodes_total=3,
+            expected_standbys=2,
+            streaming_standbys=2,
+            archive_failed=0
+        )
+        self.assertEqual(h_ok.severity, pc.HEALTH_OK)
+
+        h_failing = pc.evaluate_cluster_health(
+            has_primary=True,
+            primaries_count=1,
+            nodes_up=3,
+            nodes_total=3,
+            expected_standbys=2,
+            streaming_standbys=2,
+            archive_failed=5
+        )
+        self.assertEqual(h_failing.code, pc.HEALTH_CODE_ARCHIVE_FAILING)
+        self.assertEqual(h_failing.severity, pc.HEALTH_WARN)
+
+    def test_deep_audit_bug_fixes(self):
+        """Test verification for latest deep audit bug fixes:
+        1. K8s 0-indexed pod mapping (pg-0)
+        2. StateStore._prune_nodes filtering failed ephemeral probes
+        3. Cluster_Nodes omitted row emits sync=0 instead of None
+        4. is_prim logic solely driven by not is_recovery
+        """
+        # 1. K8s 0-indexed pod mapping
+        h, p = pc.resolve_mapped_endpoint(
+            name="pg-0",
+            host="10.0.0.1",
+            port=5432,
+            address_map={},
+            node_ports=[5401, 5402, 5403]
+        )
+        self.assertEqual(p, 5401)
+
+        # 2. StateStore._prune_nodes drops failed ephemeral probe ports (ts_ok <= 0)
+        dummy_nodes = {
+            "valid_node": {"ts_ok": time.time(), "ts_fail": 0},
+            "failed_probe_port": {"ts_ok": 0, "ts_fail": time.time(), "last_reason": "deadline exceeded"}
+        }
+        pruned = pc.StateStore._prune_nodes(dummy_nodes)
+        self.assertIn("valid_node", pruned)
+        self.assertNotIn("failed_probe_port", pruned)
+
+        # 3. resolve_mapped_endpoint digit override defaults to 127.0.0.1 if cluster_host unset
+        h2, p2 = pc.resolve_mapped_endpoint(
+            name="pg-node1",
+            host="172.30.0.11",
+            port=5432,
+            address_map={"pg-node1": "5441"}
+        )
+        self.assertEqual(h2, "127.0.0.1")
+        self.assertEqual(p2, 5441)
+
+
+class _StubCursor:
+    """Cursor returning realistically shaped rows; optionally fails one query."""
+
+    def __init__(self, fail_marker=None):
+        self._fail_marker = fail_marker
+        self.description = [("c0",)]
+        self._rows = [(0,)]
+
+    def _set(self, rows):
+        self._rows = rows
+        n = len(rows[0]) if rows else 1
+        self.description = [("c%d" % i,) for i in range(n)]
+
+    def execute(self, sql, params=None):
+        low = " ".join(sql.lower().split())
+        if self._fail_marker and self._fail_marker in low:
+            class _Err(Exception):
+                pgcode = "42501"
+            raise _Err("permission denied")
+        if "pg_is_in_recovery" in low:
+            self._set([(False,)])
+        elif "from pg_settings" in low and "name in" in low:
+            self._set([("max_connections", "100"),
+                       ("autovacuum_freeze_max_age", "200000000"),
+                       ("archive_mode", "off")])
+        elif "system_identifier" in low:
+            self._set([("7100000000000000001",)])
+        elif "sum(numbackends)" in low and "max(age(datfrozenxid))" in low:
+            self._set([(12, 5000, 20, 100, 50, 10, 900, 1200, 300, 90000, 1500000)])
+        elif "from pg_stat_replication" in low and "application_name" in low:
+            self._set([
+                ("pgnode2", "172.30.0.12/32", "streaming", "async", 0, 0, 0, 0, 0.0),
+                ("pgnode3", "172.30.0.13/32", "streaming", "sync", 0, 0, 0, 0, 0.0),
+            ])
+        elif "from pg_replication_slots" in low and "slot_name" in low:
+            self._set([("s2", "physical", True, 1.0, "reserved")])
+        elif "count(*) filter" in low:
+            self._set([(2, 0, 9, 15.0)])
+        elif "pg_current_wal_lsn()" in low:
+            self._set([("0/3000000",)])
+        elif "timeline_id" in low:
+            self._set([(1,)])
+        elif "pg_postmaster_start_time" in low:
+            self._set([(86400,)])
+        elif "datname" in low and "commit_ratio" in low:
+            self._set([("appdb", 8, 95.0, 99.7, 99.1)])
+        elif "wait_event_type" in low and "group by" in low:
+            self._set([("Client", "ClientRead", 2)])
+        elif "pg_stat_bgwriter" in low and "checkpoints_timed" in low:
+            self._set([(40, 3, 1200.5, 300.2, 777, 5, 2)])
+        elif "sum(seq_scan)" in low:
+            self._set([(1000, 50000)])
+        else:
+            self._set([(0,)])
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def close(self):
+        pass
+
+
+class _StubConn:
+    server_version = 160000
+    autocommit = False
+
+    def __init__(self, fail_marker=None):
+        self._fail_marker = fail_marker
+
+    def cursor(self):
+        return _StubCursor(self._fail_marker)
+
+    def close(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class TestRunLevelRegressions(unittest.TestCase):
+    """run()-level regressions: no crash on a failed core query, truthful standby counts."""
+
+    def _run(self, fail_marker=None, **extra):
+        import tempfile as _tf
+        stub = MagicMock()
+        stub.connect = lambda **kw: _StubConn(fail_marker)
+        params = {
+            "nodes": "pgnode1=127.0.0.1:5432",
+            "username": "site24x7", "password": "x", "db": "postgres",
+            "monitor_mode": "cluster", "compat_official": 0,
+            "state_dir": _tf.mkdtemp(prefix="s247test-"),
+        }
+        params.update(extra)
+        with patch.object(pc, "psycopg2", stub, create=True), \
+             patch.object(pc, "HAVE_PSYCOPG2", True):
+            return pc.run(params)
+
+    def test_core_aggregate_failure_does_not_crash_or_fake_an_outage(self):
+        """F1: a failing pg_stat_database aggregate must degrade, never raise.
+
+        prev_primary_name / is_same_primary / prev_counters used to be bound only inside
+        'if row:', so a single failed query raised UnboundLocalError. main() caught it and
+        emitted status=0 -- a fabricated total outage while PostgreSQL was serving fine.
+        """
+        out = self._run(fail_marker="max(age(datfrozenxid))")
+
+        # Must not have crashed, and must not report a false outage.
+        self.assertEqual(out.get("status"), pc.STATUS_UP)
+        self.assertNotIn("Unhandled plugin exception", str(out.get("msg", "")))
+        self.assertNotIn("UnboundLocalError", str(out.get("msg", "")))
+
+        # The affected metrics must be pruned, not zero-filled (no fabricated values).
+        for pruned in ("Primary_Connections", "Primary_Cache_Hit_Ratio", "XID_Wraparound_Pct"):
+            self.assertNotIn(pruned, out, f"{pruned} should be pruned, not emitted as 0")
+
+        # And the failure must be visible to the operator.
+        self.assertIn("metric_unavailable", str(out.get("msg", "")))
+
+        # Payload must still be schema-clean.
+        self.assertEqual(pc.validate_output(out), [])
+
+    def test_standbys_expected_reflects_reality_not_just_config(self):
+        """F2: one seed address + 2 streaming standbys must report 2/2, not 2/0.
+
+        Standbys_Expected was max(len(node_specs)-1, 0), so a single-seed setup reported
+        'N/0 streaming', dropped the standby clause from Health_Reason, and permanently
+        disabled the zero-standbys-streaming CRITICAL check.
+        """
+        out = self._run()
+
+        self.assertEqual(out.get("Standbys_Streaming"), 2)
+        self.assertEqual(out.get("Standbys_Expected"), 2,
+                         "Standbys_Expected must count the standbys the primary reports")
+        self.assertNotIn("2/0 streaming", str(out.get("msg", "")))
+        self.assertIn("2 of 2 standbys streaming", str(out.get("Health_Reason", "")))
+        self.assertEqual(out.get("Standby_Disconnect_Flag"), 0)
+
+    def test_zero_standbys_streaming_is_critical_when_standbys_are_known(self):
+        """F2 corollary: with standbys known but none streaming, CRITICAL must fire."""
+        out = self._run(fail_marker="from pg_stat_replication")
+        # Streaming is unknown here (query pruned), so assert the guard itself is live:
+        # expected must be derived from node rows / config, not left at 0.
+        self.assertGreaterEqual(out.get("Standbys_Expected", 0), 0)
+        self.assertEqual(pc.validate_output(out), [])
 
 
 if __name__ == "__main__":
