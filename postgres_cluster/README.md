@@ -121,8 +121,7 @@ The plugin eliminates the requirement to manually configure individual backend P
          +-------------------------------------------------------------+
          |     Cluster Entry Point / Load Balancer (HAProxy / VIP)     |
          |  - Port 5500: Write pool (routes to active primary)         |
-         |  - Port 5501: Read pool (load balances active standbys)     |
-         |  - Port 7000: HAProxy stats interface (/stats;csv)         |
+         |  - Port 7000: Stats interface (/;csv) -- optional, naming   |
          +------+----------------------+-------------------------+-----+
                 |                      |                         |
                 v                      v                         v
@@ -211,7 +210,6 @@ In Docker Desktop on Windows with WSL2, internal bridge subnets (e.g. `172.18.0.
 | :--- | :--- | :--- | :--- |
 | **HAProxy Stats** | `patroni-haproxy:7000` | `http://127.0.0.1:7000/;csv` | HTTP Stats (CSV & HTML) |
 | **HAProxy Write Pool** | `patroni-haproxy:5000` | `127.0.0.1:5500` | PostgreSQL TCP (Leader) |
-| **HAProxy Read Pool** | `patroni-haproxy:5001` | `127.0.0.1:5501` | PostgreSQL TCP (Replicas) |
 | **PostgreSQL Node 1** | `pg-node1:5432` | `127.0.0.1:5441` | PostgreSQL TCP (Direct) |
 | **PostgreSQL Node 2** | `pg-node2:5432` | `127.0.0.1:5442` | PostgreSQL TCP (Direct) |
 | **PostgreSQL Node 3** | `pg-node3:5432` | `127.0.0.1:5443` | PostgreSQL TCP (Direct) |
@@ -276,23 +274,39 @@ For PostgreSQL versions prior to 10, grant `SELECT` on `pg_stat_database`, `pg_s
 ### 3.3 Health Condition Codes (`Health_Code`)
 | Code | Severity | Description | Default Action Hint |
 | :--- | :--- | :--- | :--- |
+**Live codes.** `Health_Code` is part of the published contract: an alert may be keyed
+on any value below, and these numbers will not be re-pointed at a different condition.
+
+| Code | Severity | Description | Default Action Hint |
+| :--- | :--- | :--- | :--- |
 | `0` | `OK` | Normal cluster operation | none |
 | `1` | `CRITICAL` | No primary reachable across any node | patronictl list; failover --candidate |
 | `2` | `CRITICAL` | Split-brain (multiple active primaries) | fence rogue primary immediately |
-| `3` | `CRITICAL` | No standbys streaming (zero redundancy) | check wal_sender limits and replication slots |
-| `4` | `CRITICAL` | Synchronous standby deficit below quorum | review synchronous_standby_names |
-| `5` | `CRITICAL` | Replication slot retained WAL >= 10 GB | verify standby or drop abandoned slot |
-| `6` | `CRITICAL` | XID wraparound emergency (age >= 1.8B) | run VACUUM FREEZE immediately |
-| `7` | `CRITICAL` | Standbys present but none eligible for failover | enable replication slots on standbys |
-| `10` | `WARN` | One or more standby nodes down/unreachable | restart postgresql service on node |
-| `11` | `WARN` | Standby replay lag exceeds threshold (> 60s) | check standby I/O saturation and network |
-| `12` | `WARN` | Inactive replication slot accumulating WAL | verify slot consumer is running |
-| `13` | `WARN` | Standby on older timeline than primary | pg_rewind or resync standby from primary |
-| `14` | `WARN` | Cluster failover occurred within warning window | verify previous primary re-joined as standby |
-| `15` | `WARN` | XID wraparound warning (age >= 1.0B) | schedule autovacuum freeze on older tables |
-| `16` | `WARN` | Connection pool saturation (>= 85%) | tune max_connections or deploy PgBouncer |
-| `17` | `WARN` | WAL archive command failing | check archiver disk space and permissions |
-| `18` | `WARN` | Stale statistics detected on major tables | run ANALYZE on active tables |
+| `7` | `CRITICAL` | No primary, and no standby eligible to be promoted | manual recovery; no candidate |
+| `8` | `CRITICAL` | Authentication failed for the monitoring role | check credentials in postgres_cluster.cfg |
+| `9` | `CRITICAL` | Instance unreachable (standalone mode) | check host, port and pg_hba.conf |
+| `10` | `WARN` | One or more cluster nodes down/unreachable | inspect the offline node's postmaster |
+| `19` | `CRITICAL` | PostgreSQL below the supported 9.6 floor | upgrade PostgreSQL to 9.6 or later |
+
+**Retired codes.** Earlier versions raised these for conditions that are now left to
+Site24x7 threshold profiles, so that the operator can tune them without editing the
+plugin. Nothing emits them any more; the numbers stay reserved so an existing alert
+cannot silently start matching a different condition. Threshold the metric instead:
+
+| Code | Was | Threshold this metric instead |
+| :--- | :--- | :--- |
+| `3` | No standbys streaming | `Standbys_Streaming`, `Standby_Disconnect_Flag` |
+| `4` | Synchronous standby deficit | `Sync_Standby_Count` |
+| `5` | Replication slot retaining WAL | `Slot_Risk`, `Max_Slot_Retained_MB` |
+| `6` | XID wraparound emergency | `XID_Wraparound_Pct` |
+| `11` | Standby replay lag high | `Max_Replay_Lag_s`, `Max_Replay_Backlog` |
+| `12` | Inactive slot accumulating WAL | `Inactive_Slots_Count` |
+| `13` | Timeline mismatch across nodes | `Timeline_Spread` |
+| `14` | Recent failover within window | `Failover_Age_s`, `Failover_Count_24h` |
+| `15` | XID wraparound warning | `XID_Wraparound_Pct` |
+| `16` | Connection pool saturation | `Primary_Connection_Pct` |
+| `17` | WAL archive command failing | `Archive_Failed` |
+| `18` | Stale statistics | never emitted |
 
 ### 3.4 Standby Sync State (`sync` column)
 | Integer | Mode | Description |
@@ -374,7 +388,7 @@ The plugin exposes exactly 7 child tables. Every table satisfies Site24x7 hard c
      patronictl -c /etc/patroni/patroni.yml reinit <cluster_name> <rogue_node>
      ```
 
-### Code 5: `CRITICAL c5: replication slot retained WAL exceeds 10 GB`
+### Slot retention (was code 5 -- now threshold `Slot_Risk` / `Max_Slot_Retained_MB`)
 - **Root Cause**: An inactive or disconnected replication slot is holding WAL segments on the primary, risking disk exhaustion.
 - **Runbook**:
   1. Identify the offending slot:
@@ -388,7 +402,7 @@ The plugin exposes exactly 7 child tables. Every table satisfies Site24x7 hard c
      SELECT pg_drop_replication_slot('offending_slot_name');
      ```
 
-### Code 6: `CRITICAL c6: transaction ID wraparound critical (>= 1.8B)`
+### XID wraparound (was code 6 -- now threshold `XID_Wraparound_Pct`)
 - **Root Cause**: Autovacuum is falling behind or blocked by long-running transactions, prepared transactions, or abandoned slots.
 - **Runbook**:
   1. Identify oldest transactions and relations:
