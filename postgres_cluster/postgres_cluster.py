@@ -2984,6 +2984,883 @@ def read_cfg_file(cfg_path: str) -> Dict[str, Any]:
     return out
 
 
+def build_child_tables(
+    payload: Dict[str, Any],
+    node_rows: List[Dict[str, Any]],
+    rep_link_data: List[Dict[str, Any]],
+    slot_rows: Optional[List[Tuple]],
+    db_stat_rows: List[Any],
+    raw_we_rows: List[Any],
+    standby_wal_rec: Optional[Tuple],
+) -> None:
+    """
+    Populates the Site24x7 child tables on the payload, in place.
+
+    Site24x7 caps every table at 25 rows, 15 columns and 5 string columns including
+    'name', so each table is truncated here rather than relying on the validator to
+    catch an overflow. Tables are emitted only for data that genuinely exists: an
+    empty list is a truthful 'nothing to report', whereas a synthesised placeholder
+    row would chart as a real measurement.
+    """
+    # 4. Format Child Tables (Site24x7 Hard Limits: <=10 tables, <=15 cols, <=5 strings, <=25 rows)
+
+    # 4.1 Cluster_Nodes
+    cluster_nodes_table: List[Dict[str, Any]] = []
+    for r in node_rows[:MAX_ROWS]:
+        node_entry = {
+            "name": safe_name(r["name"]),
+            "role": r["role"],
+            "status": r["status"],
+            "status_reason": str(r["status_reason"])[:MAX_STRING_CHARS],
+            "last_seen_s": r["last_seen_s"],
+            "last_seen_ts": str(r["last_seen_ts"])[:MAX_STRING_CHARS],
+            "timeline": r["timeline"],
+            "replay_lag_s": r["replay_lag_s"],
+            "replay_lag_bytes": r["replay_lag_bytes"],
+            "conn_pct": r["conn_pct"],
+            "resp_ms": r["resp_ms"],
+            "sync": 0 if r.get("sync") is None else (1 if r.get("sync") else 0),
+            "patroni_state": r["patroni_state"],
+            "xact_age_s": r["xact_age_s"]
+        }
+        cluster_nodes_table.append(node_entry)
+
+    if len(node_rows) > MAX_ROWS:
+        omitted = len(node_rows) - MAX_ROWS
+        payload["Nodes_Omitted"] = omitted
+        cluster_nodes_table.append({
+            "name": safe_name(f"{omitted}_more_nodes"),
+            "role": ROLE_UNKNOWN,
+            "status": STATUS_DOWN,
+            "status_reason": f"{omitted} nodes omitted by 25-row limit",
+            "last_seen_s": 0,
+            "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "timeline": 0,
+            "replay_lag_s": 0.0,
+            "replay_lag_bytes": 0,
+            "conn_pct": 0.0,
+            "resp_ms": 0.0,
+            "sync": 0,
+            "patroni_state": PATRONI_STATE_UNKNOWN,
+            "xact_age_s": 0
+        })
+    payload["Cluster_Nodes"] = cluster_nodes_table
+
+    # 4.2 Node_Snapshot
+    node_snapshot_table: List[Dict[str, Any]] = []
+    for r in node_rows[:MAX_ROWS]:
+        node_snapshot_table.append({
+            "name": safe_name(r["name"]),
+            "status": r.get("status", STATUS_DOWN),
+            "version_num": int(r.get("version_num") or 0),
+            "uptime_s": int(r.get("uptime_s") or 0),
+            "active_queries": int(r.get("active_queries") or 0),
+            "idle_in_txn": int(r.get("idle_in_txn") or 0),
+            "longest_query_s": int(r.get("longest_query_s") or 0),
+            "temp_bytes": int(r.get("temp_bytes") or 0),
+            "dead_tuples": int(r.get("dead_tuples") or 0)
+        })
+    payload["Node_Snapshot"] = node_snapshot_table
+
+    # 4.3 Replication_Links -- emitted only for links that genuinely exist
+    replication_links_table: List[Dict[str, Any]] = []
+    seen_link_names: Set[str] = set()
+    if rep_link_data:
+        for idx, rl in enumerate(rep_link_data[:MAX_ROWS]):
+            raw_base = rl.get("app_name") or rl.get("application_name") or rl.get("client_addr") or f"replica_{idx+1}"
+            link_name = safe_name(raw_base)
+            if link_name in seen_link_names or not link_name:
+                link_name = safe_name(f"{raw_base}_{idx+1}")
+            seen_link_names.add(link_name)
+            replication_links_table.append({
+                "name": link_name,
+                "status": 1 if rl["state"].lower() == "streaming" else 0,
+                "application_name": rl["app_name"][:MAX_STRING_CHARS],
+                "client_addr": rl["client_addr"][:MAX_STRING_CHARS],
+                "state": rl["state"][:MAX_STRING_CHARS],
+                "sync_state": rl["sync_state"][:MAX_STRING_CHARS],
+                "sent_lag_b": rl["sent_lag_b"],
+                "write_lag_b": rl["write_lag_b"],
+                "flush_lag_b": rl["flush_lag_b"],
+                "replay_lag_b": rl["replay_lag_b"],
+                "replay_lag_s": round(rl["replay_lag_s"], 2)
+            })
+    elif standby_wal_rec and standby_wal_rec[0]:
+        # Standby instance: ONE row describing upstream link from pg_stat_wal_receiver
+        s_host = str(standby_wal_rec[0] or "")
+        s_port = safe_int(standby_wal_rec[1])
+        s_st = str(standby_wal_rec[2] or "streaming")
+        s_lag_s = safe_float(standby_wal_rec[4])
+        s_lag_b = safe_int(standby_wal_rec[5])
+        up_addr = f"{s_host}:{s_port}" if s_port else s_host
+        replication_links_table.append({
+            "name": safe_name(f"upstream_{up_addr}"),
+            "status": 1 if s_st.lower() == "streaming" else 0,
+            "application_name": "walreceiver",
+            "client_addr": up_addr[:MAX_STRING_CHARS],
+            "state": s_st[:MAX_STRING_CHARS],
+            "sync_state": "none",
+            "sent_lag_b": 0,
+            "write_lag_b": 0,
+            "flush_lag_b": 0,
+            "replay_lag_b": s_lag_b,
+            "replay_lag_s": round(s_lag_s, 2)
+        })
+    # If standalone with no replication, replication_links_table remains empty []
+    payload["Replication_Links"] = replication_links_table[:MAX_ROWS]
+
+    # 4.4 Replication_Slots
+    replication_slots_table: List[Dict[str, Any]] = []
+    for s_row in (slot_rows or [])[:MAX_ROWS]:
+        s_name = str(s_row[0] or "")
+        s_type = str(s_row[1] or "") if len(s_row) > 1 else "physical"
+        s_act = 1 if bool(s_row[2]) else 0 if len(s_row) > 2 else 0
+        s_ret = safe_float(s_row[3]) if len(s_row) > 3 and s_row[3] is not None else 0.0
+        s_wal_st = str(s_row[4] if len(s_row) > 4 and s_row[4] is not None else "normal")
+        replication_slots_table.append({
+            "name": safe_name(s_name or "slot"),
+            "status": s_act,
+            "slot_type": s_type[:MAX_STRING_CHARS],
+            "active": s_act,
+            "retained_mb": round(s_ret, 2),
+            "wal_status": s_wal_st[:MAX_STRING_CHARS]
+        })
+    payload["Replication_Slots"] = replication_slots_table
+
+    # 4.5 Database_Stats
+    db_stats_table: List[Dict[str, Any]] = []
+    if db_stat_rows:
+        for ds in db_stat_rows[:MAX_ROWS]:
+            d_name = str(ds[0] or "")
+            d_conn = safe_int(ds[1])
+            d_size = safe_float(ds[2])
+            d_commit = safe_float(ds[3])
+            d_cache = safe_float(ds[4])
+            db_stats_table.append({
+                "name": safe_name(d_name),
+                "status": 1,
+                "size_mb": d_size,
+                "connections": d_conn,
+                "commit_ratio": d_commit,
+                "cache_hit_ratio": d_cache
+            })
+    payload["Database_Stats"] = db_stats_table[:MAX_ROWS]
+
+    # 4.6 Wait_Events
+    wait_events_table: List[Dict[str, Any]] = []
+    if raw_we_rows:
+        for we in raw_we_rows[:MAX_ROWS]:
+            ev_type = str(we[0] or "CPU")[:MAX_STRING_CHARS]
+            ev_name = str(we[1] or "running")[:MAX_STRING_CHARS]
+            ev_sess = safe_int(we[2])
+            wait_events_table.append({
+                "name": safe_name(f"{ev_type}_{ev_name}"),
+                "status": 1,
+                "event_type": ev_type,
+                "event": ev_name,
+                "sessions": ev_sess
+            })
+    payload["Wait_Events"] = wait_events_table[:MAX_ROWS]
+
+
+
+def collect_primary_metrics(
+    active_client: NodeClient,
+    payload: Dict[str, Any],
+    *,
+    merged: Dict[str, Any],
+    prev_state: Dict[str, Any],
+    new_state: Dict[str, Any],
+    all_warnings: List[str],
+    node_rows: List[Dict[str, Any]],
+    node_specs: List[Dict[str, Any]],
+    effective_mode: str,
+    patroni_probe_status: str,
+    dbname: str,
+    compat_official: int,
+    cluster_manager: int,
+    cluster_manager_str: str,
+    queries_count: int,
+    t0: float,
+) -> Dict[str, Any]:
+    """
+    Collects every metric that can only be read from a live connection, writing the
+    scalar metrics onto `payload` in place and returning the intermediate results the
+    caller still needs to build child tables and evaluate health.
+
+    The caller owns the connection: this function neither opens nor closes it, and the
+    unsupported-version precondition is checked before it is called.
+
+    Each query follows the same contract. On success the metric is written; on failure
+    the metric is removed with prune_omitted_metric() and a `metric_unavailable` note is
+    recorded, so a metric is never reported as a fabricated zero. Values that depend on
+    a previous poll (the `*_s` rates, Primary_Chkpts_Req_1h) are additionally suppressed
+    when the primary has changed identity since that poll, because differencing counters
+    across two different servers is meaningless.
+    """
+    # Outputs that are only populated on some paths must still be defined, since the
+    # caller unpacks every key of the returned dict.
+    compat_metrics: Dict[str, Any] = {}
+    compat_db_stats: List[Dict[str, Any]] = []
+    compat_txn_sessions: List[Dict[str, Any]] = []
+
+    payload["Primary_Up"] = 1
+    payload["Primary_Node"] = active_client.name
+    payload["Primary_Data_Source"] = "live"
+    payload["Cluster_Role"] = ROLE_PRIMARY if not active_client.is_recovery else ROLE_STANDBY
+
+    # 3.1 pg_stat_database aggregation
+    db_sql = """
+        SELECT sum(numbackends), sum(xact_commit), sum(xact_rollback),
+               sum(tup_inserted), sum(tup_updated), sum(tup_deleted),
+               sum(tup_fetched), sum(tup_returned), sum(blks_read), sum(blks_hit),
+               (SELECT max(age(datfrozenxid)) FROM pg_database WHERE NOT datistemplate)
+        FROM pg_stat_database;
+    """
+    # Baselines are resolved BEFORE the aggregate query runs: if that query fails, the
+    # sections below (WAL rate, archiver, checkpoints, scans) must still find these bound.
+    prev_primary_name = str(prev_state.get("primary_name") or "")
+    is_same_primary = (not prev_primary_name) or (prev_primary_name == active_client.name)
+    prev_counters = prev_state.get("primary_counters") or {}
+    max_xid_age = 0
+    row = active_client.query_one(db_sql)
+    queries_count += 1
+    commits, rollbacks, ins, upd, dels, blks_r, blks_h = 0, 0, 0, 0, 0, 0, 0
+    if row:
+        conns = safe_int(row[0]) if len(row) > 0 else 0
+        commits = safe_int(row[1]) if len(row) > 1 else 0
+        rollbacks = safe_int(row[2]) if len(row) > 2 else 0
+        ins = safe_int(row[3]) if len(row) > 3 else 0
+        upd = safe_int(row[4]) if len(row) > 4 else 0
+        dels = safe_int(row[5]) if len(row) > 5 else 0
+        blks_r = safe_int(row[8]) if len(row) > 8 else 0
+        blks_h = safe_int(row[9]) if len(row) > 9 else 0
+        max_xid_age = safe_int(row[10]) if len(row) > 10 else 0
+
+        payload["Primary_Connections"] = conns
+        payload["Active_Sessions"] = conns
+
+        # Rate calculation from state deltas
+        prev_ts = float(prev_state.get("primary_ts") or 0.0)
+        dt = t0 - prev_ts
+        if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
+            payload["Primary_Commits_s"] = round(max(0.0, commits - safe_float(prev_counters.get("commits", commits))) / dt, 2)
+            payload["Primary_Rollbacks_s"] = round(max(0.0, rollbacks - safe_float(prev_counters.get("rollbacks", rollbacks))) / dt, 2)
+            payload["Primary_Tup_Inserted_s"] = round(max(0.0, ins - safe_float(prev_counters.get("ins", ins))) / dt, 2)
+            payload["Primary_Tup_Updated_s"] = round(max(0.0, upd - safe_float(prev_counters.get("upd", upd))) / dt, 2)
+            payload["Primary_Tup_Deleted_s"] = round(max(0.0, dels - safe_float(prev_counters.get("dels", dels))) / dt, 2)
+            payload["Primary_Blks_Read_s"] = round(max(0.0, blks_r - safe_float(prev_counters.get("blks_r", blks_r))) / dt, 2)
+            payload["Blks_Read_s"] = payload["Primary_Blks_Read_s"]
+            payload["Blks_Hit_s"] = round(max(0.0, blks_h - safe_float(prev_counters.get("blks_h", blks_h))) / dt, 2)
+            payload["Rate_Warmup_Flag"] = 0
+        else:
+            payload["Primary_Commits_s"] = 0.0
+            payload["Primary_Rollbacks_s"] = 0.0
+            payload["Primary_Tup_Inserted_s"] = 0.0
+            payload["Primary_Tup_Updated_s"] = 0.0
+            payload["Primary_Tup_Deleted_s"] = 0.0
+            payload["Primary_Blks_Read_s"] = 0.0
+            payload["Blks_Read_s"] = 0.0
+            payload["Blks_Hit_s"] = 0.0
+            payload["Rate_Warmup_Flag"] = 1
+
+        total_blks = blks_h + blks_r
+        hit_ratio = round((100.0 * blks_h / total_blks), 2) if total_blks > 0 else 100.0
+        payload["Primary_Cache_Hit_Ratio"] = hit_ratio
+        payload["Cache_Hit_Ratio"] = hit_ratio
+
+        payload["Primary_XID_Age"] = max_xid_age
+        freeze_max = safe_int(active_client.settings.get("autovacuum_freeze_max_age", 200_000_000), default=200_000_000)
+        if freeze_max > 0:
+            wrap_pct = round(100.0 * max_xid_age / freeze_max, 2)
+            payload["Primary_XID_Wrap_Pct"] = wrap_pct
+            payload["XID_Wraparound_Pct"] = wrap_pct
+    elif active_client.last_error_class is not None:
+        # The core aggregate failed: drop every metric it feeds rather than emitting zeros.
+        err_cls = active_client.last_error_class
+        for _m in (
+            "Primary_Connections", "Active_Sessions",
+            "Primary_Commits_s", "Primary_Rollbacks_s",
+            "Primary_Tup_Inserted_s", "Primary_Tup_Updated_s", "Primary_Tup_Deleted_s",
+            "Primary_Blks_Read_s", "Blks_Read_s", "Blks_Hit_s",
+            "Primary_Cache_Hit_Ratio", "Cache_Hit_Ratio",
+            "Primary_XID_Age", "Primary_XID_Wrap_Pct", "XID_Wraparound_Pct",
+        ):
+            prune_omitted_metric(payload, _m)
+        payload["Rate_Warmup_Flag"] = 1
+        all_warnings.append(f"metric_unavailable: Primary_Connections ({err_cls})")
+
+    # 3.2 Max connections and connection percentage
+    max_conn = safe_int(active_client.settings.get("max_connections", 100), default=100)
+    payload["Primary_Max_Connections"] = max_conn
+    if max_conn > 0 and "Primary_Connections" in payload:
+        conn_pct = round(100.0 * payload["Primary_Connections"] / max_conn, 2)
+        payload["Primary_Connection_Pct"] = conn_pct
+
+    # 3.3 Active & Idle-in-transaction queries
+    backend_clause = "WHERE (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else "WHERE 1=1"
+    act_sql = f"""
+        SELECT
+            count(*) FILTER (WHERE state = 'active'),
+            count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
+            count(*) FILTER (WHERE state = 'idle'),
+            coalesce(max(extract(epoch from (now() - xact_start))), 0)
+        FROM pg_stat_activity
+        {backend_clause};
+    """
+    act_row = active_client.query_one(act_sql)
+    queries_count += 1
+    if act_row:
+        payload["Primary_Active_Queries"] = safe_int(act_row[0])
+        payload["Primary_Idle_In_Txn"] = safe_int(act_row[1]) if len(act_row) > 1 else 0
+        payload["Idle_Sessions"] = safe_int(act_row[2]) if len(act_row) > 2 else 0
+        payload["Primary_Longest_Txn_s"] = safe_int(act_row[3]) if len(act_row) > 3 else 0
+    elif active_client.last_error_class is not None:
+        err_cls = active_client.last_error_class
+        prune_omitted_metric(payload, "Primary_Active_Queries")
+        prune_omitted_metric(payload, "Primary_Idle_In_Txn")
+        prune_omitted_metric(payload, "Idle_Sessions")
+        prune_omitted_metric(payload, "Primary_Longest_Txn_s")
+        all_warnings.append(f"metric_unavailable: Primary_Active_Queries ({err_cls})")
+
+    # 3.4 WAL Current Position & Directory (Replay LSN on standby, Current LSN on writable)
+    if active_client.is_recovery:
+        wal_sql = "SELECT pg_last_wal_replay_lsn();" if active_client.requires("pg_current_wal_lsn") else "SELECT pg_last_xlog_replay_location();"
+    else:
+        wal_sql = "SELECT pg_current_wal_lsn();" if active_client.requires("pg_current_wal_lsn") else "SELECT pg_current_xlog_location();"
+    wal_row = active_client.query_one(wal_sql)
+    queries_count += 1
+    wal_bytes = 0
+    if wal_row and wal_row[0]:
+        wal_bytes = lsn_to_bytes(wal_row[0])
+        wal_mb = round(wal_bytes / (1024 * 1024), 2)
+        payload["Primary_WAL_LSN_MB"] = wal_mb
+        payload["WAL_LSN_MB"] = wal_mb
+        prev_counters = prev_state.get("primary_counters") or {}
+        prev_ts = float(prev_state.get("primary_ts") or 0.0)
+        dt = t0 - prev_ts
+        if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
+            p_wal = prev_counters.get("wal_bytes", wal_bytes)
+            payload["Primary_WAL_Rate_MBs"] = round(max(0.0, wal_bytes - p_wal) / (1024 * 1024 * dt), 2)
+            payload["WAL_Rate_MBs"] = payload["Primary_WAL_Rate_MBs"]
+        else:
+            payload["Primary_WAL_Rate_MBs"] = 0.0
+            payload["WAL_Rate_MBs"] = 0.0
+
+    # 3.5 Uptime
+    uptime_row = active_client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()));")
+    queries_count += 1
+    if uptime_row and uptime_row[0]:
+        payload["Primary_Uptime_s"] = int(uptime_row[0])
+
+    # 3.6 Replication Standbys & Slots
+    # Standbys_Expected must reflect the cluster, not just the config. With a single seed
+    # address len(node_specs) is 1, which previously reported "N/0 streaming", emptied
+    # Health_Reason and disabled the zero-standbys-streaming CRITICAL check entirely.
+    configured_standbys = max(len(node_specs) - 1, 0)
+    discovered_standbys = len([
+        r for r in node_rows
+        if r.get("role") in (ROLE_STANDBY, ROLE_DELAYED, ROLE_CASCADING, ROLE_STANDBY_LEADER)
+    ])
+    if effective_mode == MODE_STANDALONE:
+        payload["Standbys_Expected"] = 0
+    else:
+        payload["Standbys_Expected"] = max(configured_standbys, discovered_standbys)
+
+    rep_sql = """
+        SELECT application_name, client_addr::text, state, sync_state,
+               coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn), 0) as sent_lag_b,
+               coalesce(pg_wal_lsn_diff(sent_lsn, write_lsn), 0) as write_lag_b,
+               coalesce(pg_wal_lsn_diff(sent_lsn, flush_lsn), 0) as flush_lag_b,
+               coalesce(pg_wal_lsn_diff(sent_lsn, replay_lsn), 0) as replay_lag_b,
+               coalesce(extract(epoch from replay_lag)::float, 0.0) as replay_lag_s
+        FROM pg_stat_replication;
+    """ if active_client.version_tuple >= (10, 0) else "SELECT application_name, client_addr, state, sync_state, 0 as sent_lag_b, 0 as write_lag_b, 0 as flush_lag_b, 0 as replay_lag_b, 0.0 as replay_lag_s FROM pg_stat_replication;"
+    rep_rows = active_client.query_all(rep_sql)
+    queries_count += 1
+    if rep_rows is None:
+        err_cls = active_client.last_error_class or "query_error"
+        prune_omitted_metric(payload, "Standbys_Streaming")
+        prune_omitted_metric(payload, "Sync_Standby_Count")
+        all_warnings.append(f"metric_unavailable: Standbys_Streaming ({err_cls})")
+        all_warnings.append(f"metric_unavailable: Sync_Standby_Count ({err_cls})")
+    else:
+        # Columns 2 and 3 are state and sync_state. A short row means the query
+        # shape changed, so skip it rather than compare the wrong column.
+        streaming_count = len([r for r in rep_rows if len(r) > 2 and str(r[2]).lower() == "streaming"])
+        sync_count = len([r for r in rep_rows if len(r) > 3 and str(r[3]).lower() in ("sync", "quorum")])
+        payload["Standbys_Streaming"] = streaming_count
+        payload["Sync_Standby_Count"] = sync_count
+        # A standby the primary is actively streaming to is by definition expected.
+        if effective_mode != MODE_STANDALONE:
+            payload["Standbys_Expected"] = max(
+                safe_int(payload.get("Standbys_Expected", 0)), streaming_count
+            )
+
+    if active_client.version_tuple >= (10, 0):
+        slot_sql = """
+            SELECT slot_name, slot_type, active,
+                   pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024.0 / 1024.0 as retained_mb,
+                   wal_status
+            FROM pg_replication_slots;
+        """ if active_client.version_tuple >= (13, 0) else """
+            SELECT slot_name, slot_type, active,
+                   pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024.0 / 1024.0 as retained_mb,
+                   'normal' as wal_status
+            FROM pg_replication_slots;
+        """
+    else:
+        slot_sql = "SELECT slot_name, slot_type, active, 0.0 as retained_mb, 'normal' as wal_status FROM pg_replication_slots;"
+
+    slot_rows = active_client.query_all(slot_sql)
+    queries_count += 1
+    if slot_rows is None:
+        err_cls = active_client.last_error_class or "query_error"
+        prune_omitted_metric(payload, "Replication_Slots_Total")
+        prune_omitted_metric(payload, "Replication_Slots_Active")
+        prune_omitted_metric(payload, "Inactive_Slots_Count")
+        prune_omitted_metric(payload, "Max_Slot_Retained_MB")
+        prune_omitted_metric(payload, "Slot_Risk")
+        all_warnings.append(f"metric_unavailable: Replication_Slots_Total ({err_cls})")
+        all_warnings.append(f"metric_unavailable: Replication_Slots_Active ({err_cls})")
+        all_warnings.append(f"metric_unavailable: Inactive_Slots_Count ({err_cls})")
+    else:
+        payload["Replication_Slots_Total"] = len(slot_rows)
+        payload["Replication_Slots_Active"] = len([s for s in slot_rows if bool(s[2])])
+        payload["Inactive_Slots_Count"] = len(slot_rows) - payload["Replication_Slots_Active"]
+        retained_list = [safe_float(s[3]) for s in slot_rows if len(s) > 3 and s[3] is not None]
+        payload["Max_Slot_Retained_MB"] = max(retained_list, default=0.0)
+        slot_risk = 0
+        for s in slot_rows:
+            s_active = bool(s[2])
+            s_ret = safe_float(s[3]) if len(s) > 3 else 0.0
+            s_wal_st = str(s[4]).lower() if len(s) > 4 else "normal"
+            if s_wal_st == "lost":
+                slot_risk = max(slot_risk, 3)
+            elif s_wal_st == "unreserved" or s_ret > 10240.0:
+                slot_risk = max(slot_risk, 2)
+            elif (not s_active) or s_ret > 1024.0:
+                slot_risk = max(slot_risk, 1)
+        payload["Slot_Risk"] = slot_risk
+
+    # 3.7 Archiver status
+    active_archive_failing = 0
+    if active_client.settings.get("archive_mode", "off") != "off":
+        payload["Archive_Mode"] = active_client.settings.get("archive_mode")
+        arch_row = active_client.query_one("""
+            SELECT archived_count, failed_count, last_archived_wal,
+                   coalesce(extract(epoch from (now() - last_archived_time))::int, 0) as lag_s,
+                   CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END as is_failing
+            FROM pg_stat_archiver;
+        """)
+        queries_count += 1
+        if active_client.last_error_class is not None:
+            err_cls = active_client.last_error_class
+            prune_omitted_metric(payload, "Primary_Archive_Ok")
+            prune_omitted_metric(payload, "Archive_Success")
+            prune_omitted_metric(payload, "Primary_Archive_Failed")
+            prune_omitted_metric(payload, "Archive_Failed")
+            prune_omitted_metric(payload, "Primary_Archive_Lag_s")
+            all_warnings.append(f"metric_unavailable: Archive_Success ({err_cls})")
+        elif arch_row:
+            payload["Primary_Archive_Ok"] = safe_int(arch_row[0])
+            payload["Archive_Success"] = safe_int(arch_row[0])
+            cur_arch_failed = safe_int(arch_row[1])
+            payload["Primary_Archive_Failed"] = cur_arch_failed
+            payload["Archive_Failed"] = cur_arch_failed
+            payload["Last_Archived_WAL"] = str(arch_row[2] or "none")[:MAX_STRING_CHARS]
+            payload["Primary_Archive_Lag_s"] = safe_int(arch_row[3])
+            arch_is_failing = bool(safe_int(arch_row[4])) if len(arch_row) > 4 else False
+            prev_arch_failed = safe_int(prev_counters.get("arch_failed", cur_arch_failed))
+            if arch_is_failing or (cur_arch_failed > prev_arch_failed and is_same_primary):
+                active_archive_failing = cur_arch_failed
+
+        if active_client.version_tuple >= (10, 0):
+            ready_row = active_client.query_one("SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
+            queries_count += 1
+            if ready_row and ready_row[0] is not None:
+                payload["Primary_Archive_Ready"] = safe_int(ready_row[0])
+                payload["Archive_Ready"] = safe_int(ready_row[0])
+            else:
+                prune_omitted_metric(payload, "Primary_Archive_Ready")
+                prune_omitted_metric(payload, "Archive_Ready")
+                if active_client.last_error_class is not None:
+                    all_warnings.append(f"metric_unavailable: Primary_Archive_Ready ({active_client.last_error_class})")
+        else:
+            prune_omitted_metric(payload, "Primary_Archive_Ready")
+            prune_omitted_metric(payload, "Archive_Ready")
+    else:
+        payload["Archive_Mode"] = "off"
+        prune_omitted_metric(payload, "Primary_Archive_Ok")
+        prune_omitted_metric(payload, "Archive_Success")
+        prune_omitted_metric(payload, "Primary_Archive_Failed")
+        prune_omitted_metric(payload, "Archive_Failed")
+        prune_omitted_metric(payload, "Primary_Archive_Ready")
+        prune_omitted_metric(payload, "Archive_Ready")
+        prune_omitted_metric(payload, "Primary_Archive_Lag_s")
+
+    # 3.8 Database sizes
+    db_size_sql = "SELECT count(*), coalesce(sum(CASE WHEN has_database_privilege(oid, 'CONNECT') THEN pg_database_size(oid) ELSE 0 END) / (1024*1024), 0) FROM pg_database WHERE datallowconn;"
+    db_size_row = active_client.query_one(db_size_sql)
+    queries_count += 1
+    if active_client.last_error_class is not None:
+        err_cls = active_client.last_error_class
+        prune_omitted_metric(payload, "DB_Count")
+        prune_omitted_metric(payload, "DB_Total_Size_MB")
+        all_warnings.append(f"metric_unavailable: DB_Count ({err_cls})")
+    elif db_size_row:
+        payload["DB_Count"] = int(db_size_row[0] or 0)
+        payload["DB_Total_Size_MB"] = round(float(db_size_row[1] or 0), 2) if len(db_size_row) > 1 else 0.0
+
+    # 3.9 Health and activity metrics
+    # Long running queries
+    lq_sec = safe_int(merged.get("long_query_seconds", 300), default=300)
+    lq_backend = "AND (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else ""
+    lq_sql = f"""
+        SELECT count(*) FROM pg_stat_activity
+        WHERE state = 'active'
+          {lq_backend}
+          AND (now() - query_start) > interval '{lq_sec} seconds';
+    """
+    lq_row = active_client.query_one(lq_sql)
+    queries_count += 1
+    if lq_row and lq_row[0] is not None:
+        payload["Long_Running_Queries"] = safe_int(lq_row[0])
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Long_Running_Queries")
+        all_warnings.append(f"metric_unavailable: Long_Running_Queries ({active_client.last_error_class})")
+
+    # Blocked sessions
+    if active_client.version_tuple >= (9, 6):
+        bs_sql = "SELECT count(*) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0;"
+        bs_row = active_client.query_one(bs_sql)
+        queries_count += 1
+        if bs_row and bs_row[0] is not None:
+            payload["Blocked_Sessions"] = safe_int(bs_row[0])
+            payload["Primary_Blocked_Locks"] = safe_int(bs_row[0])
+        elif active_client.last_error_class is not None:
+            prune_omitted_metric(payload, "Blocked_Sessions")
+            all_warnings.append(f"metric_unavailable: Blocked_Sessions ({active_client.last_error_class})")
+    else:
+        prune_omitted_metric(payload, "Blocked_Sessions")
+
+    # Dead tuples total
+    dt_sql = "SELECT coalesce(sum(n_dead_tup), 0) FROM pg_stat_user_tables;"
+    dt_row = active_client.query_one(dt_sql)
+    queries_count += 1
+    if dt_row and dt_row[0] is not None:
+        payload["Dead_Tuples_Total"] = safe_int(dt_row[0])
+        payload["Primary_Dead_Tuples"] = safe_int(dt_row[0])
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Dead_Tuples_Total")
+        all_warnings.append(f"metric_unavailable: Dead_Tuples_Total ({active_client.last_error_class})")
+
+    # Sessions killed (PG 14+)
+    if active_client.version_tuple >= (14, 0):
+        sk_row = active_client.query_one("SELECT coalesce(sum(sessions_killed), 0) FROM pg_stat_database;")
+        queries_count += 1
+        if sk_row and sk_row[0] is not None:
+            payload["Primary_Sessions_Killed"] = safe_int(sk_row[0])
+        elif active_client.last_error_class is not None:
+            prune_omitted_metric(payload, "Primary_Sessions_Killed")
+            all_warnings.append(f"metric_unavailable: Primary_Sessions_Killed ({active_client.last_error_class})")
+    else:
+        prune_omitted_metric(payload, "Primary_Sessions_Killed")
+
+    # Logical replication & subscriptions
+    has_sub = False
+    if active_client.version_tuple >= (10, 0):
+        sub_cnt = active_client.query_one("SELECT count(*) FROM pg_subscription;")
+        queries_count += 1
+        if sub_cnt and safe_int(sub_cnt[0]) > 0:
+            has_sub = True
+
+    if has_sub:
+        payload["Logical_Replication_Used"] = 1
+        if active_client.version_tuple >= (15, 0):
+            sub_stats = active_client.query_one("SELECT coalesce(sum(apply_error_count), 0), coalesce(sum(sync_error_count), 0) FROM pg_stat_subscription_stats;")
+            queries_count += 1
+            if sub_stats:
+                payload["Subscription_Apply_Errors"] = safe_int(sub_stats[0]) if len(sub_stats) > 0 else 0
+                payload["Subscription_Conflicts"] = safe_int(sub_stats[1]) if len(sub_stats) > 1 else 0
+            else:
+                prune_omitted_metric(payload, "Subscription_Apply_Errors")
+                prune_omitted_metric(payload, "Subscription_Conflicts")
+        else:
+            prune_omitted_metric(payload, "Subscription_Apply_Errors")
+            prune_omitted_metric(payload, "Subscription_Conflicts")
+
+        sub_lag = active_client.query_one("""
+            SELECT coalesce(max(CASE WHEN received_lsn = latest_end_lsn THEN 0.0 ELSE extract(epoch from (now() - latest_end_time)) END), 0.0)
+            FROM pg_stat_subscription
+            WHERE latest_end_time IS NOT NULL;
+        """)
+        queries_count += 1
+        if sub_lag and sub_lag[0] is not None:
+            payload["Max_Logical_Lag_s"] = round(safe_float(sub_lag[0]), 2)
+        else:
+            prune_omitted_metric(payload, "Max_Logical_Lag_s")
+    else:
+        payload["Logical_Replication_Used"] = 0
+        prune_omitted_metric(payload, "Subscription_Apply_Errors")
+        prune_omitted_metric(payload, "Subscription_Conflicts")
+        prune_omitted_metric(payload, "Max_Logical_Lag_s")
+
+    # Cascading and delayed standby counts
+    payload["Cascading_Standby_Count"] = len([r for r in node_rows if r.get("role") == ROLE_CASCADING])
+    payload["Delayed_Standby_Count"] = len([r for r in node_rows if r.get("role") == ROLE_DELAYED])
+    s_exp = safe_int(payload.get("Standbys_Expected", 0))
+    s_act = safe_int(payload.get("Standbys_Streaming", 0))
+    payload["Standby_Disconnect_Flag"] = 1 if s_exp > s_act else 0
+
+    # Multi-master & mesh metrics
+    is_multi_master = bool(int(merged.get("is_multi_master") or 0)) or str(merged.get("topology_type", "")).lower() in ("multi_master", "4")
+    if is_multi_master:
+        mesh_sql = "SELECT count(*), count(*) FILTER (WHERE active) FROM pg_replication_slots WHERE slot_type = 'logical';"
+        m_row = active_client.query_one(mesh_sql)
+        queries_count += 1
+        if m_row:
+            m_decl = safe_int(m_row[0])
+            m_act = safe_int(m_row[1]) if len(m_row) > 1 else m_decl
+            payload["Mesh_Links_Declared"] = m_decl
+            payload["Mesh_Links_Active"] = m_act
+            payload["Mesh_Disconnect_Flag"] = 1 if m_decl > m_act else 0
+        else:
+            payload["Mesh_Links_Declared"] = 0
+            payload["Mesh_Links_Active"] = 0
+            payload["Mesh_Disconnect_Flag"] = 0
+    else:
+        prune_omitted_metric(payload, "Mesh_Links_Declared")
+        prune_omitted_metric(payload, "Mesh_Links_Active")
+        prune_omitted_metric(payload, "Mesh_Disconnect_Flag")
+
+    # Snapshot state for rate delta calculation and primary clamping
+    new_state["primary_counters"] = {
+        "commits": commits, "rollbacks": rollbacks,
+        "ins": ins, "upd": upd, "dels": dels,
+        "blks_r": blks_r, "blks_h": blks_h,
+        "wal_bytes": wal_bytes
+    }
+    new_state["primary_metrics"] = {k: v for k, v in payload.items() if k.startswith("Primary_")}
+    new_state["primary_ts"] = t0
+    new_state["primary_name"] = active_client.name
+
+    # Query standby wal_receiver if in recovery
+    standby_wal_rec = None
+    active_client_is_recovery = active_client.is_recovery
+    active_client_version = active_client.version_tuple
+    if active_client.is_recovery:
+        if active_client.requires("pg_wal_lsn_diff"):
+            wal_rec_sql = """
+                SELECT sender_host, sender_port, status, slot_name,
+                       coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
+                       coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0) as replay_lag_b
+                FROM pg_stat_wal_receiver;
+            """
+        else:
+            wal_rec_sql = """
+                SELECT sender_host, sender_port, status, slot_name,
+                       coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
+                       coalesce(pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()), 0) as replay_lag_b
+                FROM pg_stat_wal_receiver;
+            """
+        standby_wal_rec = active_client.query_one(wal_rec_sql)
+        queries_count += 1
+
+    # Detect cluster manager before closing active connection
+    if effective_mode == MODE_STANDALONE:
+        cluster_manager = 0
+        cluster_manager_str = "standalone"
+    elif cluster_manager not in (TOPOLOGY_PATRONI, TOPOLOGY_REPMGR, TOPOLOGY_CITUS, TOPOLOGY_CNPG, TOPOLOGY_STOLON):
+        mgr_code, mgr_str, probe_res = probe_cluster_managers(active_client, patroni_probe_status)
+        if mgr_code != TOPOLOGY_UNKNOWN or not cluster_manager:
+            cluster_manager = mgr_code
+            cluster_manager_str = mgr_str
+
+    # Query real per-database statistics using datid
+    db_stats_query_sql = """
+        SELECT datname,
+               numbackends,
+               round((CASE WHEN has_database_privilege(datname, 'CONNECT') THEN pg_database_size(datid) ELSE 0 END / (1024*1024)::numeric), 2) as size_mb,
+               round(CASE WHEN (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)) = 0 THEN 100.0
+                          ELSE (100.0 * coalesce(xact_commit, 0) / (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)))::numeric END, 2) as commit_ratio,
+               round(CASE WHEN (coalesce(blks_hit, 0) + coalesce(blks_read, 0)) = 0 THEN 100.0
+                          ELSE (100.0 * coalesce(blks_hit, 0) / (coalesce(blks_hit, 0) + coalesce(blks_read, 0)))::numeric END, 2) as cache_hit_ratio
+        FROM pg_stat_database
+        WHERE datname IS NOT NULL AND datname NOT IN ('template0', 'template1')
+        ORDER BY size_mb DESC;
+    """
+    db_stat_rows = active_client.query_all(db_stats_query_sql) or []
+    queries_count += 1
+
+    # Query real wait events from active client sessions
+    we_backend = "WHERE (backend_type = 'client backend' OR backend_type IS NULL) AND state = 'active'" if active_client.requires("pg_stat_activity_backend_type") else "WHERE state = 'active'"
+    we_query_sql = f"""
+        SELECT coalesce(wait_event_type, 'CPU') as event_type,
+               coalesce(wait_event, 'running') as event,
+               count(*) as sessions
+        FROM pg_stat_activity
+        {we_backend}
+        GROUP BY wait_event_type, wait_event
+        ORDER BY sessions DESC;
+    """
+    raw_we_rows = active_client.query_all(we_query_sql) or []
+    queries_count += 1
+
+    # 3.10 Checkpoints, BGWriter & IO Telemetry
+    if active_client.version_tuple >= (17, 0):
+        chk_sql = """
+            SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time,
+                   coalesce((SELECT sum(writes) FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation'), 0),
+                   b.maxwritten_clean,
+                   coalesce((SELECT sum(fsyncs) FROM pg_stat_io WHERE backend_type = 'client backend'), 0)
+            FROM pg_stat_checkpointer c, pg_stat_bgwriter b;
+        """
+    else:
+        chk_sql = """
+            SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, checkpoint_sync_time,
+                   buffers_backend, maxwritten_clean, buffers_backend_fsync
+            FROM pg_stat_bgwriter;
+        """
+    chk_row = active_client.query_one(chk_sql)
+    queries_count += 1
+    if chk_row:
+        payload["Checkpoints_Timed"] = safe_int(chk_row[0]) if len(chk_row) > 0 else 0
+        payload["Checkpoints_Req"] = safe_int(chk_row[1]) if len(chk_row) > 1 else 0
+        payload["Checkpoint_Write_ms"] = safe_float(chk_row[2]) if len(chk_row) > 2 else 0.0
+        payload["Primary_Chkpt_Write_ms"] = payload["Checkpoint_Write_ms"]
+        payload["Buffers_Backend"] = safe_int(chk_row[4]) if len(chk_row) > 4 else 0
+        payload["Maxwritten_Clean"] = safe_int(chk_row[5]) if len(chk_row) > 5 else 0
+        payload["Backend_Fsync"] = safe_int(chk_row[6]) if len(chk_row) > 6 else 0
+
+        cur_chk_req = safe_int(chk_row[1]) if len(chk_row) > 1 else 0
+        prev_counters = prev_state.get("primary_counters") or {}
+        prev_chk_req = safe_int(prev_counters.get("checkpoints_req", cur_chk_req))
+        prev_ts = float(prev_state.get("primary_ts") or 0.0)
+        dt = t0 - prev_ts
+        if is_same_primary and 0 < dt <= 7200:
+            req_delta = max(0, cur_chk_req - prev_chk_req)
+            payload["Primary_Chkpts_Req_1h"] = safe_int(round(req_delta * (3600.0 / dt))) if dt < 3600 else req_delta
+        else:
+            payload["Primary_Chkpts_Req_1h"] = 0
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Checkpoints_Timed")
+        prune_omitted_metric(payload, "Checkpoints_Req")
+        prune_omitted_metric(payload, "Checkpoint_Write_ms")
+        prune_omitted_metric(payload, "Primary_Chkpt_Write_ms")
+        prune_omitted_metric(payload, "Buffers_Backend")
+        prune_omitted_metric(payload, "Maxwritten_Clean")
+        prune_omitted_metric(payload, "Backend_Fsync")
+        prune_omitted_metric(payload, "Primary_Chkpts_Req_1h")
+
+    # 3.11 Index Hit Ratio
+    idx_hit_sql = """
+        SELECT CASE WHEN (coalesce(sum(idx_blks_hit), 0) + coalesce(sum(idx_blks_read), 0)) = 0 THEN 100.0
+                    ELSE round(100.0 * sum(idx_blks_hit) / (sum(idx_blks_hit) + sum(idx_blks_read)), 2)
+               END
+        FROM pg_statio_user_tables;
+    """
+    idx_hit_row = active_client.query_one(idx_hit_sql)
+    queries_count += 1
+    if idx_hit_row and len(idx_hit_row) > 0 and idx_hit_row[0] is not None:
+        payload["Index_Hit_Ratio"] = safe_float(idx_hit_row[0])
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Index_Hit_Ratio")
+
+    # 3.12 Table Scans (Seq & Idx) Rates
+    scan_sql = "SELECT coalesce(sum(seq_scan), 0), coalesce(sum(idx_scan), 0) FROM pg_stat_user_tables;"
+    scan_row = active_client.query_one(scan_sql)
+    queries_count += 1
+    cur_seq = 0
+    cur_idx = 0
+    if scan_row:
+        cur_seq = safe_int(scan_row[0]) if len(scan_row) > 0 else 0
+        cur_idx = safe_int(scan_row[1]) if len(scan_row) > 1 else 0
+        prev_counters = prev_state.get("primary_counters") or {}
+        prev_seq = safe_int(prev_counters.get("seq_scans", cur_seq))
+        prev_idx = safe_int(prev_counters.get("idx_scans", cur_idx))
+        prev_ts = float(prev_state.get("primary_ts") or 0.0)
+        dt = t0 - prev_ts
+        if is_same_primary and 0.5 <= dt <= 900.0:
+            payload["Seq_Scans_s"] = round(max(0.0, cur_seq - prev_seq) / dt, 2)
+            payload["Idx_Scans_s"] = round(max(0.0, cur_idx - prev_idx) / dt, 2)
+        else:
+            payload["Seq_Scans_s"] = 0.0
+            payload["Idx_Scans_s"] = 0.0
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Seq_Scans_s")
+        prune_omitted_metric(payload, "Idx_Scans_s")
+
+    # 3.13 Temp Files Utilization
+    temp_sql = "SELECT coalesce(max(temp_bytes) / (1024.0 * 1024.0), 0.0) FROM pg_stat_database;"
+    temp_row = active_client.query_one(temp_sql)
+    queries_count += 1
+    if temp_row and len(temp_row) > 0 and temp_row[0] is not None:
+        payload["Max_Temp_MB"] = round(safe_float(temp_row[0]), 2)
+    elif active_client.last_error_class is not None:
+        prune_omitted_metric(payload, "Max_Temp_MB")
+
+    # 3.14 WAL Directory Disk Size
+    if active_client.version_tuple >= (10, 0):
+        wal_dir_sql = "SELECT coalesce(sum(size) / (1024.0 * 1024.0), 0.0) FROM pg_ls_waldir();"
+        wal_dir_row = active_client.query_one(wal_dir_sql)
+        queries_count += 1
+        if wal_dir_row and len(wal_dir_row) > 0 and wal_dir_row[0] is not None:
+            wal_mb = round(safe_float(wal_dir_row[0]), 2)
+            payload["Primary_WAL_Dir_MB"] = wal_mb
+            payload["WAL_Dir_MB"] = wal_mb
+        else:
+            prune_omitted_metric(payload, "Primary_WAL_Dir_MB")
+            prune_omitted_metric(payload, "WAL_Dir_MB")
+    else:
+        prune_omitted_metric(payload, "Primary_WAL_Dir_MB")
+        prune_omitted_metric(payload, "WAL_Dir_MB")
+
+    # 3.15 Top Wait Event & Largest Database
+    if db_stat_rows:
+        payload["Largest_DB"] = str(db_stat_rows[0][0])[:MAX_STRING_CHARS]
+    elif payload.get("DB_Count", 0) > 0:
+        payload["Largest_DB"] = safe_name(dbname or "postgres")
+
+    if raw_we_rows and payload.get("Primary_Active_Queries", 0) > 0:
+        ev_t = str(raw_we_rows[0][0] or "CPU")[:50]
+        ev_n = str(raw_we_rows[0][1] or "running")[:50]
+        payload["Wait_Event_Top"] = safe_name(f"{ev_t}_{ev_n}")
+    else:
+        payload["Wait_Event_Top"] = "none"
+
+    # Update primary_counters with checkpoint, scan, and archive metrics
+    new_state["primary_counters"]["checkpoints_req"] = payload.get("Checkpoints_Req", 0)
+    new_state["primary_counters"]["seq_scans"] = cur_seq
+    new_state["primary_counters"]["idx_scans"] = cur_idx
+    new_state["primary_counters"]["arch_failed"] = payload.get("Primary_Archive_Failed", 0)
+
+    # Official-plugin compatibility metrics (see collect_official_compat)
+    compat_client_version = getattr(active_client, "version_tuple", (0, 0))
+    if compat_official == 1:
+        compat_metrics, compat_db_stats, compat_txn_sessions = collect_official_compat(active_client)
+
+    return {
+        "queries_count": queries_count,
+        "cluster_manager": cluster_manager,
+        "cluster_manager_str": cluster_manager_str,
+        "rep_rows": rep_rows,
+        "slot_rows": slot_rows,
+        "db_stat_rows": db_stat_rows,
+        "raw_we_rows": raw_we_rows,
+        "standby_wal_rec": standby_wal_rec,
+        "active_client_is_recovery": active_client_is_recovery,
+        "active_client_version": active_client_version,
+        "compat_client_version": compat_client_version,
+        "compat_metrics": compat_metrics,
+        "compat_db_stats": compat_db_stats,
+        "compat_txn_sessions": compat_txn_sessions,
+        "is_multi_master": is_multi_master,
+        "active_archive_failing": active_archive_failing,
+        "prev_primary_name": prev_primary_name,
+    }
+
+
 def run(param: Dict[str, Any]) -> Dict[str, Any]:
     """Standard Site24x7 plugin entry point."""
     t0 = time.time()
@@ -3815,641 +4692,41 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 standby_client.close()
             return payload
 
-        payload["Primary_Up"] = 1
-        payload["Primary_Node"] = active_client.name
-        payload["Primary_Data_Source"] = "live"
-        payload["Cluster_Role"] = ROLE_PRIMARY if not active_client.is_recovery else ROLE_STANDBY
-
-        # 3.1 pg_stat_database aggregation
-        db_sql = """
-            SELECT sum(numbackends), sum(xact_commit), sum(xact_rollback),
-                   sum(tup_inserted), sum(tup_updated), sum(tup_deleted),
-                   sum(tup_fetched), sum(tup_returned), sum(blks_read), sum(blks_hit),
-                   (SELECT max(age(datfrozenxid)) FROM pg_database WHERE NOT datistemplate)
-            FROM pg_stat_database;
-        """
-        # Baselines are resolved BEFORE the aggregate query runs: if that query fails, the
-        # sections below (WAL rate, archiver, checkpoints, scans) must still find these bound.
-        prev_primary_name = str(prev_state.get("primary_name") or "")
-        is_same_primary = (not prev_primary_name) or (prev_primary_name == active_client.name)
-        prev_counters = prev_state.get("primary_counters") or {}
-        max_xid_age = 0
-        row = active_client.query_one(db_sql)
-        queries_count += 1
-        commits, rollbacks, ins, upd, dels, blks_r, blks_h = 0, 0, 0, 0, 0, 0, 0
-        if row:
-            conns = safe_int(row[0]) if len(row) > 0 else 0
-            commits = safe_int(row[1]) if len(row) > 1 else 0
-            rollbacks = safe_int(row[2]) if len(row) > 2 else 0
-            ins = safe_int(row[3]) if len(row) > 3 else 0
-            upd = safe_int(row[4]) if len(row) > 4 else 0
-            dels = safe_int(row[5]) if len(row) > 5 else 0
-            blks_r = safe_int(row[8]) if len(row) > 8 else 0
-            blks_h = safe_int(row[9]) if len(row) > 9 else 0
-            max_xid_age = safe_int(row[10]) if len(row) > 10 else 0
-
-            payload["Primary_Connections"] = conns
-            payload["Active_Sessions"] = conns
-
-            # Rate calculation from state deltas
-            prev_ts = float(prev_state.get("primary_ts") or 0.0)
-            dt = t0 - prev_ts
-            if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
-                payload["Primary_Commits_s"] = round(max(0.0, commits - safe_float(prev_counters.get("commits", commits))) / dt, 2)
-                payload["Primary_Rollbacks_s"] = round(max(0.0, rollbacks - safe_float(prev_counters.get("rollbacks", rollbacks))) / dt, 2)
-                payload["Primary_Tup_Inserted_s"] = round(max(0.0, ins - safe_float(prev_counters.get("ins", ins))) / dt, 2)
-                payload["Primary_Tup_Updated_s"] = round(max(0.0, upd - safe_float(prev_counters.get("upd", upd))) / dt, 2)
-                payload["Primary_Tup_Deleted_s"] = round(max(0.0, dels - safe_float(prev_counters.get("dels", dels))) / dt, 2)
-                payload["Primary_Blks_Read_s"] = round(max(0.0, blks_r - safe_float(prev_counters.get("blks_r", blks_r))) / dt, 2)
-                payload["Blks_Read_s"] = payload["Primary_Blks_Read_s"]
-                payload["Blks_Hit_s"] = round(max(0.0, blks_h - safe_float(prev_counters.get("blks_h", blks_h))) / dt, 2)
-                payload["Rate_Warmup_Flag"] = 0
-            else:
-                payload["Primary_Commits_s"] = 0.0
-                payload["Primary_Rollbacks_s"] = 0.0
-                payload["Primary_Tup_Inserted_s"] = 0.0
-                payload["Primary_Tup_Updated_s"] = 0.0
-                payload["Primary_Tup_Deleted_s"] = 0.0
-                payload["Primary_Blks_Read_s"] = 0.0
-                payload["Blks_Read_s"] = 0.0
-                payload["Blks_Hit_s"] = 0.0
-                payload["Rate_Warmup_Flag"] = 1
-
-            total_blks = blks_h + blks_r
-            hit_ratio = round((100.0 * blks_h / total_blks), 2) if total_blks > 0 else 100.0
-            payload["Primary_Cache_Hit_Ratio"] = hit_ratio
-            payload["Cache_Hit_Ratio"] = hit_ratio
-
-            payload["Primary_XID_Age"] = max_xid_age
-            freeze_max = safe_int(active_client.settings.get("autovacuum_freeze_max_age", 200_000_000), default=200_000_000)
-            if freeze_max > 0:
-                wrap_pct = round(100.0 * max_xid_age / freeze_max, 2)
-                payload["Primary_XID_Wrap_Pct"] = wrap_pct
-                payload["XID_Wraparound_Pct"] = wrap_pct
-        elif active_client.last_error_class is not None:
-            # The core aggregate failed: drop every metric it feeds rather than emitting zeros.
-            err_cls = active_client.last_error_class
-            for _m in (
-                "Primary_Connections", "Active_Sessions",
-                "Primary_Commits_s", "Primary_Rollbacks_s",
-                "Primary_Tup_Inserted_s", "Primary_Tup_Updated_s", "Primary_Tup_Deleted_s",
-                "Primary_Blks_Read_s", "Blks_Read_s", "Blks_Hit_s",
-                "Primary_Cache_Hit_Ratio", "Cache_Hit_Ratio",
-                "Primary_XID_Age", "Primary_XID_Wrap_Pct", "XID_Wraparound_Pct",
-            ):
-                prune_omitted_metric(payload, _m)
-            payload["Rate_Warmup_Flag"] = 1
-            all_warnings.append(f"metric_unavailable: Primary_Connections ({err_cls})")
-
-        # 3.2 Max connections and connection percentage
-        max_conn = safe_int(active_client.settings.get("max_connections", 100), default=100)
-        payload["Primary_Max_Connections"] = max_conn
-        if max_conn > 0 and "Primary_Connections" in payload:
-            conn_pct = round(100.0 * payload["Primary_Connections"] / max_conn, 2)
-            payload["Primary_Connection_Pct"] = conn_pct
-
-        # 3.3 Active & Idle-in-transaction queries
-        backend_clause = "WHERE (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else "WHERE 1=1"
-        act_sql = f"""
-            SELECT
-                count(*) FILTER (WHERE state = 'active'),
-                count(*) FILTER (WHERE state LIKE 'idle in transaction%'),
-                count(*) FILTER (WHERE state = 'idle'),
-                coalesce(max(extract(epoch from (now() - xact_start))), 0)
-            FROM pg_stat_activity
-            {backend_clause};
-        """
-        act_row = active_client.query_one(act_sql)
-        queries_count += 1
-        if act_row:
-            payload["Primary_Active_Queries"] = safe_int(act_row[0])
-            payload["Primary_Idle_In_Txn"] = safe_int(act_row[1]) if len(act_row) > 1 else 0
-            payload["Idle_Sessions"] = safe_int(act_row[2]) if len(act_row) > 2 else 0
-            payload["Primary_Longest_Txn_s"] = safe_int(act_row[3]) if len(act_row) > 3 else 0
-        elif active_client.last_error_class is not None:
-            err_cls = active_client.last_error_class
-            prune_omitted_metric(payload, "Primary_Active_Queries")
-            prune_omitted_metric(payload, "Primary_Idle_In_Txn")
-            prune_omitted_metric(payload, "Idle_Sessions")
-            prune_omitted_metric(payload, "Primary_Longest_Txn_s")
-            all_warnings.append(f"metric_unavailable: Primary_Active_Queries ({err_cls})")
-
-        # 3.4 WAL Current Position & Directory (Replay LSN on standby, Current LSN on writable)
-        if active_client.is_recovery:
-            wal_sql = "SELECT pg_last_wal_replay_lsn();" if active_client.requires("pg_current_wal_lsn") else "SELECT pg_last_xlog_replay_location();"
-        else:
-            wal_sql = "SELECT pg_current_wal_lsn();" if active_client.requires("pg_current_wal_lsn") else "SELECT pg_current_xlog_location();"
-        wal_row = active_client.query_one(wal_sql)
-        queries_count += 1
-        wal_bytes = 0
-        if wal_row and wal_row[0]:
-            wal_bytes = lsn_to_bytes(wal_row[0])
-            wal_mb = round(wal_bytes / (1024 * 1024), 2)
-            payload["Primary_WAL_LSN_MB"] = wal_mb
-            payload["WAL_LSN_MB"] = wal_mb
-            prev_counters = prev_state.get("primary_counters") or {}
-            prev_ts = float(prev_state.get("primary_ts") or 0.0)
-            dt = t0 - prev_ts
-            if is_same_primary and prev_counters and 0.5 <= dt <= 900.0:
-                p_wal = prev_counters.get("wal_bytes", wal_bytes)
-                payload["Primary_WAL_Rate_MBs"] = round(max(0.0, wal_bytes - p_wal) / (1024 * 1024 * dt), 2)
-                payload["WAL_Rate_MBs"] = payload["Primary_WAL_Rate_MBs"]
-            else:
-                payload["Primary_WAL_Rate_MBs"] = 0.0
-                payload["WAL_Rate_MBs"] = 0.0
-
-        # 3.5 Uptime
-        uptime_row = active_client.query_one("SELECT extract(epoch from (now() - pg_postmaster_start_time()));")
-        queries_count += 1
-        if uptime_row and uptime_row[0]:
-            payload["Primary_Uptime_s"] = int(uptime_row[0])
-
-        # 3.6 Replication Standbys & Slots
-        # Standbys_Expected must reflect the cluster, not just the config. With a single seed
-        # address len(node_specs) is 1, which previously reported "N/0 streaming", emptied
-        # Health_Reason and disabled the zero-standbys-streaming CRITICAL check entirely.
-        configured_standbys = max(len(node_specs) - 1, 0)
-        discovered_standbys = len([
-            r for r in node_rows
-            if r.get("role") in (ROLE_STANDBY, ROLE_DELAYED, ROLE_CASCADING, ROLE_STANDBY_LEADER)
-        ])
-        if effective_mode == MODE_STANDALONE:
-            payload["Standbys_Expected"] = 0
-        else:
-            payload["Standbys_Expected"] = max(configured_standbys, discovered_standbys)
-
-        rep_sql = """
-            SELECT application_name, client_addr::text, state, sync_state,
-                   coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn), 0) as sent_lag_b,
-                   coalesce(pg_wal_lsn_diff(sent_lsn, write_lsn), 0) as write_lag_b,
-                   coalesce(pg_wal_lsn_diff(sent_lsn, flush_lsn), 0) as flush_lag_b,
-                   coalesce(pg_wal_lsn_diff(sent_lsn, replay_lsn), 0) as replay_lag_b,
-                   coalesce(extract(epoch from replay_lag)::float, 0.0) as replay_lag_s
-            FROM pg_stat_replication;
-        """ if active_client.version_tuple >= (10, 0) else "SELECT application_name, client_addr, state, sync_state, 0 as sent_lag_b, 0 as write_lag_b, 0 as flush_lag_b, 0 as replay_lag_b, 0.0 as replay_lag_s FROM pg_stat_replication;"
-        rep_rows = active_client.query_all(rep_sql)
-        queries_count += 1
-        if rep_rows is None:
-            err_cls = active_client.last_error_class or "query_error"
-            prune_omitted_metric(payload, "Standbys_Streaming")
-            prune_omitted_metric(payload, "Sync_Standby_Count")
-            all_warnings.append(f"metric_unavailable: Standbys_Streaming ({err_cls})")
-            all_warnings.append(f"metric_unavailable: Sync_Standby_Count ({err_cls})")
-        else:
-            # Columns 2 and 3 are state and sync_state. A short row means the query
-            # shape changed, so skip it rather than compare the wrong column.
-            streaming_count = len([r for r in rep_rows if len(r) > 2 and str(r[2]).lower() == "streaming"])
-            sync_count = len([r for r in rep_rows if len(r) > 3 and str(r[3]).lower() in ("sync", "quorum")])
-            payload["Standbys_Streaming"] = streaming_count
-            payload["Sync_Standby_Count"] = sync_count
-            # A standby the primary is actively streaming to is by definition expected.
-            if effective_mode != MODE_STANDALONE:
-                payload["Standbys_Expected"] = max(
-                    safe_int(payload.get("Standbys_Expected", 0)), streaming_count
-                )
-
-        if active_client.version_tuple >= (10, 0):
-            slot_sql = """
-                SELECT slot_name, slot_type, active,
-                       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024.0 / 1024.0 as retained_mb,
-                       wal_status
-                FROM pg_replication_slots;
-            """ if active_client.version_tuple >= (13, 0) else """
-                SELECT slot_name, slot_type, active,
-                       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024.0 / 1024.0 as retained_mb,
-                       'normal' as wal_status
-                FROM pg_replication_slots;
-            """
-        else:
-            slot_sql = "SELECT slot_name, slot_type, active, 0.0 as retained_mb, 'normal' as wal_status FROM pg_replication_slots;"
-
-        slot_rows = active_client.query_all(slot_sql)
-        queries_count += 1
-        if slot_rows is None:
-            err_cls = active_client.last_error_class or "query_error"
-            prune_omitted_metric(payload, "Replication_Slots_Total")
-            prune_omitted_metric(payload, "Replication_Slots_Active")
-            prune_omitted_metric(payload, "Inactive_Slots_Count")
-            prune_omitted_metric(payload, "Max_Slot_Retained_MB")
-            prune_omitted_metric(payload, "Slot_Risk")
-            all_warnings.append(f"metric_unavailable: Replication_Slots_Total ({err_cls})")
-            all_warnings.append(f"metric_unavailable: Replication_Slots_Active ({err_cls})")
-            all_warnings.append(f"metric_unavailable: Inactive_Slots_Count ({err_cls})")
-        else:
-            payload["Replication_Slots_Total"] = len(slot_rows)
-            payload["Replication_Slots_Active"] = len([s for s in slot_rows if bool(s[2])])
-            payload["Inactive_Slots_Count"] = len(slot_rows) - payload["Replication_Slots_Active"]
-            retained_list = [safe_float(s[3]) for s in slot_rows if len(s) > 3 and s[3] is not None]
-            payload["Max_Slot_Retained_MB"] = max(retained_list, default=0.0)
-            slot_risk = 0
-            for s in slot_rows:
-                s_active = bool(s[2])
-                s_ret = safe_float(s[3]) if len(s) > 3 else 0.0
-                s_wal_st = str(s[4]).lower() if len(s) > 4 else "normal"
-                if s_wal_st == "lost":
-                    slot_risk = max(slot_risk, 3)
-                elif s_wal_st == "unreserved" or s_ret > 10240.0:
-                    slot_risk = max(slot_risk, 2)
-                elif (not s_active) or s_ret > 1024.0:
-                    slot_risk = max(slot_risk, 1)
-            payload["Slot_Risk"] = slot_risk
-
-        # 3.7 Archiver status
-        active_archive_failing = 0
-        if active_client.settings.get("archive_mode", "off") != "off":
-            payload["Archive_Mode"] = active_client.settings.get("archive_mode")
-            arch_row = active_client.query_one("""
-                SELECT archived_count, failed_count, last_archived_wal,
-                       coalesce(extract(epoch from (now() - last_archived_time))::int, 0) as lag_s,
-                       CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END as is_failing
-                FROM pg_stat_archiver;
-            """)
-            queries_count += 1
-            if active_client.last_error_class is not None:
-                err_cls = active_client.last_error_class
-                prune_omitted_metric(payload, "Primary_Archive_Ok")
-                prune_omitted_metric(payload, "Archive_Success")
-                prune_omitted_metric(payload, "Primary_Archive_Failed")
-                prune_omitted_metric(payload, "Archive_Failed")
-                prune_omitted_metric(payload, "Primary_Archive_Lag_s")
-                all_warnings.append(f"metric_unavailable: Archive_Success ({err_cls})")
-            elif arch_row:
-                payload["Primary_Archive_Ok"] = safe_int(arch_row[0])
-                payload["Archive_Success"] = safe_int(arch_row[0])
-                cur_arch_failed = safe_int(arch_row[1])
-                payload["Primary_Archive_Failed"] = cur_arch_failed
-                payload["Archive_Failed"] = cur_arch_failed
-                payload["Last_Archived_WAL"] = str(arch_row[2] or "none")[:MAX_STRING_CHARS]
-                payload["Primary_Archive_Lag_s"] = safe_int(arch_row[3])
-                arch_is_failing = bool(safe_int(arch_row[4])) if len(arch_row) > 4 else False
-                prev_arch_failed = safe_int(prev_counters.get("arch_failed", cur_arch_failed))
-                if arch_is_failing or (cur_arch_failed > prev_arch_failed and is_same_primary):
-                    active_archive_failing = cur_arch_failed
-
-            if active_client.version_tuple >= (10, 0):
-                ready_row = active_client.query_one("SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready';")
-                queries_count += 1
-                if ready_row and ready_row[0] is not None:
-                    payload["Primary_Archive_Ready"] = safe_int(ready_row[0])
-                    payload["Archive_Ready"] = safe_int(ready_row[0])
-                else:
-                    prune_omitted_metric(payload, "Primary_Archive_Ready")
-                    prune_omitted_metric(payload, "Archive_Ready")
-                    if active_client.last_error_class is not None:
-                        all_warnings.append(f"metric_unavailable: Primary_Archive_Ready ({active_client.last_error_class})")
-            else:
-                prune_omitted_metric(payload, "Primary_Archive_Ready")
-                prune_omitted_metric(payload, "Archive_Ready")
-        else:
-            payload["Archive_Mode"] = "off"
-            prune_omitted_metric(payload, "Primary_Archive_Ok")
-            prune_omitted_metric(payload, "Archive_Success")
-            prune_omitted_metric(payload, "Primary_Archive_Failed")
-            prune_omitted_metric(payload, "Archive_Failed")
-            prune_omitted_metric(payload, "Primary_Archive_Ready")
-            prune_omitted_metric(payload, "Archive_Ready")
-            prune_omitted_metric(payload, "Primary_Archive_Lag_s")
-
-        # 3.8 Database sizes
-        db_size_sql = "SELECT count(*), coalesce(sum(CASE WHEN has_database_privilege(oid, 'CONNECT') THEN pg_database_size(oid) ELSE 0 END) / (1024*1024), 0) FROM pg_database WHERE datallowconn;"
-        db_size_row = active_client.query_one(db_size_sql)
-        queries_count += 1
-        if active_client.last_error_class is not None:
-            err_cls = active_client.last_error_class
-            prune_omitted_metric(payload, "DB_Count")
-            prune_omitted_metric(payload, "DB_Total_Size_MB")
-            all_warnings.append(f"metric_unavailable: DB_Count ({err_cls})")
-        elif db_size_row:
-            payload["DB_Count"] = int(db_size_row[0] or 0)
-            payload["DB_Total_Size_MB"] = round(float(db_size_row[1] or 0), 2) if len(db_size_row) > 1 else 0.0
-
-        # 3.9 Health and activity metrics
-        # Long running queries
-        lq_sec = safe_int(merged.get("long_query_seconds", 300), default=300)
-        lq_backend = "AND (backend_type = 'client backend' OR backend_type IS NULL)" if active_client.requires("pg_stat_activity_backend_type") else ""
-        lq_sql = f"""
-            SELECT count(*) FROM pg_stat_activity
-            WHERE state = 'active'
-              {lq_backend}
-              AND (now() - query_start) > interval '{lq_sec} seconds';
-        """
-        lq_row = active_client.query_one(lq_sql)
-        queries_count += 1
-        if lq_row and lq_row[0] is not None:
-            payload["Long_Running_Queries"] = safe_int(lq_row[0])
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Long_Running_Queries")
-            all_warnings.append(f"metric_unavailable: Long_Running_Queries ({active_client.last_error_class})")
-
-        # Blocked sessions
-        if active_client.version_tuple >= (9, 6):
-            bs_sql = "SELECT count(*) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0;"
-            bs_row = active_client.query_one(bs_sql)
-            queries_count += 1
-            if bs_row and bs_row[0] is not None:
-                payload["Blocked_Sessions"] = safe_int(bs_row[0])
-                payload["Primary_Blocked_Locks"] = safe_int(bs_row[0])
-            elif active_client.last_error_class is not None:
-                prune_omitted_metric(payload, "Blocked_Sessions")
-                all_warnings.append(f"metric_unavailable: Blocked_Sessions ({active_client.last_error_class})")
-        else:
-            prune_omitted_metric(payload, "Blocked_Sessions")
-
-        # Dead tuples total
-        dt_sql = "SELECT coalesce(sum(n_dead_tup), 0) FROM pg_stat_user_tables;"
-        dt_row = active_client.query_one(dt_sql)
-        queries_count += 1
-        if dt_row and dt_row[0] is not None:
-            payload["Dead_Tuples_Total"] = safe_int(dt_row[0])
-            payload["Primary_Dead_Tuples"] = safe_int(dt_row[0])
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Dead_Tuples_Total")
-            all_warnings.append(f"metric_unavailable: Dead_Tuples_Total ({active_client.last_error_class})")
-
-        # Sessions killed (PG 14+)
-        if active_client.version_tuple >= (14, 0):
-            sk_row = active_client.query_one("SELECT coalesce(sum(sessions_killed), 0) FROM pg_stat_database;")
-            queries_count += 1
-            if sk_row and sk_row[0] is not None:
-                payload["Primary_Sessions_Killed"] = safe_int(sk_row[0])
-            elif active_client.last_error_class is not None:
-                prune_omitted_metric(payload, "Primary_Sessions_Killed")
-                all_warnings.append(f"metric_unavailable: Primary_Sessions_Killed ({active_client.last_error_class})")
-        else:
-            prune_omitted_metric(payload, "Primary_Sessions_Killed")
-
-        # Logical replication & subscriptions
-        has_sub = False
-        if active_client.version_tuple >= (10, 0):
-            sub_cnt = active_client.query_one("SELECT count(*) FROM pg_subscription;")
-            queries_count += 1
-            if sub_cnt and safe_int(sub_cnt[0]) > 0:
-                has_sub = True
-
-        if has_sub:
-            payload["Logical_Replication_Used"] = 1
-            if active_client.version_tuple >= (15, 0):
-                sub_stats = active_client.query_one("SELECT coalesce(sum(apply_error_count), 0), coalesce(sum(sync_error_count), 0) FROM pg_stat_subscription_stats;")
-                queries_count += 1
-                if sub_stats:
-                    payload["Subscription_Apply_Errors"] = safe_int(sub_stats[0]) if len(sub_stats) > 0 else 0
-                    payload["Subscription_Conflicts"] = safe_int(sub_stats[1]) if len(sub_stats) > 1 else 0
-                else:
-                    prune_omitted_metric(payload, "Subscription_Apply_Errors")
-                    prune_omitted_metric(payload, "Subscription_Conflicts")
-            else:
-                prune_omitted_metric(payload, "Subscription_Apply_Errors")
-                prune_omitted_metric(payload, "Subscription_Conflicts")
-
-            sub_lag = active_client.query_one("""
-                SELECT coalesce(max(CASE WHEN received_lsn = latest_end_lsn THEN 0.0 ELSE extract(epoch from (now() - latest_end_time)) END), 0.0)
-                FROM pg_stat_subscription
-                WHERE latest_end_time IS NOT NULL;
-            """)
-            queries_count += 1
-            if sub_lag and sub_lag[0] is not None:
-                payload["Max_Logical_Lag_s"] = round(safe_float(sub_lag[0]), 2)
-            else:
-                prune_omitted_metric(payload, "Max_Logical_Lag_s")
-        else:
-            payload["Logical_Replication_Used"] = 0
-            prune_omitted_metric(payload, "Subscription_Apply_Errors")
-            prune_omitted_metric(payload, "Subscription_Conflicts")
-            prune_omitted_metric(payload, "Max_Logical_Lag_s")
-
-        # Cascading and delayed standby counts
-        payload["Cascading_Standby_Count"] = len([r for r in node_rows if r.get("role") == ROLE_CASCADING])
-        payload["Delayed_Standby_Count"] = len([r for r in node_rows if r.get("role") == ROLE_DELAYED])
-        s_exp = safe_int(payload.get("Standbys_Expected", 0))
-        s_act = safe_int(payload.get("Standbys_Streaming", 0))
-        payload["Standby_Disconnect_Flag"] = 1 if s_exp > s_act else 0
-
-        # Multi-master & mesh metrics
-        is_multi_master = bool(int(merged.get("is_multi_master") or 0)) or str(merged.get("topology_type", "")).lower() in ("multi_master", "4")
-        if is_multi_master:
-            mesh_sql = "SELECT count(*), count(*) FILTER (WHERE active) FROM pg_replication_slots WHERE slot_type = 'logical';"
-            m_row = active_client.query_one(mesh_sql)
-            queries_count += 1
-            if m_row:
-                m_decl = safe_int(m_row[0])
-                m_act = safe_int(m_row[1]) if len(m_row) > 1 else m_decl
-                payload["Mesh_Links_Declared"] = m_decl
-                payload["Mesh_Links_Active"] = m_act
-                payload["Mesh_Disconnect_Flag"] = 1 if m_decl > m_act else 0
-            else:
-                payload["Mesh_Links_Declared"] = 0
-                payload["Mesh_Links_Active"] = 0
-                payload["Mesh_Disconnect_Flag"] = 0
-        else:
-            prune_omitted_metric(payload, "Mesh_Links_Declared")
-            prune_omitted_metric(payload, "Mesh_Links_Active")
-            prune_omitted_metric(payload, "Mesh_Disconnect_Flag")
-
-        # Snapshot state for rate delta calculation and primary clamping
-        new_state["primary_counters"] = {
-            "commits": commits, "rollbacks": rollbacks,
-            "ins": ins, "upd": upd, "dels": dels,
-            "blks_r": blks_r, "blks_h": blks_h,
-            "wal_bytes": wal_bytes
-        }
-        new_state["primary_metrics"] = {k: v for k, v in payload.items() if k.startswith("Primary_")}
-        new_state["primary_ts"] = t0
-        new_state["primary_name"] = active_client.name
-
-        # Query standby wal_receiver if in recovery
-        standby_wal_rec = None
-        active_client_is_recovery = active_client.is_recovery
-        active_client_version = active_client.version_tuple
-        if active_client.is_recovery:
-            if active_client.requires("pg_wal_lsn_diff"):
-                wal_rec_sql = """
-                    SELECT sender_host, sender_port, status, slot_name,
-                           coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
-                           coalesce(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0) as replay_lag_b
-                    FROM pg_stat_wal_receiver;
-                """
-            else:
-                wal_rec_sql = """
-                    SELECT sender_host, sender_port, status, slot_name,
-                           coalesce(extract(epoch from (now() - pg_last_xact_replay_timestamp()))::float, 0.0) as replay_lag_s,
-                           coalesce(pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()), 0) as replay_lag_b
-                    FROM pg_stat_wal_receiver;
-                """
-            standby_wal_rec = active_client.query_one(wal_rec_sql)
-            queries_count += 1
-
-        # Detect cluster manager before closing active connection
-        if effective_mode == MODE_STANDALONE:
-            cluster_manager = 0
-            cluster_manager_str = "standalone"
-        elif cluster_manager not in (TOPOLOGY_PATRONI, TOPOLOGY_REPMGR, TOPOLOGY_CITUS, TOPOLOGY_CNPG, TOPOLOGY_STOLON):
-            mgr_code, mgr_str, probe_res = probe_cluster_managers(active_client, patroni_probe_status)
-            if mgr_code != TOPOLOGY_UNKNOWN or not cluster_manager:
-                cluster_manager = mgr_code
-                cluster_manager_str = mgr_str
-
-        # Query real per-database statistics using datid
-        db_stats_query_sql = """
-            SELECT datname,
-                   numbackends,
-                   round((CASE WHEN has_database_privilege(datname, 'CONNECT') THEN pg_database_size(datid) ELSE 0 END / (1024*1024)::numeric), 2) as size_mb,
-                   round(CASE WHEN (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)) = 0 THEN 100.0
-                              ELSE (100.0 * coalesce(xact_commit, 0) / (coalesce(xact_commit, 0) + coalesce(xact_rollback, 0)))::numeric END, 2) as commit_ratio,
-                   round(CASE WHEN (coalesce(blks_hit, 0) + coalesce(blks_read, 0)) = 0 THEN 100.0
-                              ELSE (100.0 * coalesce(blks_hit, 0) / (coalesce(blks_hit, 0) + coalesce(blks_read, 0)))::numeric END, 2) as cache_hit_ratio
-            FROM pg_stat_database
-            WHERE datname IS NOT NULL AND datname NOT IN ('template0', 'template1')
-            ORDER BY size_mb DESC;
-        """
-        db_stat_rows = active_client.query_all(db_stats_query_sql) or []
-        queries_count += 1
-
-        # Query real wait events from active client sessions
-        we_backend = "WHERE (backend_type = 'client backend' OR backend_type IS NULL) AND state = 'active'" if active_client.requires("pg_stat_activity_backend_type") else "WHERE state = 'active'"
-        we_query_sql = f"""
-            SELECT coalesce(wait_event_type, 'CPU') as event_type,
-                   coalesce(wait_event, 'running') as event,
-                   count(*) as sessions
-            FROM pg_stat_activity
-            {we_backend}
-            GROUP BY wait_event_type, wait_event
-            ORDER BY sessions DESC;
-        """
-        raw_we_rows = active_client.query_all(we_query_sql) or []
-        queries_count += 1
-
-        # 3.10 Checkpoints, BGWriter & IO Telemetry
-        if active_client.version_tuple >= (17, 0):
-            chk_sql = """
-                SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time,
-                       coalesce((SELECT sum(writes) FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation'), 0),
-                       b.maxwritten_clean,
-                       coalesce((SELECT sum(fsyncs) FROM pg_stat_io WHERE backend_type = 'client backend'), 0)
-                FROM pg_stat_checkpointer c, pg_stat_bgwriter b;
-            """
-        else:
-            chk_sql = """
-                SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, checkpoint_sync_time,
-                       buffers_backend, maxwritten_clean, buffers_backend_fsync
-                FROM pg_stat_bgwriter;
-            """
-        chk_row = active_client.query_one(chk_sql)
-        queries_count += 1
-        if chk_row:
-            payload["Checkpoints_Timed"] = safe_int(chk_row[0]) if len(chk_row) > 0 else 0
-            payload["Checkpoints_Req"] = safe_int(chk_row[1]) if len(chk_row) > 1 else 0
-            payload["Checkpoint_Write_ms"] = safe_float(chk_row[2]) if len(chk_row) > 2 else 0.0
-            payload["Primary_Chkpt_Write_ms"] = payload["Checkpoint_Write_ms"]
-            payload["Buffers_Backend"] = safe_int(chk_row[4]) if len(chk_row) > 4 else 0
-            payload["Maxwritten_Clean"] = safe_int(chk_row[5]) if len(chk_row) > 5 else 0
-            payload["Backend_Fsync"] = safe_int(chk_row[6]) if len(chk_row) > 6 else 0
-
-            cur_chk_req = safe_int(chk_row[1]) if len(chk_row) > 1 else 0
-            prev_counters = prev_state.get("primary_counters") or {}
-            prev_chk_req = safe_int(prev_counters.get("checkpoints_req", cur_chk_req))
-            prev_ts = float(prev_state.get("primary_ts") or 0.0)
-            dt = t0 - prev_ts
-            if is_same_primary and 0 < dt <= 7200:
-                req_delta = max(0, cur_chk_req - prev_chk_req)
-                payload["Primary_Chkpts_Req_1h"] = safe_int(round(req_delta * (3600.0 / dt))) if dt < 3600 else req_delta
-            else:
-                payload["Primary_Chkpts_Req_1h"] = 0
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Checkpoints_Timed")
-            prune_omitted_metric(payload, "Checkpoints_Req")
-            prune_omitted_metric(payload, "Checkpoint_Write_ms")
-            prune_omitted_metric(payload, "Primary_Chkpt_Write_ms")
-            prune_omitted_metric(payload, "Buffers_Backend")
-            prune_omitted_metric(payload, "Maxwritten_Clean")
-            prune_omitted_metric(payload, "Backend_Fsync")
-            prune_omitted_metric(payload, "Primary_Chkpts_Req_1h")
-
-        # 3.11 Index Hit Ratio
-        idx_hit_sql = """
-            SELECT CASE WHEN (coalesce(sum(idx_blks_hit), 0) + coalesce(sum(idx_blks_read), 0)) = 0 THEN 100.0
-                        ELSE round(100.0 * sum(idx_blks_hit) / (sum(idx_blks_hit) + sum(idx_blks_read)), 2)
-                   END
-            FROM pg_statio_user_tables;
-        """
-        idx_hit_row = active_client.query_one(idx_hit_sql)
-        queries_count += 1
-        if idx_hit_row and len(idx_hit_row) > 0 and idx_hit_row[0] is not None:
-            payload["Index_Hit_Ratio"] = safe_float(idx_hit_row[0])
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Index_Hit_Ratio")
-
-        # 3.12 Table Scans (Seq & Idx) Rates
-        scan_sql = "SELECT coalesce(sum(seq_scan), 0), coalesce(sum(idx_scan), 0) FROM pg_stat_user_tables;"
-        scan_row = active_client.query_one(scan_sql)
-        queries_count += 1
-        cur_seq = 0
-        cur_idx = 0
-        if scan_row:
-            cur_seq = safe_int(scan_row[0]) if len(scan_row) > 0 else 0
-            cur_idx = safe_int(scan_row[1]) if len(scan_row) > 1 else 0
-            prev_counters = prev_state.get("primary_counters") or {}
-            prev_seq = safe_int(prev_counters.get("seq_scans", cur_seq))
-            prev_idx = safe_int(prev_counters.get("idx_scans", cur_idx))
-            prev_ts = float(prev_state.get("primary_ts") or 0.0)
-            dt = t0 - prev_ts
-            if is_same_primary and 0.5 <= dt <= 900.0:
-                payload["Seq_Scans_s"] = round(max(0.0, cur_seq - prev_seq) / dt, 2)
-                payload["Idx_Scans_s"] = round(max(0.0, cur_idx - prev_idx) / dt, 2)
-            else:
-                payload["Seq_Scans_s"] = 0.0
-                payload["Idx_Scans_s"] = 0.0
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Seq_Scans_s")
-            prune_omitted_metric(payload, "Idx_Scans_s")
-
-        # 3.13 Temp Files Utilization
-        temp_sql = "SELECT coalesce(max(temp_bytes) / (1024.0 * 1024.0), 0.0) FROM pg_stat_database;"
-        temp_row = active_client.query_one(temp_sql)
-        queries_count += 1
-        if temp_row and len(temp_row) > 0 and temp_row[0] is not None:
-            payload["Max_Temp_MB"] = round(safe_float(temp_row[0]), 2)
-        elif active_client.last_error_class is not None:
-            prune_omitted_metric(payload, "Max_Temp_MB")
-
-        # 3.14 WAL Directory Disk Size
-        if active_client.version_tuple >= (10, 0):
-            wal_dir_sql = "SELECT coalesce(sum(size) / (1024.0 * 1024.0), 0.0) FROM pg_ls_waldir();"
-            wal_dir_row = active_client.query_one(wal_dir_sql)
-            queries_count += 1
-            if wal_dir_row and len(wal_dir_row) > 0 and wal_dir_row[0] is not None:
-                wal_mb = round(safe_float(wal_dir_row[0]), 2)
-                payload["Primary_WAL_Dir_MB"] = wal_mb
-                payload["WAL_Dir_MB"] = wal_mb
-            else:
-                prune_omitted_metric(payload, "Primary_WAL_Dir_MB")
-                prune_omitted_metric(payload, "WAL_Dir_MB")
-        else:
-            prune_omitted_metric(payload, "Primary_WAL_Dir_MB")
-            prune_omitted_metric(payload, "WAL_Dir_MB")
-
-        # 3.15 Top Wait Event & Largest Database
-        if db_stat_rows:
-            payload["Largest_DB"] = str(db_stat_rows[0][0])[:MAX_STRING_CHARS]
-        elif payload.get("DB_Count", 0) > 0:
-            payload["Largest_DB"] = safe_name(dbname or "postgres")
-
-        if raw_we_rows and payload.get("Primary_Active_Queries", 0) > 0:
-            ev_t = str(raw_we_rows[0][0] or "CPU")[:50]
-            ev_n = str(raw_we_rows[0][1] or "running")[:50]
-            payload["Wait_Event_Top"] = safe_name(f"{ev_t}_{ev_n}")
-        else:
-            payload["Wait_Event_Top"] = "none"
-
-        # Update primary_counters with checkpoint, scan, and archive metrics
-        new_state["primary_counters"]["checkpoints_req"] = payload.get("Checkpoints_Req", 0)
-        new_state["primary_counters"]["seq_scans"] = cur_seq
-        new_state["primary_counters"]["idx_scans"] = cur_idx
-        new_state["primary_counters"]["arch_failed"] = payload.get("Primary_Archive_Failed", 0)
-
-        # Official-plugin compatibility metrics (see collect_official_compat)
-        compat_client_version = getattr(active_client, "version_tuple", (0, 0))
-        if compat_official == 1:
-            compat_metrics, compat_db_stats, compat_txn_sessions = collect_official_compat(active_client)
+        collected = collect_primary_metrics(
+            active_client,
+            payload,
+            merged=merged,
+            prev_state=prev_state,
+            new_state=new_state,
+            all_warnings=all_warnings,
+            node_rows=node_rows,
+            node_specs=node_specs,
+            effective_mode=effective_mode,
+            patroni_probe_status=patroni_probe_status,
+            dbname=dbname,
+            compat_official=compat_official,
+            cluster_manager=cluster_manager,
+            cluster_manager_str=cluster_manager_str,
+            queries_count=queries_count,
+            t0=t0,
+        )
+        queries_count = collected["queries_count"]
+        cluster_manager = collected["cluster_manager"]
+        cluster_manager_str = collected["cluster_manager_str"]
+        rep_rows = collected["rep_rows"]
+        slot_rows = collected["slot_rows"]
+        db_stat_rows = collected["db_stat_rows"]
+        raw_we_rows = collected["raw_we_rows"]
+        standby_wal_rec = collected["standby_wal_rec"]
+        active_client_is_recovery = collected["active_client_is_recovery"]
+        active_client_version = collected["active_client_version"]
+        compat_client_version = collected["compat_client_version"]
+        compat_metrics = collected["compat_metrics"]
+        compat_db_stats = collected["compat_db_stats"]
+        compat_txn_sessions = collected["compat_txn_sessions"]
+        is_multi_master = collected["is_multi_master"]
+        active_archive_failing = collected["active_archive_failing"]
+        prev_primary_name = collected["prev_primary_name"]
 
         active_client.close()
         primary_client = None
@@ -4547,165 +4824,16 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 elif app_n and (n_name == app_n or app_n.startswith(n_name)):
                     nr["sync"] = is_sync
 
-    # 4. Format Child Tables (Site24x7 Hard Limits: <=10 tables, <=15 cols, <=5 strings, <=25 rows)
-
-    # 4.1 Cluster_Nodes
-    cluster_nodes_table: List[Dict[str, Any]] = []
-    for r in node_rows[:MAX_ROWS]:
-        node_entry = {
-            "name": safe_name(r["name"]),
-            "role": r["role"],
-            "status": r["status"],
-            "status_reason": str(r["status_reason"])[:MAX_STRING_CHARS],
-            "last_seen_s": r["last_seen_s"],
-            "last_seen_ts": str(r["last_seen_ts"])[:MAX_STRING_CHARS],
-            "timeline": r["timeline"],
-            "replay_lag_s": r["replay_lag_s"],
-            "replay_lag_bytes": r["replay_lag_bytes"],
-            "conn_pct": r["conn_pct"],
-            "resp_ms": r["resp_ms"],
-            "sync": 0 if r.get("sync") is None else (1 if r.get("sync") else 0),
-            "patroni_state": r["patroni_state"],
-            "xact_age_s": r["xact_age_s"]
-        }
-        cluster_nodes_table.append(node_entry)
-
-    if len(node_rows) > MAX_ROWS:
-        omitted = len(node_rows) - MAX_ROWS
-        payload["Nodes_Omitted"] = omitted
-        cluster_nodes_table.append({
-            "name": safe_name(f"{omitted}_more_nodes"),
-            "role": ROLE_UNKNOWN,
-            "status": STATUS_DOWN,
-            "status_reason": f"{omitted} nodes omitted by 25-row limit",
-            "last_seen_s": 0,
-            "last_seen_ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "timeline": 0,
-            "replay_lag_s": 0.0,
-            "replay_lag_bytes": 0,
-            "conn_pct": 0.0,
-            "resp_ms": 0.0,
-            "sync": 0,
-            "patroni_state": PATRONI_STATE_UNKNOWN,
-            "xact_age_s": 0
-        })
-    payload["Cluster_Nodes"] = cluster_nodes_table
-
-    # 4.2 Node_Snapshot
-    node_snapshot_table: List[Dict[str, Any]] = []
-    for r in node_rows[:MAX_ROWS]:
-        node_snapshot_table.append({
-            "name": safe_name(r["name"]),
-            "status": r.get("status", STATUS_DOWN),
-            "version_num": int(r.get("version_num") or 0),
-            "uptime_s": int(r.get("uptime_s") or 0),
-            "active_queries": int(r.get("active_queries") or 0),
-            "idle_in_txn": int(r.get("idle_in_txn") or 0),
-            "longest_query_s": int(r.get("longest_query_s") or 0),
-            "temp_bytes": int(r.get("temp_bytes") or 0),
-            "dead_tuples": int(r.get("dead_tuples") or 0)
-        })
-    payload["Node_Snapshot"] = node_snapshot_table
-
-    # 4.3 Replication_Links -- emitted only for links that genuinely exist
-    replication_links_table: List[Dict[str, Any]] = []
-    seen_link_names: Set[str] = set()
-    if rep_link_data:
-        for idx, rl in enumerate(rep_link_data[:MAX_ROWS]):
-            raw_base = rl.get("app_name") or rl.get("application_name") or rl.get("client_addr") or f"replica_{idx+1}"
-            link_name = safe_name(raw_base)
-            if link_name in seen_link_names or not link_name:
-                link_name = safe_name(f"{raw_base}_{idx+1}")
-            seen_link_names.add(link_name)
-            replication_links_table.append({
-                "name": link_name,
-                "status": 1 if rl["state"].lower() == "streaming" else 0,
-                "application_name": rl["app_name"][:MAX_STRING_CHARS],
-                "client_addr": rl["client_addr"][:MAX_STRING_CHARS],
-                "state": rl["state"][:MAX_STRING_CHARS],
-                "sync_state": rl["sync_state"][:MAX_STRING_CHARS],
-                "sent_lag_b": rl["sent_lag_b"],
-                "write_lag_b": rl["write_lag_b"],
-                "flush_lag_b": rl["flush_lag_b"],
-                "replay_lag_b": rl["replay_lag_b"],
-                "replay_lag_s": round(rl["replay_lag_s"], 2)
-            })
-    elif standby_wal_rec and standby_wal_rec[0]:
-        # Standby instance: ONE row describing upstream link from pg_stat_wal_receiver
-        s_host = str(standby_wal_rec[0] or "")
-        s_port = safe_int(standby_wal_rec[1])
-        s_st = str(standby_wal_rec[2] or "streaming")
-        s_lag_s = safe_float(standby_wal_rec[4])
-        s_lag_b = safe_int(standby_wal_rec[5])
-        up_addr = f"{s_host}:{s_port}" if s_port else s_host
-        replication_links_table.append({
-            "name": safe_name(f"upstream_{up_addr}"),
-            "status": 1 if s_st.lower() == "streaming" else 0,
-            "application_name": "walreceiver",
-            "client_addr": up_addr[:MAX_STRING_CHARS],
-            "state": s_st[:MAX_STRING_CHARS],
-            "sync_state": "none",
-            "sent_lag_b": 0,
-            "write_lag_b": 0,
-            "flush_lag_b": 0,
-            "replay_lag_b": s_lag_b,
-            "replay_lag_s": round(s_lag_s, 2)
-        })
-    # If standalone with no replication, replication_links_table remains empty []
-    payload["Replication_Links"] = replication_links_table[:MAX_ROWS]
-
-    # 4.4 Replication_Slots
-    replication_slots_table: List[Dict[str, Any]] = []
-    for s_row in (slot_rows or [])[:MAX_ROWS]:
-        s_name = str(s_row[0] or "")
-        s_type = str(s_row[1] or "") if len(s_row) > 1 else "physical"
-        s_act = 1 if bool(s_row[2]) else 0 if len(s_row) > 2 else 0
-        s_ret = safe_float(s_row[3]) if len(s_row) > 3 and s_row[3] is not None else 0.0
-        s_wal_st = str(s_row[4] if len(s_row) > 4 and s_row[4] is not None else "normal")
-        replication_slots_table.append({
-            "name": safe_name(s_name or "slot"),
-            "status": s_act,
-            "slot_type": s_type[:MAX_STRING_CHARS],
-            "active": s_act,
-            "retained_mb": round(s_ret, 2),
-            "wal_status": s_wal_st[:MAX_STRING_CHARS]
-        })
-    payload["Replication_Slots"] = replication_slots_table
-
-    # 4.5 Database_Stats
-    db_stats_table: List[Dict[str, Any]] = []
-    if db_stat_rows:
-        for ds in db_stat_rows[:MAX_ROWS]:
-            d_name = str(ds[0] or "")
-            d_conn = safe_int(ds[1])
-            d_size = safe_float(ds[2])
-            d_commit = safe_float(ds[3])
-            d_cache = safe_float(ds[4])
-            db_stats_table.append({
-                "name": safe_name(d_name),
-                "status": 1,
-                "size_mb": d_size,
-                "connections": d_conn,
-                "commit_ratio": d_commit,
-                "cache_hit_ratio": d_cache
-            })
-    payload["Database_Stats"] = db_stats_table[:MAX_ROWS]
-
-    # 4.6 Wait_Events
-    wait_events_table: List[Dict[str, Any]] = []
-    if raw_we_rows:
-        for we in raw_we_rows[:MAX_ROWS]:
-            ev_type = str(we[0] or "CPU")[:MAX_STRING_CHARS]
-            ev_name = str(we[1] or "running")[:MAX_STRING_CHARS]
-            ev_sess = safe_int(we[2])
-            wait_events_table.append({
-                "name": safe_name(f"{ev_type}_{ev_name}"),
-                "status": 1,
-                "event_type": ev_type,
-                "event": ev_name,
-                "sessions": ev_sess
-            })
-    payload["Wait_Events"] = wait_events_table[:MAX_ROWS]
+    # 4. Child tables
+    build_child_tables(
+        payload,
+        node_rows=node_rows,
+        rep_link_data=rep_link_data,
+        slot_rows=slot_rows,
+        db_stat_rows=db_stat_rows,
+        raw_we_rows=raw_we_rows,
+        standby_wal_rec=standby_wal_rec,
+    )
 
     # 4.7 Topology & Multi-Master / Manager Detection
     if effective_mode == MODE_STANDALONE:
