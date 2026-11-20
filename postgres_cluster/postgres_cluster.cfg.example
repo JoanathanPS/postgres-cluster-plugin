@@ -6,13 +6,15 @@ redirect_output=1
 # =============================================================================
 # 1. Essential Settings (Required for all clusters)
 # =============================================================================
-# Single cluster entry point: IP address or hostname of HAProxy VIP, load balancer,
-# internal domain (e.g. postgres-cluster.corp), or any cluster node.
+# Single cluster entry point. Any ONE reachable address works: a cluster node
+# (primary OR standby), a VIP, a floating IP, an HAProxy/pgpool front end, or an
+# internal domain such as postgres-cluster.corp.
+#
+# The plugin discovers the rest of the cluster from here. It needs no HA manager and
+# no proxy: if the address turns out to be a standby it follows pg_stat_wal_receiver
+# to the primary, then reads pg_stat_replication for the other nodes. Patroni, when
+# present, is used first because it also provides failover history.
 cluster_host="127.0.0.1"
-
-# HAProxy Primary Write Port:
-# Routes transparently to the current primary/leader (default: 5000 in production, 5500 in dev)
-write_port=5000
 
 # Database monitoring credentials (recommended role: pg_monitor)
 username="site24x7"
@@ -28,7 +30,12 @@ database="postgres"
 # Target PostgreSQL database port (default: 5432)
 # postgres_port=5432
 
-# HAProxy Replica Read Port (default: 5001)
+# Write endpoint port, if the entry point above is a proxy or VIP that routes to the
+# current primary. Leave unset for a direct node: the plugin then uses postgres_port.
+# write_port=5000
+
+# Read endpoint port, if a proxy exposes replicas behind a single address. Only probed
+# when the primary reports no standbys of its own.
 # read_port=5001
 
 # HAProxy Stats / Discovery Interface (default: 7000 and /;csv)

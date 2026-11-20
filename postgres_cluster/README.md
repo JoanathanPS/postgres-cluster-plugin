@@ -133,19 +133,75 @@ The plugin eliminates the requirement to manually configure individual backend P
 ```
 
 ### Discovery & Port Resolution Engine
-1. **Dynamic Patroni REST Discovery (`patroni_ports`)**:
-   - The plugin probes candidate Patroni REST API ports on `cluster_host` (e.g. `8001-8003` or `8008`).
-   - Obtains real-time cluster membership from `/cluster`, including roles (`primary`, `standby`), timelines, replication lag, and node states.
-2. **HAProxy Stats Discovery (`discovery_port`, `discovery_uri`)**:
-   - If Patroni REST is disabled or unreachable, the plugin queries HAProxy CSV stats on port 7000.
-   - Discovers which backend is currently marked active (`UP`) in the primary/write backend pool.
-3. **Mapped Port Resolution (`node_ports`, `address_map`)**:
-   - Resolves internal advertised container/VM IPs to client-accessible connection ports.
-   - Supports shorthand mapping (e.g. `address_map="pg-node1=5441,pg-node2=5442,pg-node3=5443"`), host:port pairs, or automatic indexing via `node_ports="5441-5443"`.
-4. **Zero-Reconfiguration Failover**:
-   - When the primary node crashes or shuts down, Patroni promotes a replica.
-   - The plugin automatically detects the promoted primary on the next collection cycle without any configuration modifications.
-   - Stopped nodes are accurately reported as `offline` (`patroni_state: stopped`), while the overall cluster remains `UP` (`1`) with healthy nodes operational.
+
+The plugin needs **one reachable address**. It tries each source below in order and
+stops at the first that answers, so the sources are ordered by how authoritative
+they are, not by how exotic the setup is.
+
+**Only step 1 requires an HA manager, and only the optional naming lookup in step 2
+touches a proxy. A plain two-node streaming pair with neither is fully supported.**
+
+1. **Patroni REST API** (`patroni_port`, `patroni_ports`) — authoritative when present.
+   Probes candidate REST ports on `cluster_host` (e.g. `8008`, or `8001-8003` for a
+   port-forwarded lab) and reads `/cluster` for exact node names, roles, states,
+   timelines and lag, plus `/history` for failover age and 24-hour failover count.
+   This is the only source that can give a true failover history, so it is tried first.
+
+2. **SQL topology discovery** — the general case; needs nothing but PostgreSQL.
+   Connects to the seed endpoint and reads the cluster out of the catalogs:
+   - `pg_is_in_recovery()` to tell a primary from a standby.
+   - If the seed is a **standby**, `pg_stat_wal_receiver` is followed upstream to the
+     primary and discovery is retried once — so you may point the plugin at *any*
+     node, not just the leader.
+   - `pg_stat_replication` on the primary for every attached standby, with sync state
+     and byte lag.
+   - `inet_server_addr()`, `current_setting('port')` and `cluster_name` for identity.
+
+   Candidate ports: an explicitly configured `write_port` first, then the plain
+   PostgreSQL port (`postgres_port`, default 5432), then the conventional HAProxy
+   write ports 5000 and 5500 — but those last two **only if a proxy stats endpoint
+   actually answered**, so they are never dialled speculatively on a host that has no
+   proxy. This covers a direct node, a VIP, a floating IP, HAProxy and pgpool-II
+   identically, because to PostgreSQL they are all just a connection.
+
+   A proxy stats endpoint (`discovery_port`, `discovery_uri`), when reachable, is used
+   **only to put a friendly backend name on the primary**. Without it the primary is
+   named from `address_map`, then `cluster_name`, then its own `host:port`. Losing the
+   stats endpoint costs you a nicer label and nothing else.
+
+3. **Explicit node list** (`nodes`) — whatever you configured, used as-is. Setting
+   `nodes` disables automatic discovery entirely, which is the escape hatch for
+   topologies the catalogs cannot express (see "Cluster Support Levels").
+
+4. **Single node** — the configured `cluster_host` on its own, for a standalone
+   instance or when nothing above answered.
+
+Nodes found by any source are then merged with any expected members declared in
+`address_map`, in the proxy stats backend list, or in `nodes`, so a node that is
+currently **stopped** still appears as a row rather than silently vanishing.
+
+#### Mapped Port Resolution (`node_ports`, `address_map`)
+
+Discovery returns addresses as the *cluster* sees them (container IPs, internal
+hostnames). `address_map` and `node_ports` translate those to addresses the agent can
+actually reach:
+
+- `address_map="pg-node1:5432=127.0.0.1:5441"` — explicit `host:port` pair.
+- `address_map="pg-node1=5441"` — port-only shorthand, resolved against `cluster_host`.
+- `node_ports="5441-5443"` — automatic indexing by the trailing digit in the node name
+  (`pg-node2` → the 2nd port). The node name is stripped of any `:port` suffix and
+  skipped if it is a bare IPv4 address, so an address is never mistaken for an index.
+
+#### Zero-Reconfiguration Failover
+
+When the primary is lost, the HA manager promotes a replica. On the next collection
+cycle the plugin re-runs discovery from the same single address and finds the new
+leader — no configuration change. Rate metrics (`*_s`) are suppressed for one cycle
+after a leader change, because differencing counters across two different servers
+would report a meaningless spike. Stopped nodes are reported as `offline` with their
+last known role, while the cluster stays `UP` (`1`) as long as a primary is serving;
+replication degradation is reported through `Cluster_Health` and `Health_Reason`
+instead of through availability.
 
 ### Docker Desktop (Windows Host) Network Mapping Reference
 

@@ -3081,14 +3081,10 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         proxy_host = ""
         patroni_ports = parse_port_list(param.get("patroni_ports"))
         node_ports = parse_port_list(param.get("node_ports"))
-    elif "postgres_port" in param and param["postgres_port"] not in (5432, 0, "5432", None) and "discovery_port" not in param and "write_port" not in param:
-        discovery_port = 0
-        write_port = 0
-        proxy_host = ""
-        seed_host = ""
-        patroni_ports = []
-        node_ports = []
     else:
+        # postgres_port names the PostgreSQL port to discover ON; it does not suppress
+        # discovery. `nodes` above is the escape hatch for pinning an exact target, so
+        # a cluster that simply runs on a non-default port is still discovered.
         seed_host = cluster_host or proxy_host or ("127.0.0.1" if not raw_nodes else "")
 
     hp_stats: Dict[str, Dict[str, str]] = {}
@@ -3118,17 +3114,26 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     can_discover = bool(seed_host and monitor_mode != MODE_STANDALONE and not raw_nodes)
 
+    # Discovery runs before the per-node probes, so it needs its own slice of the cycle
+    # budget: a seed that accepts TCP but never completes the handshake must not be able
+    # to consume the whole collection interval before probing has even started.
+    cycle_deadline = float(merged.get("cycle_deadline") or 40.0)
+    discovery_deadline = t0 + max(1.0, min(cycle_deadline * 0.3, 10.0))
+
+    def _discovery_budget_left() -> float:
+        return discovery_deadline - time.time()
+
     # 1. Patroni REST API (/cluster & /history)
     patroni_probe_status = "not_applicable"
     patroni_endpoint_used = None
-    if can_discover:
+    if can_discover and _discovery_budget_left() > 0:
         patroni_probe_status, patroni_data, patroni_history, patroni_endpoint_used, candidates_tried = discover_patroni_cluster(
             seed_host=seed_host,
             seed_port=patroni_port,
             address_map=address_map,
             prev_state=prev_state,
             raw_nodes=raw_nodes,
-            timeout=1.0,
+            timeout=max(0.2, min(1.0, _discovery_budget_left())),
             patroni_ports=patroni_ports,
         )
         if patroni_probe_status == "positive":
@@ -3155,6 +3160,11 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
             if cand and cand not in candidate_ports:
                 candidate_ports.append(cand)
         for sql_port in candidate_ports:
+            if _discovery_budget_left() <= 0:
+                all_warnings.append(
+                    f"discovery: budget exhausted, {len(candidate_ports)} candidate port(s) not tried"
+                )
+                break
             sql_ok, p_spec, sb_specs, sql_msg = discover_cluster_via_sql(
                 seed_host=seed_h,
                 seed_port=sql_port,
@@ -3166,7 +3176,7 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
                 sslrootcert=sslrootcert,
                 sslcert=sslcert,
                 sslkey=sslkey,
-                connect_timeout=2,
+                connect_timeout=max(1, int(min(2.0, _discovery_budget_left()))),
                 stats_port=discovery_port if hp_stats else 0,
                 stats_uri=discovery_uri,
                 read_port=read_port,
@@ -3499,7 +3509,6 @@ def run(param: Dict[str, Any]) -> Dict[str, Any]:
         return row_res
 
     # Fan out probes with DaemonThreadPoolExecutor bounded by cycle_deadline
-    cycle_deadline = float(merged.get("cycle_deadline") or 40.0)
     workers_count = min(16, max(len(node_specs), 1))
     executor = DaemonThreadPoolExecutor(max_workers=workers_count)
     future_map = {executor.submit(probe_single_node, spec): spec for spec in node_specs}
