@@ -13,7 +13,6 @@ import concurrent.futures.thread
 import copy
 import csv
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
@@ -2497,79 +2496,21 @@ NODE_TTL_DAYS = 7
 DEFAULT_STATE_FILENAME = "postgres_cluster_state.json"
 
 
-def _machine_id() -> str:
-    """Stable per-machine identifier, best effort, never raises."""
-    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                val = f.read().strip()
-            if val:
-                return val[:64]
-        except OSError:
-            continue
-    if os.name == "nt":
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Cryptography",
-                0,
-                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
-            ) as key:
-                val, _ = winreg.QueryValueEx(key, "MachineGuid")
-                if val:
-                    return str(val)[:64]
-        except Exception:
-            pass
-    try:
-        return "host-" + socket.gethostname()[:48]
-    except Exception:
-        return "host-unknown"
-
-
-def _safe_token(raw: str, limit: int = 24) -> str:
-    """Filesystem-safe, collision-resistant slug."""
-    keep = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(raw or ""))
-    keep = keep.strip("-")
-    return (keep[:limit] or "cluster")
-
-
-def writable_by_write_probe(directory: str) -> Tuple[bool, str]:
-    """Tests writability using actual file creation instead of os.access()."""
-    if not directory:
-        return False, "no directory"
-    if not os.path.isdir(directory):
-        return False, "not a directory"
-    import uuid
-    probe = os.path.join(directory, f".pgcluster-probe.{uuid.uuid4().hex[:8]}")
-    try:
-        with open(probe, "wb") as f:
-            f.write(b"ok")
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        return False, str(e)
-    finally:
-        try:
-            if os.path.exists(probe):
-                os.remove(probe)
-        except OSError:
-            pass
-    return True, "ok"
-
-
-def ensure_dir(path: str) -> bool:
-    """mkdir -p, True if directory exists afterwards."""
-    try:
-        os.makedirs(path, exist_ok=True)
-        return os.path.isdir(path)
-    except OSError:
-        return False
-
-
 class StateStore:
-    """Atomic, keyed, self-describing JSON state for monitored cluster."""
+    """
+    Atomic JSON state for one monitored cluster.
+
+    Holds only what cannot be derived from a single poll: the rate-counter baselines,
+    the last known primary (for the clamp and for detecting a leader change), and the
+    per-node last-seen timestamps that let a stopped node keep its row.
+
+    Three locations are tried in order and the first writable one wins: the configured
+    state_dir, the plugin's own directory (where the Site24x7 agent keeps the plugin,
+    so it survives between polls), then the system temp directory as a volatile
+    fallback. diagnostics() reports which kind was used via State_Persistent, because
+    the rate metrics and the primary clamp are meaningless if the file does not
+    survive from one poll to the next.
+    """
 
     def __init__(
         self,
@@ -2582,7 +2523,6 @@ class StateStore:
         allow_temp_fallback: bool = True,
         warn=None,
     ):
-        self.plugin_file = plugin_file
         self.plugin_dir = os.path.dirname(os.path.abspath(plugin_file))
         self.cluster_id = str(cluster_id or "")
         self.name = str(name or "")
@@ -2590,63 +2530,40 @@ class StateStore:
         self.filename = filename
         self.explicit_dir = state_dir or ""
         self.allow_temp_fallback = allow_temp_fallback
-        self._warn = warn or (lambda code, text: None)
         self._path: Optional[str] = None
         self._persistent: Optional[bool] = None
-        self._reason: str = "not probed"
-        self._machine = _machine_id()
+        self._reason = "not probed"
         self._io_errors = 0
         self._last_written: Optional[float] = None
 
-    def instance_key(self) -> str:
-        """Namespaces the state file to avoid collision across clusters/folders."""
-        identity = self.cluster_id or self.seed or self.name or "unnamed"
-        seed = "|".join([self._machine, identity, self.plugin_dir])
-        return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
-
     def _candidates(self) -> List[Tuple[str, bool, str]]:
-        cands: List[Tuple[str, bool, str]] = []
+        cands = []
         if self.explicit_dir:
             cands.append((os.path.abspath(self.explicit_dir), True, "configured"))
         cands.append((self.plugin_dir, True, "plugin_dir"))
-        if os.name == "nt":
-            base = os.environ.get("PROGRAMDATA") or os.environ.get("ALLUSERSPROFILE")
-            if base:
-                cands.append((os.path.join(base, "Site24x7", "postgres_cluster"), True, "programdata"))
-        else:
-            cands.append(("/var/lib/site24x7/postgres_cluster", True, "var_lib"))
-            xdg = os.environ.get("XDG_STATE_HOME") or (
-                os.path.join(os.path.expanduser("~"), ".local", "state") if os.path.expanduser("~") not in ("~", "") else ""
-            )
-            if xdg:
-                cands.append((os.path.join(xdg, "site24x7", "postgres_cluster"), True, "xdg_state"))
         if self.allow_temp_fallback:
             cands.append((os.path.join(tempfile.gettempdir(), "site24x7-postgres_cluster"), False, "tempdir"))
         return cands
 
     def probe(self, force: bool = False) -> "StateStore":
+        """Picks the first candidate directory that can actually be written to."""
         if self._path and not force:
             return self
         self._path, self._persistent, self._reason = None, None, "no writable location"
         for directory, durable, label in self._candidates():
-            if label != "configured" and not os.path.isdir(directory):
-                if not ensure_dir(directory):
-                    continue
-            elif label == "configured" and not os.path.isdir(directory):
-                if not ensure_dir(directory):
-                    continue
-            ok, why = writable_by_write_probe(directory)
-            if not ok:
+            try:
+                os.makedirs(directory, exist_ok=True)
+                # Probe by writing, not by os.access(): the latter lies on Windows
+                # ACLs and inside containers.
+                probe_file = os.path.join(directory, ".pgcluster-probe")
+                with open(probe_file, "wb") as f:
+                    f.write(b"ok")
+                os.remove(probe_file)
+            except OSError:
                 continue
-            target_dir = os.path.join(directory, f".pgcluster-{self.instance_key()}")
-            if not ensure_dir(target_dir):
-                continue
-            ok2, _ = writable_by_write_probe(target_dir)
-            if not ok2:
-                continue
-            self._path = os.path.join(target_dir, self.filename)
+            self._path = os.path.join(directory, self.filename)
             self._persistent = durable
-            self._reason = f"{label}: {target_dir}"
+            self._reason = f"{label}: {directory}"
             return self
         return self
 
@@ -2657,6 +2574,7 @@ class StateStore:
         return self._path
 
     def load(self) -> Dict[str, Any]:
+        """Returns the saved state, or {} if it is absent, unreadable or not ours."""
         path = self.path
         if not path or not os.path.exists(path):
             return {}
@@ -2672,40 +2590,33 @@ class StateStore:
             data = json.loads(raw)
         except ValueError:
             return {}
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
             return {}
-        if data.get("schema") != STATE_SCHEMA:
-            return {}
-        if data.get("instance") != self.instance_key():
+        # Reject state written for a different cluster, which can happen when two
+        # monitors share a configured state_dir.
+        if str(data.get("cluster_id") or "") != self.cluster_id:
             return {}
         return data
 
     def save(self, state: Dict[str, Any]) -> bool:
+        """Writes state atomically: temp file in the same directory, then os.replace."""
         path = self.path
         if not path:
             return False
         state = dict(state or {})
         state["schema"] = STATE_SCHEMA
-        state["instance"] = self.instance_key()
-        state["machine_id"] = self._machine
         state["cluster_id"] = self.cluster_id
         state["name"] = self.name
         state["updated"] = int(time.time())
         state["nodes"] = self._prune_nodes(state.get("nodes") or {})
 
         tmp = None
-        directory = os.path.dirname(path)
         try:
-            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".state.", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".state.", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(state, f, separators=(",", ":"), default=str)
                 f.flush()
                 os.fsync(f.fileno())
-            if os.name != "nt":
-                try:
-                    os.chmod(tmp, 0o600)
-                except OSError:
-                    pass
             os.replace(tmp, path)
             tmp = None
             self._last_written = time.time()
@@ -2722,6 +2633,7 @@ class StateStore:
 
     @staticmethod
     def _prune_nodes(nodes: Dict[str, Any]) -> Dict[str, Any]:
+        """Drops nodes never seen alive, and those not seen for NODE_TTL_DAYS."""
         cutoff = time.time() - NODE_TTL_DAYS * 86400
         out = {}
         for alias, entry in (nodes or {}).items():
@@ -2734,18 +2646,18 @@ class StateStore:
         return out
 
     def diagnostics(self) -> Dict[str, Any]:
-        age = None
+        age = -1
         if self._last_written:
             age = int(time.time() - self._last_written)
         elif self._path and os.path.exists(self._path):
             try:
                 age = int(time.time() - os.path.getmtime(self._path))
             except OSError:
-                age = None
+                age = -1
         return {
             "State_File": (self._path or "none")[-100:],
             "State_Persistent": 1 if self._persistent else 0,
-            "State_Age_s": age if age is not None else -1,
+            "State_Age_s": age,
             "State_IO_Errors": self._io_errors,
             "State_Reason": (self._reason or "")[:100],
         }
