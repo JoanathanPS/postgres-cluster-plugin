@@ -6,7 +6,7 @@ Read this instead of the old chat. The v6 handoff, research, docs and console ev
 
 - **What it is:** a replacement for the official Site24x7 `postgres` plugin. Plugin name `postgres`, `PLUGIN_VERSION = 2`.
 - **Code:** `postgres/postgres.py` (single file, ~2,000 lines), `postgres/postgres.cfg`, `postgres/README.md`.
-- **Tests:** `tests/test_postgres_v2.py`, 46 tests. Run with `python -m pytest tests -q`.
+- **Tests:** `tests/test_postgres_v2.py`, 37 tests. Run with `python -m pytest tests -q`.
 - **Branch:** `v7`. Not pushed, no PR (not ready).
 - **v6 is gone from v7:** the `postgres_cluster/` folder and its tooling were removed. They are still on branch `v6`.
 - **Decided with the TL:** no separate cluster plugin; replace `postgres`. Version stays 2 (deleting the monitor and template is fine while testing). Backward compatible: same cfg keys, every v1 metric name and table kept. Discovery works from one address; the user never lists nodes. Patroni is optional, used only if `patroni_port` is set.
