@@ -74,7 +74,18 @@ Read this instead of the old chat. The v6 handoff, research, docs and console ev
 - **What it prints per monitor:** up/down, template size, registered metrics with no data in the period, and catalogue metrics missing from the template. Full responses go to `.api_reports/`.
 - **Results at 17:20, 2026-11-23:**
   - All 6 monitors are up. Re-registering after the section rename fixed issue 0.
-  - **Bug A (major), the template is missing 29 metrics.** All `postgres` monitors share one template, frozen from the first v2 payload (a primary with no user tables and archiving off). Missing: Replay Lag, Replay Backlog, WAL Receiver Connected, Last WAL Message Age, Last Failover Age, all archive metrics, Index/Heap/Cache Hit Ratio, Dead/Live Tuples, Sequential Scans, WAL Files/Directory Size, Checksum Failures, and others. Confirms issue 2. **Fix:** make every payload declare the full catalogue in `tabs`/`units` (stop pruning in `finalize()`). Then the user deletes the template once in the console, and `api_check.py` should report `missing_from_template=0`. If the template only takes keys that have values, the fallback needs a design decision; ask before sending placeholder values (never-fabricate rule).
+  - **Bug A (major), the template is missing 29 metrics.** All `postgres` monitors share one template, frozen from the first v2 payload (a primary with no user tables and archiving off). Missing: Replay Lag, Replay Backlog, WAL Receiver Connected, Last WAL Message Age, Last Failover Age, all archive metrics, Index/Heap/Cache Hit Ratio, Dead/Live Tuples, Sequential Scans, WAL Files/Directory Size, Checksum Failures, and others. Confirms issue 2.
+    - **Tested on 2026-11-23:**
+      1. The template is built only when a monitor registers fresh (a new monitor or plugin name). A changed `.py` or a service restart does not rebuild it while the monitors exist ("already registered").
+      2. Declaring the full catalogue in `tabs`/`units` does not add keys (commit `1848d41`; registration at 17:33 still gave 119).
+      3. Sending missing metrics as `null` does not add keys either. A fresh `postgres_nulltest` plugin registered 103 metrics, and the 38 nulls were all left out. Reverted.
+    - **Conclusion:** a key enters the template only with a real value in the registration run.
+    - **Decision needed (user/TL, not Claude):**
+      - (a) accept an incomplete template, or
+      - (b) send 0 where 0 is true (for example archive counts when archiving is off), or
+      - (c) send placeholder 0 for everything at registration, which breaks the never-fabricate rule.
+    - **Option (a) note:** register monitors so the richest node registers first; a standby with archiving and user tables covers the most.
+    - **Console cleanup:** the `postgres_nulltest-Joana-PC.` monitor can be deleted.
   - **Bug B (minor), repmgr seeded at a standby has no Max Standby Replay Lag or Backlog.** `RepmgrAdapter` only gets links when the seed is the primary. Connect to the registry's primary for `replication_view` like `PatroniAdapter` does.
   - **Expected gaps, not bugs:** Buffers Backend on PG17, primary-only metrics on standby-seeded monitors, no standby lag on standalone.
 
