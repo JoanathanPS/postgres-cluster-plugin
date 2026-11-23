@@ -110,15 +110,15 @@ class RateTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
 
-    def test_finalize_keeps_full_catalogue_in_tabs_and_units(self):
-        full_tabs, full_units = pg.build_tabs_and_units()
+    def test_finalize_keeps_units_and_tabs_to_emitted_keys(self):
+        """Repository rule: every key in `units` must exist in the data."""
         p = pg.base_payload(pg.resolve_args({}))
         p["Uptime"] = 10
         p["Locks Count"] = 3
         out = pg.finalize(p)
-        self.assertEqual(out["tabs"], full_tabs)
-        self.assertEqual(out["units"], full_units)
-        self.assertNotIn("Replay Lag", out)
+        self.assertEqual(out["tabs"]["Activity"]["tablist"], ["Locks Count"])
+        self.assertEqual(set(out["units"]), {"Uptime", "Locks Count"})
+        self.assertNotIn("Replay Lag", str(out["tabs"]))
         self.assertEqual(pg.validate_output(out), [])
 
     def test_validator_flags_limit_breaches(self):

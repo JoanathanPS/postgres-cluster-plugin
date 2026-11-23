@@ -48,7 +48,17 @@ A node's role is always taken from PostgreSQL (`pg_is_in_recovery()`), never onl
 
   Without `pg_monitor` the plugin still runs. Metrics the user cannot read, for example WAL directory size, are left out instead of shown as 0, and `msg` names the permission that is missing.
 
-## Plugin installation
+## Installation using the installer (Linux)
+
+```bash
+wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/installer/Site24x7PostgresPluginInstaller.sh && sudo bash Site24x7PostgresPluginInstaller.sh
+```
+
+The installer checks the agent, installs `psycopg2-binary` if it is missing, asks for the connection details, test-runs the plugin and moves it into the agent's plugin folder.
+
+**Upgrading from version 1:** run the same command. The installer detects the existing plugin and replaces only `postgres.py` and this README. Your `postgres.cfg`, with every monitor and its encrypted credentials, is kept as it is.
+
+## Plugin installation (manual)
 
 1. Create a folder named `postgres` and download `postgres.py` and `postgres.cfg` into it:
 

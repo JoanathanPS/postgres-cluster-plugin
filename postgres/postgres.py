@@ -1765,9 +1765,17 @@ def base_payload(args):
 
 
 def finalize(payload):
-    """Keeps the full catalogue in `tabs` and `units` on every poll, so the shared
-    template is the same whichever monitor registers first. Metrics with no value this
-    poll are declared but not sent."""
+    """Drops tab and unit entries for anything not emitted this poll.
+
+    The repository rules require every `units` key to exist in the data. Declaring
+    unsent metrics would not help either: Site24x7 builds the template only from
+    metrics that carry a value (tested 2026-11-23), which is why truthful_zeros() and
+    sampled_rates() exist."""
+    emitted = {k for k in payload if k not in RESERVED_KEYS}
+    for tab in payload.get("tabs", {}).values():
+        tab["tablist"] = [m for m in tab["tablist"] if m in emitted]
+    payload["tabs"] = {k: v for k, v in payload.get("tabs", {}).items() if v["tablist"]}
+    payload["units"] = {k: v for k, v in payload.get("units", {}).items() if k in emitted}
     if "msg" in payload:
         payload["msg"] = str(payload["msg"])[:MAX_MSG_CHARS]
     return payload
