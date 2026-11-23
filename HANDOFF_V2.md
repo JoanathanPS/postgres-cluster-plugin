@@ -69,7 +69,16 @@ Read this instead of the old chat. `HANDOFF.md` describes v6 and is history only
 
 ## 5. Open issues and decisions
 
-0. **Extra cfg sections receive no arguments (found 15:06, 2026-11-23).**
+**Automated console check works, and is the first thing to run:** `python scripts/api_check.py --period 0`.
+- **What it uses:** the Site24x7 REST API, read-only Self Client. Credentials are in `.env` as `S247_*` and are gitignored.
+- **What it prints per monitor:** up/down, template size, registered metrics with no data in the period, and catalogue metrics missing from the template. Full responses go to `.api_reports/`.
+- **Results at 17:20, 2026-11-23:**
+  - All 6 monitors are up. Re-registering after the section rename fixed issue 0.
+  - **Bug A (major), the template is missing 29 metrics.** All `postgres` monitors share one template, frozen from the first v2 payload (a primary with no user tables and archiving off). Missing: Replay Lag, Replay Backlog, WAL Receiver Connected, Last WAL Message Age, Last Failover Age, all archive metrics, Index/Heap/Cache Hit Ratio, Dead/Live Tuples, Sequential Scans, WAL Files/Directory Size, Checksum Failures, and others. Confirms issue 2. **Fix:** make every payload declare the full catalogue in `tabs`/`units` (stop pruning in `finalize()`). Then the user deletes the template once in the console, and `api_check.py` should report `missing_from_template=0`. If the template only takes keys that have values, the fallback needs a design decision; ask before sending placeholder values (never-fabricate rule).
+  - **Bug B (minor), repmgr seeded at a standby has no Max Standby Replay Lag or Backlog.** `RepmgrAdapter` only gets links when the seed is the primary. Connect to the registry's primary for `replication_view` like `PatroniAdapter` does.
+  - **Expected gaps, not bugs:** Buffers Backend on PG17, primary-only metrics on standby-seeded monitors, no standby lag on standalone.
+
+0. **(Resolved by re-registering) Extra cfg sections receive no arguments (found 15:06, 2026-11-23).**
    - **What happens:** the agent passed `--host/--port/--username/--password/--db` only to the original `[postgres]` section. The five added sections ran with no arguments, so they used the defaults (`localhost:5432`) and are down.
    - **How it was confirmed:** a one-poll debug hook that logged argv names.
    - **Naming:** the agent registered the sections as `postgres-postgres-<x>`. They have since been renamed `[standalone]`, `[streaming]`, `[patroni]`, `[repmgr]`, `[logical]` in the agent cfg, but the agent still uses the old registered names. It reads sections at registration time.

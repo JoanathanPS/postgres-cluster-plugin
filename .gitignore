@@ -50,3 +50,4 @@ postgres/.state/
 postgres/*.log*
 postgres/.summ.py
 postgres/.e2e.py
+.api_reports/
