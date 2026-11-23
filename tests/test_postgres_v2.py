@@ -140,6 +140,14 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("db1:5433", out["msg"])
         self.assertNotIn("hunter2", str(out))
 
+    def test_missing_host_says_no_configuration_received(self):
+        node = mock.Mock(auth_failed=False, error="refused")
+        node.connect.return_value = False
+        with mock.patch.object(pg, "HAVE_PSYCOPG2", True),                 mock.patch.object(pg, "Node", return_value=node):
+            out = pg.run(pg.parse_cli([]))
+        self.assertEqual(out["status"], 0)
+        self.assertIn("no configuration received from agent", out["msg"])
+
 
 class FakeCursor(object):
     """Answers each catalogue query with a row of 1s; tables get one row."""

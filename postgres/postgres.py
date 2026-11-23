@@ -1865,6 +1865,8 @@ def run(param):
     if not node.connect():
         reason = "authentication failed for user %s" % args["username"] if node.auth_failed \
             else "cannot connect to %s:%s (%s)" % (args["host"], args["port"], node.error)
+        if not param.get("host"):
+            reason = "no configuration received from agent; " + reason
         return down(payload, reason)
 
     path = state_path(args["host"], args["port"], args["db"])
@@ -1916,7 +1918,7 @@ def run(param):
 
 def parse_cli(argv=None):
     parser = argparse.ArgumentParser(description="Site24x7 PostgreSQL plugin")
-    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--host", default="")
     parser.add_argument("--port", default="5432")
     parser.add_argument("--username", default="postgres")
     parser.add_argument("--password", default="")
