@@ -324,6 +324,10 @@ QUERIES = [
             [M("WAL Written", "MB", "WAL and Archiving", float)])],
         role=PRIMARY),
 
+    Query("wal_stats", [Variant((14, 0),
+        "SELECT wal_buffers_full FROM pg_stat_wal",
+        [M("WAL Buffers Full", "times", "WAL and Archiving")])]),
+
     Query("wal_directory", [Variant((10, 0),
         "SELECT count(*), round(coalesce(sum(size), 0) / 1048576.0, 2) FROM pg_ls_waldir()",
         [M("WAL Files", "files", "WAL and Archiving"),
@@ -450,6 +454,7 @@ RATES = [
     Rate("New Requested Checkpoints", "Checkpoints Req", "checkpoints", "BG Writer", delta=True),
     Rate("New Archive Failures", "Archive Failed Count", "files", "WAL and Archiving", delta=True),
     Rate("New Checksum Failures", "Checksum Failures", "failures", "DB and IO stats", delta=True),
+    Rate("New WAL Buffers Full", "WAL Buffers Full", "times", "WAL and Archiving", delta=True),
 ]
 
 # Metrics computed in derive_metrics() rather than read from a query.
@@ -551,6 +556,15 @@ TABLES = [
         {"sessions": "sessions"}),
 
     Table("Replication_Slots", "Replication", [
+        ((14, 0),
+         "SELECT s.slot_name AS name, s.slot_type, s.active::int AS active,"
+         " round(coalesce(pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery()"
+         " THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, s.restart_lsn), 0)"
+         " / 1048576.0, 2) AS retained_mb, coalesce(s.wal_status, 'unknown') AS wal_status,"
+         " age(s.catalog_xmin) AS catalog_xmin_age,"
+         " round(coalesce(st.spill_bytes, 0) / 1048576.0, 2) AS spill_mb"
+         " FROM pg_replication_slots s LEFT JOIN pg_stat_replication_slots st USING (slot_name)"
+         " ORDER BY retained_mb DESC, s.slot_name"),
         ((13, 0),
          "SELECT slot_name AS name, slot_type, active::int AS active,"
          " round(coalesce(pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery()"
@@ -563,7 +577,25 @@ TABLES = [
          " THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, restart_lsn), 0)"
          " / 1048576.0, 2) AS retained_mb"
          " FROM pg_replication_slots ORDER BY retained_mb DESC, slot_name")],
-        {"slot_type": "", "active": "flag", "retained_mb": "MB", "wal_status": ""}),
+        {"slot_type": "", "active": "flag", "retained_mb": "MB", "wal_status": "",
+         "catalog_xmin_age": "transactions", "spill_mb": "MB"}),
+
+    # Only when pg_stat_statements is installed in the monitored database.
+    Table("Top_Queries", "Activity", [
+        ((13, 0),
+         "SELECT queryid::text AS name, calls, round(total_exec_time::numeric, 2) AS total_time_ms,"
+         " round(mean_exec_time::numeric, 2) AS mean_time_ms, rows,"
+         " left(regexp_replace(query, '\\s+', ' ', 'g'), 100) AS query"
+         " FROM pg_stat_statements WHERE queryid IS NOT NULL"
+         " ORDER BY total_exec_time DESC LIMIT 10"),
+        ((9, 6),
+         "SELECT queryid::text AS name, calls, round(total_time::numeric, 2) AS total_time_ms,"
+         " round(mean_time::numeric, 2) AS mean_time_ms, rows,"
+         " left(regexp_replace(query, '\\s+', ' ', 'g'), 100) AS query"
+         " FROM pg_stat_statements WHERE queryid IS NOT NULL"
+         " ORDER BY total_time DESC LIMIT 10")],
+        {"calls": "calls", "total_time_ms": "ms", "mean_time_ms": "ms", "rows": "rows", "query": ""},
+        when=lambda node: node.settings.get("pg_stat_statements")),
 ]
 
 # Tables kept for continuity with version 1 monitors.
@@ -722,11 +754,13 @@ class Node(object):
         self.version = (num // 10000, num % 10000) if num >= 100000 else (num // 10000, (num // 100) % 100)
         row = self.query_one(
             "SELECT pg_is_in_recovery(), current_setting('archive_mode'),"
-            " pg_postmaster_start_time()::text")
+            " pg_postmaster_start_time()::text,"
+            " (SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements')")
         if row:
             self.is_recovery = bool(row[0])
             self.settings["archive_mode"] = row[1]
             self.identity = "%s:%s|%s" % (self.host, self.port, row[2])
+            self.settings["pg_stat_statements"] = bool(row[3]) if len(row) > 3 else False
         return True
 
     def query_all(self, sql):
