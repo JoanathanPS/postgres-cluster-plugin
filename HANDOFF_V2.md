@@ -1,0 +1,86 @@
+# postgres plugin v2: handoff (2026-11-23)
+
+Read this instead of the old chat. `HANDOFF.md` describes v6 and is history only.
+
+## 1. Where things stand
+
+- **What it is:** a replacement for the official Site24x7 `postgres` plugin. Plugin name `postgres`, `PLUGIN_VERSION = 2`.
+- **Code:** `postgres/postgres.py` (single file, ~2,000 lines), `postgres/postgres.cfg`, `postgres/README.md`.
+- **Tests:** `tests/test_postgres_v2.py`, 46 tests. Run with `python -m pytest tests -q`.
+- **Branch:** `v7`. Not pushed, no PR (not ready).
+- **v6 is gone from v7:** the `postgres_cluster/` folder and its tooling were removed. They are still on branch `v6`.
+- **Decided with the TL:** no separate cluster plugin; replace `postgres`. Version stays 2 (deleting the monitor and template is fine while testing). Backward compatible: same cfg keys, every v1 metric name and table kept. Discovery works from one address; the user never lists nodes. Patroni is optional, used only if `patroni_port` is set.
+
+## 2. Design
+
+- **Catalogue (section 1 of `postgres.py`):** `QUERIES` (single-row SQL → metrics, version-gated with `Variant(min_ver, sql, fields)`), `TABLES` (child tables), `RATES` (per-second rates and per-poll deltas), `DERIVED`, `CLUSTER_TABLES`. To add a metric, add one entry; there is no new code path.
+- **Engine rules:**
+  - A failed, NULL or inapplicable query leaves its metric out; it never sends 0.
+  - `status = 0` only for: driver missing, connect or auth failure, version below 9.6.
+  - Rates need two polls of the same server process (`identity` = host:port plus postmaster start time).
+- **Two layers per monitor:**
+  - *This node:* full metrics for whatever `host:port` reaches.
+  - *Cluster:* the Nodes, Replication_Links and Events tables, plus Health Code.
+- **Adapters (section 6):** `detect(seed, ctx)` and `nodes(seed, ctx) -> ClusterView`. Order: Patroni → repmgr → pg_auto_failover monitor → Citus → pgpool → Logical → Streaming → Standalone.
+- **Roles:** always from `pg_is_in_recovery()` when the plugin can reach the node. If the manager disagrees, that is Health Code 4.
+- **Health codes:** 0 OK, 1 node down or not streaming, 2 no primary, 3 split brain, 4 manager disagrees. Cluster Health is 0/1/2.
+- **Remembered nodes:** kept in the state file for 24 h and still probed. That is how a returning ex-primary is caught as split brain.
+- **State:** `postgres/.state/<hash>.json`. Events log: `postgres/postgres_events.log`, written only when `logs_enabled`, sent via `applog`.
+
+## 3. Verified so far (real servers)
+
+- **Versions:** 9.6, 12, 13, 14, 16, 17 and 18 return status 1 with 0 failed queries. 9.5 is refused cleanly. Python 3.6 passes the unit tests and a live poll.
+- **Discovery:** standalone, streaming (from the primary and from a standby), Patroni (switchover and leader kill), repmgr with witness, pgpool (it caught a real detached primary → code 4), Citus, the pg_auto_failover monitor, and a 3-node logical mesh.
+- **Failover sequence:** down → recovered → no primary → promoted (timeline 1→2) → split brain. The events log matched.
+- **Access:** login-only user, `pg_monitor` user, wrong password, unreachable host, `sslmode=require`, and `verify-full` refused on a self-signed certificate.
+- **Rates vs pgbench:** commits and rows-updated rates match.
+- **Real Windows agent:** v2 dropped over v1 with the customer's existing encrypted cfg gives availability 1, version 2, 90 metrics, old names present.
+  - Six monitors run from one cfg: `[postgres]` (the original v1 cfg), standalone, streaming, patroni, repmgr, logical. All registered and send data.
+  - The user saw several bugs in the console. **They are not written down yet. Get the list first (section 6).**
+
+## 4. Test kit
+
+**Test beds** (`environments/`, all Docker). The repo `.env` holds the streaming credentials; the others use `site24x7/site24x7` unless noted.
+
+| Test bed | Reach from Windows | In-network host |
+| :--- | :--- | :--- |
+| standalone PG16 | 127.0.0.1:5450 | `tb-standalone-pg16` (network `tb-standalone_default`) |
+| streaming (root `docker-compose.yml`) | 5432 primary, 5433 standby | `pg-primary`, `pg-replica` (`pg-cluster-site24x7_default`). Credentials: `.env` MONITOR_* |
+| Patroni (`environments/patroni`) | PG 5441-5443, REST 8001-8003, HAProxy 5500 | `pg-node1..3`, `haproxy:5000`, REST 8008 |
+| repmgr | 5461-5464 | `repmgr-node1..3`, `repmgr-witness` (`tb-repmgr_default`) |
+| logical (`environments/docker/multimaster`) | 5451-5453 | `pg-mm1..3` (`pg-multimaster_default`) |
+| pgpool | none | `pgpool:9999` (`tb-pgpool_default`) |
+| Citus | none | `citus-coordinator`, user `postgres/pgpass` (`tb-citus_default`) |
+| pg_auto_failover | none | `monitor`, user `autoctl_node`, db `pg_auto_failover` (`tb-pgaf_default`). Data nodes block outside access (hba). node1 has crashed in this bed. |
+
+**Testing from Windows:** container IPs are not routable, so pass `address_map` (examples in the agent cfg below). Testing inside a network needs no map: `bash scripts/run_in_network.sh <network> --host <container> --username ... --password ...`. Build the runner once with `docker build -t pgplugin-runner scripts/runner`.
+
+**Real agent (this PC):**
+- **Folder:** `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres\`. Writable without admin.
+- **Service:** the plugin agent can't be restarted without admin. It notices a changed `.py` on its own ("Time Change" in the log) and re-registers.
+- **Polls:** every 5 min.
+- **Agent cfg:** `use_agent_python=0` and `redirect_output=1`. The agent's bundled Python has no psycopg2. The shipped cfg says `use_agent_python=1` to match upstream; this is an open question.
+- **Sections installed:** `[postgres]` (original, encrypted) plus `[postgres-standalone]`, `[postgres-streaming]` (logs on), `[postgres-patroni]`, `[postgres-repmgr]`, `[postgres-logical]`. The agent shows them as `postgres-postgres-<x>`, so use short section names like `[patroni]`.
+- **Backup of the original v1 `postgres.py` and encrypted cfg:** the session scratchpad `agent-backup/` folder (temporary). v1 is also at `reference/postgres/postgres.py`.
+- **Logs:** `...\monitoring\Logs\Details\PluginLog.log` and `PluginRegisterLog.log`.
+- **Exactly what the agent sends:** `bash scripts/agent_payloads.sh 6`. The agent wraps the output as `{availability, version, msg, data:{...}}`, with UTF-16 files that are deleted seconds after writing.
+
+**Console:** site24x7.in, org account. View only; never delete or change anything there. The user does deletions.
+
+## 5. Open issues and decisions
+
+1. **Console bugs the user saw.** List them, then fix them.
+2. **Template stability.** All `postgres` monitors share one template, and `finalize()` drops tab and unit entries for metrics not emitted that poll. If the template freezes at the first payload, metrics that only some monitors send (standby Replay Lag, Patroni rows) may never show. Check in the console. If confirmed, always send the full `tabs`/`units` from the catalogue. The repo rubric says every `units` key must exist in the data, so this needs a decision. Then the user deletes the template once and we re-register.
+3. **`msg` is sent even when availability is 1,** for example "1 queries failed: permission denied for function pg_ls_waldir". Decide whether partial-failure notes belong in `msg`.
+4. **Shipped `use_agent_python`:** 1 (upstream) or 0 (needed on this Windows agent).
+5. **Node names can differ between monitors** on plain streaming (a hostname vs an IP). The Patroni, repmgr and pgpool adapters use the manager's names.
+6. **Upstream installer** (`installer/Site24x7PostgresPluginInstaller.sh` in site24x7/plugins) is not updated yet.
+7. **pg_auto_failover data nodes** were not tested directly (the bed's hba blocks it).
+
+## 6. How to work efficiently (token budget)
+
+- **Bugs come from the user first.** Screenshot or one line per bug: monitor, tab, what's wrong. Reading the console in the browser costs a lot; use it only for a final visual check, and with `get_page_text`, not screenshots.
+- **Verify fixes locally.** Run `python -m pytest tests -q`, then `scripts/run_in_network.sh` or direct runs with `address_map`, then `scripts/agent_payloads.sh` to confirm what the real agent sends. Most console bugs are payload bugs and show up there.
+- **Copy the fixed file into the agent folder** (see section 4). It re-registers by itself; wait for one poll.
+- **Commit per fix** on `v7`. Plain commit messages, no AI attribution.
+- **Model:** Sonnet is fine for fixing listed bugs, since the code is catalogue- and adapter-shaped and fixes are local. Use Opus only for design calls such as issue 2.
