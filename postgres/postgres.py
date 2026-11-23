@@ -153,6 +153,7 @@ TAB_ORDER = [
     "Vacuum and Wraparound",
     "WAL and Archiving",
     "Replication",
+    "Cluster",
     "Plugin",
 ]
 SUMMARY = ""                      # metrics with no tab chart on the built-in Summary tab
@@ -379,6 +380,20 @@ QUERIES = [
              M("Last WAL Message Age", "s", "Replication")])],
         role=STANDBY),
 
+    Query("timeline", [
+        Variant((10, 0),
+            "SELECT ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int",
+            [M("Timeline", "timeline", "Cluster")]),
+        Variant((9, 6),
+            "SELECT ('x' || substr(pg_xlogfile_name(pg_current_xlog_location()), 1, 8))::bit(32)::int",
+            [M("Timeline", "timeline", "Cluster")])],
+        role=PRIMARY),
+
+    Query("timeline_standby", [Variant((9, 6),
+        "SELECT received_tli FROM pg_stat_wal_receiver",
+        [M("Timeline", "timeline", "Cluster")])],
+        role=STANDBY),
+
     Query("slots", [
         Variant((10, 0),
             "SELECT count(*), count(*) FILTER (WHERE NOT active),"
@@ -418,7 +433,46 @@ DERIVED = [
     M("Buffer Cache Hit Percent", "%", SUMMARY, float),
     M("Collection Time", "ms", "Plugin"),
     M("Failed Queries", "queries", "Plugin"),
+    # Cluster layer (built in section 6 from the discovered nodes)
+    M("Cluster Type", tab="Cluster", kind=str),
+    M("Cluster Health", "status", SUMMARY),
+    M("Health Code", "code", "Cluster"),
+    M("Health Reason", tab="Cluster", kind=str),
+    M("Primary Node", tab="Cluster", kind=str),
+    M("Nodes Total", "nodes", "Cluster"),
+    M("Nodes Up", "nodes", SUMMARY),
+    M("Nodes Down", "nodes", "Cluster"),
+    M("Standbys Streaming", "nodes", "Cluster"),
+    M("Sync Standbys", "nodes", "Cluster"),
+    M("Max Standby Replay Lag", "s", "Replication", float),
+    M("Max Standby Backlog", "MB", "Replication", float),
+    M("Last Failover Age", "s", "Cluster"),
+    M("Failovers 24h", "failovers", "Cluster"),
 ]
+
+# Child tables built by the cluster layer: name -> (tab, column units). The column
+# order here is the order rows are built in; "" marks a string column.
+CLUSTER_TABLES = {
+    "Nodes": ("Cluster", {
+        "role": "", "state": "", "address": "", "status": "flag", "reachable": "flag",
+        "replay_lag_s": "s", "backlog_mb": "MB", "timeline": "timeline",
+        "conn_pct": "%", "uptime_s": "s", "longest_query_s": "s",
+        "last_msg_age_s": "s", "last_seen_s": "s"}),
+    "Replication_Links": ("Replication", {
+        "state": "", "sync_state": "", "client_addr": "", "sent_lag_mb": "MB",
+        "write_lag_mb": "MB", "flush_lag_mb": "MB", "replay_lag_mb": "MB",
+        "write_lag_s": "s", "flush_lag_s": "s", "replay_lag_s": "s"}),
+    "Events": ("Cluster", {
+        "event": "", "node": "", "old_role": "", "new_role": "", "age_s": "s"}),
+}
+
+# Health Code values: what the plugin alone can know about the cluster.
+HEALTH_OK, HEALTH_NODE_DOWN, HEALTH_NO_PRIMARY, HEALTH_SPLIT_BRAIN = 0, 1, 2, 3
+HEALTH_SEVERITY = {HEALTH_OK: 0, HEALTH_NODE_DOWN: 1, HEALTH_NO_PRIMARY: 2, HEALTH_SPLIT_BRAIN: 2}
+
+NODE_FORGET_S = 24 * 3600      # a missing node is reported for a day, then dropped
+PROBE_TIMEOUT_S = 3
+MAX_EVENTS = MAX_ROWS
 
 TABLES = [
     Table("Stats_per_DB", "DB and IO stats", [((9, 6),
@@ -511,6 +565,9 @@ def build_tabs_and_units():
     for t in TABLES:
         tabs[t.tab]["tablist"].append(t.name)
         units[t.name] = {c: u for c, u in t.units.items() if u}
+    for name, (tab, cols) in CLUSTER_TABLES.items():
+        tabs[tab]["tablist"].append(name)
+        units[name] = {c: u for c, u in cols.items() if u}
     for m in all_metric_defs():
         if m.tab:
             tabs[m.tab]["tablist"].append(m.name)
@@ -819,7 +876,434 @@ def derive_metrics(node, metrics):
 
 
 # =============================================================================
-# 6. OUTPUT
+# 6. CLUSTER LAYER
+#
+# An adapter answers two questions for one kind of cluster: "is this my kind?"
+# and "which nodes exist?". The first adapter that recognises the seed wins.
+# Whatever an adapter claims, a node's role is taken from pg_is_in_recovery()
+# whenever the plugin can connect to it.
+# =============================================================================
+
+LOOPBACK = ("localhost", "127.0.0.1", "::1", "")
+
+
+def parse_address_map(raw):
+    """'10.0.0.5:5432=127.0.0.1:5441,pg2=127.0.0.1:5442' -> {source: target}."""
+    out = {}
+    for pair in str(raw or "").split(","):
+        if "=" in pair:
+            src, dst = pair.split("=", 1)
+            if src.strip() and dst.strip():
+                out[src.strip()] = dst.strip()
+    return out
+
+
+def map_address(host, port, address_map):
+    """Translates an address as the cluster reports it into one the agent can reach."""
+    target = address_map.get("%s:%s" % (host, port)) or address_map.get(str(host))
+    if not target:
+        return host, port
+    if ":" in target:
+        h, p = target.rsplit(":", 1)
+        try:
+            return h, int(p)
+        except ValueError:
+            return h, port
+    return target, port
+
+
+def node_row(name, role, state, status, address="", **extra):
+    row = {"name": safe_row_name(name), "role": role, "state": state,
+           "status": 1 if status else 0, "address": address[:MAX_STRING_CHARS],
+           "reachable": 0}
+    row.update({k: v for k, v in extra.items() if v is not None})
+    return row
+
+
+def seed_name(seed):
+    """A node is named by its address, never by its role, so a promotion or a
+    demotion keeps the same name (and its history) in the Nodes table."""
+    row = seed.query_one("SELECT host(inet_server_addr())")
+    if row and row[0] and row[0] not in LOOPBACK:
+        return row[0]
+    # Names are never DNS-resolved: some resolvers answer unknown names with a public IP.
+    return seed.host if seed.host not in LOOPBACK else "local"
+
+
+def own_application_name(seed):
+    """The application_name this standby's WAL receiver presents to its primary."""
+    row = seed.query_one(
+        "SELECT coalesce(substring(conninfo FROM 'application_name=([^ ]+)'),"
+        " nullif(current_setting('cluster_name'), ''), 'walreceiver')"
+        " FROM pg_stat_wal_receiver")
+    return row[0] if row else ""
+
+
+def upstream_of(seed):
+    """(host, port, streaming) of the primary a standby replicates from, or None."""
+    if seed.version >= (11, 0):
+        row = seed.query_one("SELECT sender_host, sender_port, status = 'streaming'"
+                             " FROM pg_stat_wal_receiver")
+    else:
+        row = seed.query_one(
+            "SELECT substring(conninfo FROM 'host=([^ ]+)'),"
+            " coalesce(substring(conninfo FROM 'port=([0-9]+)'), '5432'), status = 'streaming'"
+            " FROM pg_stat_wal_receiver")
+    if not row or not row[0]:
+        return None
+    try:
+        return str(row[0]), int(row[1] or 5432), bool(row[2])
+    except (TypeError, ValueError):
+        return None
+
+
+def replication_view(primary):
+    """The primary's pg_stat_replication rows: one dict per attached standby."""
+    if primary.version >= (10, 0):
+        sql = ("SELECT application_name, coalesce(host(client_addr), ''), state, sync_state,"
+               " round(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) / 1048576.0, 2),"
+               " round(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn) / 1048576.0, 2),"
+               " round(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn) / 1048576.0, 2),"
+               " round(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) / 1048576.0, 2),"
+               " extract(epoch FROM write_lag), extract(epoch FROM flush_lag),"
+               " extract(epoch FROM replay_lag), current_setting('port')"
+               " FROM pg_stat_replication ORDER BY application_name")
+    else:
+        sql = ("SELECT application_name, coalesce(host(client_addr), ''), state, sync_state,"
+               " round(pg_xlog_location_diff(pg_current_xlog_location(), sent_location) / 1048576.0, 2),"
+               " round(pg_xlog_location_diff(pg_current_xlog_location(), write_location) / 1048576.0, 2),"
+               " round(pg_xlog_location_diff(pg_current_xlog_location(), flush_location) / 1048576.0, 2),"
+               " round(pg_xlog_location_diff(pg_current_xlog_location(), replay_location) / 1048576.0, 2),"
+               " NULL, NULL, NULL, current_setting('port')"
+               " FROM pg_stat_replication ORDER BY application_name")
+    rows = primary.query_all(sql)
+    if rows is None:
+        return None
+    links, used = [], set()
+    for r in rows:
+        app, addr = str(r[0] or "").strip(), str(r[1] or "")
+        name = addr or (app if app and app != "walreceiver" else "standby")
+        if name in used:
+            name = "%s-%d" % (name, len(used) + 1)
+        used.add(name)
+        replay_mb = to_number(r[7], float)
+        replay_s = to_number(r[10], float)
+        if replay_s is None and replay_mb == 0:
+            replay_s = 0.0          # caught up and idle: PostgreSQL reports NULL lag
+        links.append({
+            "name": safe_row_name(name), "app": app, "client_addr": addr,
+            "port": to_number(r[11], int) or 5432,
+            "state": str(r[2] or "unknown"),
+            # 'quorum' (ANY n) standbys are synchronous candidates too
+            "sync_state": str(r[3] or "async"),
+            "sent_lag_mb": to_number(r[4], float), "write_lag_mb": to_number(r[5], float),
+            "flush_lag_mb": to_number(r[6], float), "replay_lag_mb": replay_mb,
+            "write_lag_s": to_number(r[8], float), "flush_lag_s": to_number(r[9], float),
+            "replay_lag_s": replay_s,
+        })
+    return links
+
+
+class StandaloneAdapter(object):
+    name = "standalone"
+
+    def detect(self, seed, ctx):
+        return True
+
+    def nodes(self, seed, ctx):
+        return ClusterView(nodes=[seed_row(seed, ctx)], primary_name=seed_name(seed))
+
+
+class StreamingAdapter(object):
+    """Plain streaming replication, and anything built on it (CloudNativePG, Stolon,
+    keepalived, managed services). Nodes come from the primary's pg_stat_replication;
+    a standby seed is followed to its primary first."""
+    name = "streaming"
+
+    def detect(self, seed, ctx):
+        if seed.is_recovery:
+            return upstream_of(seed) is not None or bool(ctx["remembered"])
+        row = seed.query_one("SELECT count(*) FROM pg_stat_replication")
+        return bool(row and row[0]) or bool(ctx["remembered"])
+
+    def nodes(self, seed, ctx):
+        if not seed.is_recovery:
+            return self.from_primary(seed, seed, ctx)
+        up = upstream_of(seed)
+        if up is None:
+            return ClusterView(nodes=[seed_row(seed, ctx)], primary_name="")
+        host, port = map_address(up[0], up[1], ctx["address_map"])
+        primary = ctx["connect"](host, port)
+        if primary is not None and not primary.is_recovery:
+            try:
+                return self.from_primary(primary, seed, ctx)
+            finally:
+                primary.close()
+        if primary is not None:
+            primary.close()
+        # Primary not reachable from here. A streaming WAL receiver proves it is alive.
+        label = up[0]
+        rows = [seed_row(seed, ctx),
+                node_row(label, ROLE_PRIMARY, "up" if up[2] else "unreachable", up[2],
+                         address="%s:%s" % (host, port))]
+        return ClusterView(nodes=rows, primary_name=label if up[2] else "")
+
+    def from_primary(self, primary, seed, ctx, primary_label=None):
+        links = replication_view(primary)
+        p_label = primary_label or seed_name(primary)
+        if primary is seed:
+            p_row = seed_row(seed, ctx, name=p_label)
+        else:
+            p_row = node_row(p_label, ROLE_PRIMARY, "up", True,
+                             address="%s:%s" % (primary.host, primary.port), reachable=1)
+        rows = [p_row]
+        seed_app = own_application_name(seed) if seed.is_recovery else ""
+        seed_addr = ""
+        if seed.is_recovery:
+            r = seed.query_one("SELECT coalesce(host(inet_server_addr()), '')")
+            seed_addr = r[0] if r else ""
+        for link in links or []:
+            is_seed = seed.is_recovery and (
+                (seed_app and seed_app != "walreceiver" and link["app"] == seed_app)
+                or (seed_addr and link["client_addr"] == seed_addr)
+                or len(links) == 1)
+            if is_seed:
+                row = seed_row(seed, ctx, name=link["name"])
+                row["state"] = link["state"]
+            else:
+                host, port = map_address(link["client_addr"], link["port"], ctx["address_map"])
+                row = node_row(link["name"], ROLE_STANDBY, link["state"],
+                               link["state"] == "streaming", address="%s:%s" % (host, port))
+                row["_probe"] = (host, port)
+            row["replay_lag_s"] = link["replay_lag_s"]
+            row["backlog_mb"] = link["replay_lag_mb"]
+            row["_sync"] = link["sync_state"]
+            rows.append({k: v for k, v in row.items() if v is not None})
+        return ClusterView(nodes=rows, links=links, primary_name=p_row["name"])
+
+
+# Most specific first; Standalone always matches.
+ADAPTERS = [StreamingAdapter(), StandaloneAdapter()]
+
+
+class ClusterView(object):
+    def __init__(self, nodes, links=None, primary_name=""):
+        self.nodes = nodes
+        self.links = links
+        self.primary_name = primary_name
+
+
+def seed_row(seed, ctx, name=None):
+    m = ctx["metrics"]
+    return node_row(
+        name or seed_name(seed), seed.role, "up", True,
+        address="%s:%s" % (seed.host, seed.port), reachable=1,
+        conn_pct=m.get("Connection Utilization"), uptime_s=m.get("Uptime"),
+        longest_query_s=m.get("Longest Transaction"), timeline=m.get("Timeline"),
+        replay_lag_s=m.get("Replay Lag"), backlog_mb=m.get("Replay Backlog"),
+        last_msg_age_s=m.get("Last WAL Message Age"))
+
+
+PROBE_SQL = (
+    "SELECT pg_is_in_recovery(),"
+    " round(100.0 * (SELECT count(*) FROM pg_stat_activity WHERE datname IS NOT NULL)"
+    " / current_setting('max_connections')::int, 2),"
+    " floor(extract(epoch FROM now() - pg_postmaster_start_time()))::bigint,"
+    " (SELECT coalesce(floor(max(extract(epoch FROM now() - xact_start))), 0)::bigint"
+    " FROM pg_stat_activity WHERE datname IS NOT NULL AND pid <> pg_backend_pid()),"
+    " (SELECT floor(extract(epoch FROM now() - max(last_msg_receipt_time)))::bigint"
+    " FROM pg_stat_wal_receiver)")
+
+
+def probe_nodes(rows, ctx, deadline):
+    """One light query per non-seed node, in parallel. Fills role from the node itself."""
+    import threading
+    targets = [r for r in rows if "_probe" in r]
+
+    def work(row):
+        host, port = row["_probe"]
+        node = ctx["connect"](host, port)
+        if node is None:
+            return
+        try:
+            res = node.query_one(PROBE_SQL)
+            row["reachable"] = 1
+            row["status"] = 1
+            if row["state"] in ("down", "unreachable"):
+                row["state"] = "up"
+            if res:
+                row["role"] = ROLE_STANDBY if res[0] else ROLE_PRIMARY
+                for key, val in zip(("conn_pct", "uptime_s", "longest_query_s", "last_msg_age_s"), res[1:]):
+                    num = to_number(val, float if key == "conn_pct" else int)
+                    if num is not None:
+                        row[key] = num
+        finally:
+            node.close()
+
+    threads = [threading.Thread(target=work, args=(r,), daemon=True) for r in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+
+
+def merge_remembered(rows, prev_nodes, now):
+    """Adds nodes seen in earlier polls but missing now. Returns names to forget."""
+    present = {r["name"] for r in rows}
+    forgotten = []
+    for name, info in sorted(prev_nodes.items()):
+        if name in present:
+            continue
+        age = now - float(info.get("last_seen") or 0)
+        if age > NODE_FORGET_S:
+            forgotten.append(name)
+            continue
+        address = info.get("address", "")
+        row = node_row(name, info.get("role", ROLE_STANDBY),
+                       "not streaming" if info.get("role") != ROLE_PRIMARY else "down",
+                       False, address=address, last_seen_s=int(age))
+        host, _, port = address.rpartition(":")
+        if host and port.isdigit():
+            row["_probe"] = (host, int(port))   # it may be up but detached, or a second primary
+        rows.append(row)
+    return forgotten
+
+
+def detect_events(rows, prev_nodes, forgotten, now):
+    """Role and availability changes since the previous poll."""
+    events = []
+    if not prev_nodes:
+        return events
+    for r in rows:
+        old = prev_nodes.get(r["name"])
+        if old is None:
+            events.append(("joined", r["name"], "", r["role"]))
+            continue
+        if old.get("role") != r["role"] and r["status"]:
+            kind = "promoted" if r["role"] == ROLE_PRIMARY else "demoted"
+            events.append((kind, r["name"], old.get("role", ""), r["role"]))
+        if old.get("status", 1) and not r["status"]:
+            events.append(("down", r["name"], old.get("role", ""), r["role"]))
+        elif not old.get("status", 1) and r["status"]:
+            events.append(("recovered", r["name"], old.get("role", ""), r["role"]))
+    for name in forgotten:
+        events.append(("removed", name, prev_nodes[name].get("role", ""), ""))
+    return [{"ts": now, "event": e[0], "node": e[1], "old_role": e[2], "new_role": e[3]}
+            for e in events]
+
+
+def evaluate_health(rows, cluster_type):
+    up = [r for r in rows if r["status"]]
+    primaries = [r for r in up if r["role"] == ROLE_PRIMARY]
+    if cluster_type != "standalone" and len(primaries) > 1:
+        return HEALTH_SPLIT_BRAIN, "split brain: %s are all writable" % ", ".join(
+            r["name"] for r in primaries)
+    if cluster_type != "standalone" and not primaries:
+        return HEALTH_NO_PRIMARY, "no reachable primary"
+    down_nodes = [r["name"] for r in rows if not r["status"] or r["state"] == "not streaming"]
+    if down_nodes:
+        return HEALTH_NODE_DOWN, "%d node(s) down or not streaming: %s" % (
+            len(down_nodes), ", ".join(down_nodes))
+    return HEALTH_OK, "%d of %d nodes up" % (len(up), len(rows))
+
+
+def cluster_metrics(view, cluster_type, history, now):
+    rows = view.nodes
+    code, reason = evaluate_health(rows, cluster_type)
+    standbys = [r for r in rows if r["role"] == ROLE_STANDBY]
+    out = {
+        "Cluster Type": cluster_type,
+        "Health Code": code,
+        "Cluster Health": HEALTH_SEVERITY[code],
+        "Health Reason": reason[:MAX_STRING_CHARS],
+        "Nodes Total": len(rows),
+        "Nodes Up": len([r for r in rows if r["status"]]),
+        "Nodes Down": len([r for r in rows if not r["status"]]),
+    }
+    if view.primary_name:
+        out["Primary Node"] = view.primary_name
+    if view.links is not None:
+        out["Standbys Streaming"] = len([l for l in view.links if l["state"] == "streaming"])
+        out["Sync Standbys"] = len([l for l in view.links if l["sync_state"] in ("sync", "quorum")])
+    lags = [r["replay_lag_s"] for r in standbys if r.get("replay_lag_s") is not None]
+    backlogs = [r["backlog_mb"] for r in standbys if r.get("backlog_mb") is not None]
+    if lags:
+        out["Max Standby Replay Lag"] = max(lags)
+    if backlogs:
+        out["Max Standby Backlog"] = max(backlogs)
+    promotions = [e["ts"] for e in history if e["event"] == "promoted"]
+    if promotions:
+        out["Last Failover Age"] = int(now - max(promotions))
+    if cluster_type != "standalone":
+        out["Failovers 24h"] = len([t for t in promotions if now - t <= 86400])
+    return out
+
+
+def event_rows(history, now):
+    rows = []
+    for e in sorted(history, key=lambda e: e["ts"], reverse=True)[:MAX_EVENTS]:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e["ts"]))
+        rows.append({"name": safe_row_name("%s_%s_%s" % (stamp, e["node"], e["event"])),
+                     "event": e["event"], "node": e["node"][:MAX_STRING_CHARS],
+                     "old_role": e["old_role"] or "-", "new_role": e["new_role"] or "-",
+                     "age_s": int(now - e["ts"])})
+    return rows
+
+
+def link_rows(links):
+    cols = CLUSTER_TABLES["Replication_Links"][1]
+    return [{k: v for k, v in l.items() if (k == "name" or k in cols) and v is not None}
+            for l in (links or [])][:MAX_ROWS]
+
+
+def public_rows(rows):
+    cols = CLUSTER_TABLES["Nodes"][1]
+    out = [{k: v for k, v in r.items() if (k == "name" or k in cols) and v is not None} for r in rows]
+    # down nodes first, so a large cluster never hides a failure past the row limit
+    out.sort(key=lambda r: (r["status"], r["role"] != ROLE_PRIMARY, r["name"]))
+    return out[:MAX_ROWS]
+
+
+def discover_cluster(seed, ctx):
+    """Runs the first adapter that recognises the seed."""
+    adapter = next(a for a in ADAPTERS if a.detect(seed, ctx))
+    return adapter.name, adapter.nodes(seed, ctx)
+
+
+# =============================================================================
+# 7. EVENTS LOG
+# =============================================================================
+
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUPS = 3
+
+
+def log_path(args):
+    """The events log always lives in the plugin folder; only the file name is configurable."""
+    name = os.path.basename(args.get("log_file_path") or "") or "postgres_events.log"
+    return os.path.join(PLUGIN_DIR, name)
+
+
+def write_events_log(path, events, cluster_id):
+    if not events:
+        return
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+            for i in range(LOG_BACKUPS - 1, 0, -1):
+                if os.path.exists("%s.%d" % (path, i)):
+                    os.replace("%s.%d" % (path, i), "%s.%d" % (path, i + 1))
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            for e in events:
+                fh.write("%s cluster=%s node=%s event=%s role=%s->%s\n" % (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["ts"])), cluster_id,
+                    e["node"], e["event"], e["old_role"] or "-", e["new_role"] or "-"))
+    except OSError:
+        pass
+
+
+# =============================================================================
+# 8. OUTPUT
 # =============================================================================
 
 def base_payload(args):
@@ -928,7 +1412,64 @@ def resolve_args(param):
         "timeout": min(max(timeout, 1), 30),
         "plugin_version": plugin_version,
         "heartbeat": parse_bool(p.get("heartbeat"), HEARTBEAT),
+        "address_map": parse_address_map(p.get("address_map")),
+        "logs_enabled": parse_bool(p.get("logs_enabled"), False),
+        "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
+        "log_file_path": p.get("log_file_path") or "",
     }
+
+
+def make_connector(args, deadline):
+    """Opens a short-timeout connection to another cluster node, or returns None."""
+    def connect(host, port):
+        if time.time() > deadline:
+            return None
+        n = Node(host, port, args["username"], args["password"], args["db"], args["sslmode"],
+                 args["sslrootcert"], args["sslcert"], args["sslkey"],
+                 min(PROBE_TIMEOUT_S, args["timeout"]))
+        return n if n.connect() else None
+    return connect
+
+
+def cluster_identity(seed):
+    """The cluster's system identifier, if this user may read it (PG 10+)."""
+    if seed.version < (10, 0):
+        return ""
+    before = len(seed.failures)
+    row = seed.query_one("SELECT system_identifier::text FROM pg_control_system()")
+    del seed.failures[before:]          # optional: not a collection failure
+    return row[0] if row else ""
+
+
+def collect_cluster(seed, metrics, prev, args, deadline, now):
+    """The cluster layer: metrics, child tables and the new cluster state."""
+    prev_cluster = prev.get("cluster") or {}
+    sysid = cluster_identity(seed)
+    if sysid and prev_cluster.get("sysid") and prev_cluster["sysid"] != sysid:
+        prev_cluster = {}               # the address now reaches a different cluster
+    prev_nodes = prev_cluster.get("nodes") or {}
+    ctx = {"metrics": metrics, "address_map": args["address_map"],
+           "connect": make_connector(args, deadline),
+           "remembered": [n for n in prev_nodes if prev_nodes[n].get("role")]}
+    cluster_type, view = discover_cluster(seed, ctx)
+    forgotten = merge_remembered(view.nodes, prev_nodes, now)
+    probe_nodes(view.nodes, ctx, deadline)
+    events = detect_events(view.nodes, prev_nodes, forgotten, now)
+    history = [e for e in (prev_cluster.get("events") or []) if now - e.get("ts", 0) <= 7 * 86400]
+    history = (history + events)[-MAX_EVENTS:]
+
+    nodes_state = {}
+    for r in view.nodes:
+        old = prev_nodes.get(r["name"], {})
+        nodes_state[r["name"]] = {
+            "role": r["role"], "status": r["status"], "address": r.get("address", ""),
+            "last_seen": now if r["status"] else old.get("last_seen", now)}
+    out = cluster_metrics(view, cluster_type, history, now)
+    tables = {"Nodes": public_rows(view.nodes), "Events": event_rows(history, now)}
+    if view.links is not None:
+        tables["Replication_Links"] = link_rows(view.links)
+    state = {"sysid": sysid, "nodes": nodes_state, "events": history}
+    return out, tables, events, state
 
 
 def run(param):
@@ -946,29 +1487,44 @@ def run(param):
         reason = "authentication failed for user %s" % args["username"] if node.auth_failed \
             else "cannot connect to %s:%s (%s)" % (args["host"], args["port"], node.error)
         return down(payload, reason)
+
+    path = state_path(args["host"], args["port"], args["db"])
+    prev = load_state(path)
+    deadline = t0 + CYCLE_BUDGET_S
+    cluster_out, cluster_tables, events, cluster_state = {}, {}, [], prev.get("cluster") or {}
     try:
         if node.version < VERSION_FLOOR:
             return down(payload, "PostgreSQL %d.%d is not supported; version %d.%d or later is required"
                         % (node.version + VERSION_FLOOR))
-        deadline = t0 + CYCLE_BUDGET_S
         metrics = collect_metrics(node, deadline)
         tables = collect_tables(node, deadline)
+        metrics.update(compute_rates(metrics, prev, t0, node.identity))
+        metrics.update(derive_metrics(node, metrics))
+        try:
+            cluster_out, cluster_tables, events, cluster_state = collect_cluster(
+                node, metrics, prev, args, deadline, t0)
+        except Exception as exc:        # never lose node metrics to a cluster-layer fault
+            node.failures.append(scrub("cluster discovery: %s" % exc))
     finally:
         node.close()
 
-    path = state_path(args["host"], args["port"], args["db"])
-    prev = load_state(path)
-    metrics.update(compute_rates(metrics, prev, t0, node.identity))
-    metrics.update(derive_metrics(node, metrics))
     save_state(path, {
         "ts": t0, "identity": node.identity,
         "counters": {r.source: metrics[r.source] for r in RATES if r.source in metrics},
+        "cluster": cluster_state,
     })
+    if args["logs_enabled"]:
+        write_events_log(log_path(args), events, cluster_state.get("sysid") or
+                         "%s:%s" % (args["host"], args["port"]))
+        payload["applog"] = {"logs_enabled": True, "log_type_name": args["log_type_name"],
+                             "log_file_path": log_path(args)}
 
+    metrics.update(cluster_out)
     metrics["Failed Queries"] = len(node.failures)
     metrics["Collection Time"] = int((time.time() - t0) * 1000)
     payload.update(metrics)
     payload.update(tables)
+    payload.update(cluster_tables)
     if node.failures:
         payload["msg"] = "%d queries failed: %s" % (len(node.failures), node.failures[0])
     payload = finalize(payload)
@@ -993,6 +1549,10 @@ def parse_cli(argv=None):
     parser.add_argument("--timeout", default=str(CONNECT_TIMEOUT_S))
     parser.add_argument("--plugin_version", default=str(PLUGIN_VERSION))
     parser.add_argument("--heartbeat", default="true")
+    parser.add_argument("--address_map", default="")
+    parser.add_argument("--logs_enabled", default="false")
+    parser.add_argument("--log_type_name", default="")
+    parser.add_argument("--log_file_path", default="")
     return vars(parser.parse_args(argv))
 
 

@@ -214,5 +214,99 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("Transactions Per Sec", str(out["tabs"]))
 
 
+def row(name, role, status=1):
+    return pg.node_row(name, role, "up" if status else "down", status)
+
+
+class ClusterLogicTests(unittest.TestCase):
+
+    def test_address_map_translates_host_and_host_port(self):
+        amap = pg.parse_address_map("10.0.0.5:5432=127.0.0.1:5441, pg2=127.0.0.1:5442,bad")
+        self.assertEqual(pg.map_address("10.0.0.5", 5432, amap), ("127.0.0.1", 5441))
+        self.assertEqual(pg.map_address("pg2", 5432, amap), ("127.0.0.1", 5442))
+        self.assertEqual(pg.map_address("10.0.0.9", 5432, amap), ("10.0.0.9", 5432))
+
+    def test_first_poll_records_no_events(self):
+        self.assertEqual(pg.detect_events([row("a", "primary")], {}, [], 100.0), [])
+
+    def test_failover_produces_down_and_promoted(self):
+        prev = {"a": {"role": "primary", "status": 1}, "b": {"role": "standby", "status": 1}}
+        rows = [row("b", "primary")]
+        forgotten = pg.merge_remembered(rows, {k: dict(v, last_seen=90.0) for k, v in prev.items()}, 100.0)
+        events = pg.detect_events(rows, prev, forgotten, 100.0)
+        kinds = {(e["event"], e["node"]) for e in events}
+        self.assertIn(("promoted", "b"), kinds)
+        self.assertIn(("down", "a"), kinds)
+        missing = next(r for r in rows if r["name"] == "a")
+        self.assertEqual((missing["status"], missing["state"]), (0, "down"))
+
+    def test_missing_standby_is_not_streaming_then_forgotten(self):
+        prev = {"s1": {"role": "standby", "status": 1, "last_seen": 0.0}}
+        rows = [row("p", "primary")]
+        self.assertEqual(pg.merge_remembered(rows, prev, 60.0), [])
+        self.assertEqual(rows[-1]["state"], "not streaming")
+        rows = [row("p", "primary")]
+        self.assertEqual(pg.merge_remembered(rows, prev, pg.NODE_FORGET_S + 1.0), ["s1"])
+
+    def test_recovered_node_is_an_event(self):
+        prev = {"s1": {"role": "standby", "status": 0}}
+        events = pg.detect_events([row("s1", "standby")], prev, [], 1.0)
+        self.assertEqual(events[0]["event"], "recovered")
+
+    def test_health_rules(self):
+        self.assertEqual(pg.evaluate_health([row("a", "primary"), row("b", "standby")], "streaming")[0],
+                         pg.HEALTH_OK)
+        self.assertEqual(pg.evaluate_health([row("a", "primary"), row("b", "primary")], "streaming")[0],
+                         pg.HEALTH_SPLIT_BRAIN)
+        self.assertEqual(pg.evaluate_health([row("a", "primary", 0), row("b", "standby")], "streaming")[0],
+                         pg.HEALTH_NO_PRIMARY)
+        self.assertEqual(pg.evaluate_health([row("a", "primary"), row("b", "standby", 0)], "streaming")[0],
+                         pg.HEALTH_NODE_DOWN)
+        self.assertEqual(pg.evaluate_health([row("a", "standby")], "standalone")[0], pg.HEALTH_OK)
+
+    def test_down_nodes_survive_the_row_limit(self):
+        rows = [row("n%02d" % i, "standby") for i in range(30)] + [row("zz-down", "standby", 0)]
+        out = pg.public_rows(rows)
+        self.assertEqual(len(out), pg.MAX_ROWS)
+        self.assertEqual(out[0]["name"], "zz-down")
+
+    def test_cluster_tables_fit_limits(self):
+        history = [{"ts": float(i), "event": "promoted", "node": "node-%d" % i,
+                    "old_role": "standby", "new_role": "primary"} for i in range(40)]
+        payload = {"status": 1, "Events": pg.event_rows(history, 100.0),
+                   "Nodes": pg.public_rows([row("a", "primary")])}
+        self.assertEqual(pg.validate_output(payload), [])
+        self.assertEqual(len(payload["Events"]), pg.MAX_ROWS)
+
+    def test_failover_metrics(self):
+        view = pg.ClusterView([row("b", "primary"), row("a", "standby", 0)], links=[], primary_name="b")
+        hist = [{"ts": 40.0, "event": "promoted", "node": "b", "old_role": "standby", "new_role": "primary"}]
+        out = pg.cluster_metrics(view, "streaming", hist, 100.0)
+        self.assertEqual(out["Last Failover Age"], 60)
+        self.assertEqual(out["Failovers 24h"], 1)
+        self.assertEqual(out["Cluster Health"], 1)
+        self.assertEqual(out["Primary Node"], "b")
+
+
+class EventsLogTests(unittest.TestCase):
+
+    def test_log_stays_in_plugin_folder(self):
+        path = pg.log_path({"log_file_path": "../../etc/evil.log"})
+        self.assertEqual(os.path.dirname(path), pg.PLUGIN_DIR)
+        self.assertEqual(os.path.basename(path), "evil.log")
+
+    def test_log_rotates(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "events.log")
+        with open(path, "w") as fh:
+            fh.write("x" * (pg.LOG_MAX_BYTES + 1))
+        pg.write_events_log(path, [{"ts": 0.0, "event": "down", "node": "a",
+                                    "old_role": "primary", "new_role": "primary"}], "c1")
+        self.assertTrue(os.path.exists(path + ".1"))
+        with open(path) as fh:
+            self.assertIn("event=down", fh.read())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,3 +47,4 @@ postgres_cluster/postgres_cluster_state.json
 *_state.json
 .pgcluster-*/
 postgres/.state/
+postgres/*.log*
