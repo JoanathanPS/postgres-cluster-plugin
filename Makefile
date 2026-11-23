@@ -1,20 +1,18 @@
 # ==============================================================================
-# Makefile for PostgreSQL Patroni Cluster & Site24x7 Cluster Plugin
+# Makefile for the Site24x7 PostgreSQL plugin (v2) and its Patroni test bed
 # ==============================================================================
 
 COMPOSE_FILE = environments/patroni/docker-compose.yml
 PYTHON ?= py
 
-.PHONY: help up down status logs failover-test test lag-demo
+.PHONY: help up down status logs test
 
 help:
 	@echo "Available commands:"
 	@echo "  make up            - Build and start Patroni + etcd + HAProxy cluster"
 	@echo "  make down          - Stop and destroy the cluster and data volumes"
 	@echo "  make status        - Show running cluster containers and Patroni state"
-	@echo "  make test          - Run the Site24x7 cluster plugin validation test suite"
-	@echo "  make failover-test - Execute automated failover simulation and assertions"
-	@echo "  make lag-demo      - Generate load and demonstrate replication backlog"
+	@echo "  make test          - Run the plugin unit tests"
 
 up:
 	docker compose -f $(COMPOSE_FILE) up -d --build
@@ -33,11 +31,5 @@ status:
 logs:
 	docker compose -f $(COMPOSE_FILE) logs -f
 
-failover-test:
-	$(PYTHON) tests/tester/test_cluster_plugin.py --failover
-
 test:
-	$(PYTHON) tests/tester/test_cluster_plugin.py
-
-lag-demo:
-	$(PYTHON) tests/tester/lag_demo.py
+	$(PYTHON) -m pytest tests -q
