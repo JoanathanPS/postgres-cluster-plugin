@@ -5,7 +5,7 @@
 # Creates:
 #   * a replication role + physical replication slot for pg-replica
 #   * a least-privilege monitoring role for the Site24x7 postgres plugin
-#     (LOGIN + pg_read_all_stats, as required by the plugin README)
+#     (LOGIN + pg_monitor, as required by the plugin README)
 #   * a pg_hba.conf rule allowing streaming replication with SCRAM auth
 #
 # Note: this file may be *sourced* by the entrypoint (if it is not executable on
@@ -35,7 +35,7 @@ SELECT pg_create_physical_replication_slot(:'repl_slot');
 -- Monitoring account for Site24x7: no superuser, no CREATE, read-only by default.
 CREATE ROLE :"mon_user" WITH LOGIN PASSWORD :'mon_pass'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 5;
-GRANT pg_read_all_stats TO :"mon_user";
+GRANT pg_monitor TO :"mon_user";
 ALTER ROLE :"mon_user" SET default_transaction_read_only = on;
 SQL
 
