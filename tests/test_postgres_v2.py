@@ -381,6 +381,22 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(rows["pg-node3"]["status"], 0)
         self.assertEqual(rows["pg-node2"]["_probe"], ("pg-node2", 5432))
 
+    def test_repmgr_conninfo_without_port_means_5432(self):
+        """Seed reached on a mapped port (127.0.0.1:5462) must still be recognised as
+        the registry's node whose conninfo has no port (i.e. 5432)."""
+        seed = SeedStub(host="127.0.0.1", port=5462, answers={
+            "shared_preload_libraries": [("repmgr",)],
+            "repmgr.nodes": [("repmgr-node2", "host=repmgr-node2 user=repmgr dbname=repmgr", "primary", True),
+                             ("repmgr-node1", "host=repmgr-node1 user=repmgr dbname=repmgr", "standby", True)],
+            "pg_stat_replication": [],
+        })
+        seed.dbname = "repmgr"
+        ctx = ctx_for(seed, address_map={"repmgr-node2:5432": "127.0.0.1:5462",
+                                         "repmgr-node1:5432": "127.0.0.1:5461"})
+        rows = {r["name"]: r for r in pg.RepmgrAdapter().nodes(seed, ctx).nodes}
+        self.assertNotIn("_probe", rows["repmgr-node2"])            # matched as the seed
+        self.assertEqual(rows["repmgr-node1"]["_probe"], ("127.0.0.1", 5461))
+
     def test_patroni_needs_a_configured_port(self):
         self.assertFalse(pg.PatroniAdapter().detect(SeedStub(), ctx_for(SeedStub(), args={})))
 

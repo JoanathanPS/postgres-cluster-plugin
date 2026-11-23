@@ -1261,7 +1261,8 @@ class RepmgrAdapter(object):
             host = re.search(r"host=(\S+)", str(conninfo or ""))
             port = re.search(r"port=(\d+)", str(conninfo or ""))
             role = {"primary": ROLE_PRIMARY, "standby": ROLE_STANDBY}.get(ntype, ntype)
-            members.append((name, host.group(1) if host else name, int(port.group(1)) if port else seed.port,
+            # a conninfo without port= means libpq's default, 5432 (not the seed's port)
+            members.append((name, host.group(1) if host else name, int(port.group(1)) if port else 5432,
                             role, "active" if active else "inactive", bool(active), {}))
         rows = registry_rows(seed, ctx, members)
         primary = next((r["name"] for r in rows if r.get("_claimed", r["role"]) == ROLE_PRIMARY), "")
@@ -1277,7 +1278,21 @@ class RepmgrAdapter(object):
                 finally:
                     if pnode is not seed:
                         pnode.close()
+        apply_link_lag(rows, links)
         return ClusterView(nodes=rows, links=links, primary_name=primary)
+
+
+def apply_link_lag(rows, links):
+    """Copies replay lag from the primary's replication links onto the standby rows.
+    A link matches a row by name or by application_name (repmgr and Patroni set it to
+    the node name)."""
+    for r in rows:
+        if r["role"] != ROLE_STANDBY:
+            continue
+        link = next((l for l in links or [] if r["name"] in (l["name"], l.get("app"))), None)
+        if link:
+            r["replay_lag_s"] = link["replay_lag_s"]
+            r["backlog_mb"] = link["replay_lag_mb"]
 
 
 class AutoFailoverMonitorAdapter(object):
