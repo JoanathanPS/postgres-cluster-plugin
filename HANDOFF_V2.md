@@ -86,7 +86,14 @@ Read this instead of the old chat. `HANDOFF.md` describes v6 and is history only
 
 ## 6. How to work efficiently (token budget)
 
-- **Bugs come from the user first.** Screenshot or one line per bug: monitor, tab, what's wrong. Reading the console in the browser costs a lot; use it only for a final visual check, and with `get_page_text`, not screenshots.
+- **Don't make the user report bugs by hand; it takes too long.** Find them automatically:
+  1. `scripts/console_check.py` (restored from v6) is a Playwright script with its own Chrome profile in `.auth/` (gitignored).
+  2. The user logs in once: `py -m pip install playwright`, then `py -m playwright install chromium`, then `py scripts/console_check.py --headed`. Claude never handles the credentials.
+  3. After that it runs headless and read-only with `py scripts/console_check.py --monitor-name "<monitor>"`, and writes its findings to a file.
+  4. Compare that output with `scripts/agent_payloads.sh`, which shows what was sent. The difference between the two is the bug list.
+  5. It was written for v6 monitor names, so first adapt its checks to v2 (the tabs, the `Nodes` and `Events` tables, and Health Code).
+  6. Don't read the console in the Claude browser pane (expensive). Use it only for a final look, with `get_page_text`, not screenshots.
+- **Better long-term:** the Site24x7 REST API (`/api/current_status/<monitor_id>`, read-only OAuth self-client from api-console.zoho.in) returns monitor values as JSON with no UI scraping. It needs the user to create a read-only API client in the org account, so ask first.
 - **Verify fixes locally.** Run `python -m pytest tests -q`, then `scripts/run_in_network.sh` or direct runs with `address_map`, then `scripts/agent_payloads.sh` to confirm what the real agent sends. Most console bugs are payload bugs and show up there.
 - **Copy the fixed file into the agent folder** (see section 4). It re-registers by itself; wait for one poll.
 - **Commit per fix** on `v7`. Plain commit messages, no AI attribution.
