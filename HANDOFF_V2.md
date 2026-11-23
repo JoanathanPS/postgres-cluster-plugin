@@ -69,6 +69,13 @@ Read this instead of the old chat. `HANDOFF.md` describes v6 and is history only
 
 ## 5. Open issues and decisions
 
+0. **Extra cfg sections receive no arguments (found 15:06, 2026-11-23).**
+   - **What happens:** the agent passed `--host/--port/--username/--password/--db` only to the original `[postgres]` section. The five added sections ran with no arguments, so they used the defaults (`localhost:5432`) and are down.
+   - **How it was confirmed:** a one-poll debug hook that logged argv names.
+   - **Naming:** the agent registered the sections as `postgres-postgres-<x>`. They have since been renamed `[standalone]`, `[streaming]`, `[patroni]`, `[repmgr]`, `[logical]` in the agent cfg, but the agent still uses the old registered names. It reads sections at registration time.
+   - **Next step:** the user deletes those five monitors in the console, or restarts the "Site24x7 Plugin Agent" service as admin. Then run `scripts/agent_payloads.sh 6` and check whether short section names now get arguments.
+   - **If they still don't:** compare with upstream multi-instance plugins, the `[nginx-localhost]` style in the repo rubric.
+   - **Code change worth making either way:** when the plugin gets no `--host` at all, put "no configuration received from agent" in `msg`, so the cause is obvious.
 1. **Console bugs the user saw.** List them, then fix them.
 2. **Template stability.** All `postgres` monitors share one template, and `finalize()` drops tab and unit entries for metrics not emitted that poll. If the template freezes at the first payload, metrics that only some monitors send (standby Replay Lag, Patroni rows) may never show. Check in the console. If confirmed, always send the full `tabs`/`units` from the catalogue. The repo rubric says every `units` key must exist in the data, so this needs a decision. Then the user deletes the template once and we re-register.
 3. **`msg` is sent even when availability is 1,** for example "1 queries failed: permission denied for function pg_ls_waldir". Decide whether partial-failure notes belong in `msg`.
