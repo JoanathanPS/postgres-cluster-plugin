@@ -1897,7 +1897,10 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     ctx = {"metrics": metrics, "address_map": args["address_map"], "args": args,
            "connect": make_connector(args, deadline), "now": now,
            "prev_cluster": prev_cluster, "state_extra": {},
-           "remembered": [n for n in prev_nodes if prev_nodes[n].get("role")]}
+           # Remembered nodes keep a cluster "a cluster" while its standbys are away.
+           # A standalone server's state holds only itself, which is not evidence of one.
+           "remembered": [] if prev_cluster.get("type", "standalone") == "standalone"
+                         else [n for n in prev_nodes if prev_nodes[n].get("role")]}
     for key in ("pgpool", "pgpool_checked"):
         if key in prev_cluster:
             ctx["state_extra"][key] = prev_cluster[key]
@@ -1918,7 +1921,7 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     tables = {"Nodes": public_rows(view.nodes), "Events": event_rows(history, now)}
     if view.links is not None:
         tables["Replication_Links"] = link_rows(view.links)
-    state = {"sysid": sysid, "nodes": nodes_state, "events": history}
+    state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history}
     state.update(ctx["state_extra"])
     return out, tables, events, state
 
