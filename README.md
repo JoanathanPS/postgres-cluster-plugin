@@ -1,41 +1,23 @@
-# Site24x7 PostgreSQL Cluster Plugin
+# Site24x7 PostgreSQL plugin, version 2
 
-A single Site24x7 plugin monitor for a whole PostgreSQL cluster: primary and standbys, health, replication, and every standalone `postgres` parameter per node.
+The replacement for the official Site24x7 `postgres` plugin. It monitors a PostgreSQL server and, when that server is part of a cluster, every node of the cluster from that one address.
 
-The plugin itself is in [`postgres_cluster/`](postgres_cluster/). Start with its [README](postgres_cluster/README.md) for tabs, metrics, health rules, installation, thresholds, tested clusters and limitations.
+Start here:
+- **Plugin documentation** (install, configuration, metrics, health codes): [`postgres/README.md`](postgres/README.md)
+- **Current state, test kit and open issues:** [`HANDOFF.md`](HANDOFF.md)
 
-## Repository layout
+## Layout
 
 | Path | What it is |
 | :--- | :--- |
-| `postgres_cluster/` | The Site24x7 PostgreSQL cluster monitoring plugin (engine, config, installer, prerequisites). |
-| `docs/` | Architecture guides, specifications, and PR draft (`docs/PR_DESCRIPTION.md`). |
-| `docs/audit/` | Audit reports, gap analyses, fix prompts, and structure diffs. |
-| `docs/images/` | Dashboard screenshots and architecture diagrams (`ss1.png`, `ss2.png`). |
-| `scripts/` | Helper scripts for deployment (`deploy-dev.ps1`), failover tests, and validation (`check-layout.ps1`). |
-| `tests/` | Complete test suites: unit tests (`test_summary.py`, `test_contract.py`), harness (`tests/harness/`), and validation tester (`tests/tester/`). |
-| `environments/` | Multi-node test clusters & testbeds: Patroni (`environments/patroni/`), Streaming Replication (`environments/streaming/`), Multi-master, and community testbeds (`environments/testbeds/`). |
-| `reference/` | Parity references: upstream Site24x7 postgres plugin (`reference/postgres/`) and Datadog (`reference/datadog/`). |
-| `evidence/` | Collected test evidence, DOM inspection dumps, and agent payload outputs. |
-| `research/` | Deep-dive research notes, metric catalogues, and failure matrices. |
+| `postgres/` | The plugin: `postgres.py`, `postgres.cfg`, `README.md`. This folder is what ships. |
+| `tests/` | Unit tests. Run with `python -m pytest tests -q`. |
+| `scripts/api_check.py` | Read-only check of every `postgres` monitor through the Site24x7 REST API. Needs the `S247_*` keys in `.env`. |
+| `scripts/agent_payloads.sh` | Captures exactly what the local Site24x7 agent sends at its next poll. |
+| `scripts/run_in_network.sh`, `scripts/runner/` | Run the plugin inside a test bed's Docker network. |
+| `docker-compose.yml` | Streaming-replication test bed (primary and standby). Credentials come from `.env` (see `.env.example`). |
+| `environments/` | Other test beds: `patroni/`, `streaming/` (init scripts), `docker/multimaster/` (logical), and `testbeds/` (repmgr, pgpool, Citus, pg_auto_failover, CloudNativePG, Stolon, standalone). |
+| `reference/postgres/` | The official version 1 plugin, kept for backward-compatibility checks. |
+| `.agents/skills/pluginaudit/` | The site24x7/plugins review rubric, to check against before a PR. |
 
-## Branches
-
-| Branch | Purpose |
-| :--- | :--- |
-| `main` | The finished production plugin (Site24x7 official layout). |
-| `v5` | Full development repository with environments, test harnesses, and research. |
-| `upstream-layout` | Working branch for the upstream layout. |
-| `v4` | Work in progress: finding all nodes from one address, and more cluster types. |
-| `v1` | The previous implementation (PR #442), kept unmodified for comparison. |
-| tag `old-main` | The previous state of `main`, before it was replaced. |
-
-## Quick checks
-
-```powershell
-# Run the full test suite, including the Site24x7 payload-contract checks
-python -m pytest tests -q
-
-# Run layout compliance check
-powershell scripts\check-layout.ps1
-```
+Older work (the v6 `postgres_cluster` plugin, research, audit notes, console evidence) is on branch `v6`.
