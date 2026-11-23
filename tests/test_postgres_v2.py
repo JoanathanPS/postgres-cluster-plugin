@@ -200,7 +200,8 @@ class RunTests(unittest.TestCase):
         with mock.patch.object(pg, "psycopg2", fake), \
                 mock.patch.object(pg, "HAVE_PSYCOPG2", True), \
                 mock.patch.object(pg, "save_state", return_value=True), \
-                mock.patch.object(pg, "load_state", return_value={}):
+                mock.patch.object(pg, "load_state", return_value={}), \
+                mock.patch.object(pg, "RATE_SAMPLE_S", 0.6):
             return pg.run({"host": "h", "port": "5432", "username": "u", "password": "p"})
 
     def test_healthy_poll_is_up_and_valid(self):
@@ -218,10 +219,37 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["Failed Queries"], 1)
         self.assertIn("permission denied", out["msg"])
 
-    def test_first_poll_has_no_rates(self):
+    def test_first_poll_samples_real_rates(self):
+        """No previous state: rates come from two readings inside the poll, and the
+        plugin's own commit between them is not counted as traffic."""
         out = self.run_with()
-        self.assertNotIn("Transactions Per Sec", out)
-        self.assertNotIn("Transactions Per Sec", str(out["tabs"]))
+        self.assertEqual(out["Transactions Per Sec"], 0.0)
+        self.assertIn("New Deadlocks", out)
+
+    def test_truthful_zeros_are_sent_not_left_out(self):
+        out = self.run_with()          # fake server: primary, archive_mode off
+        for name in ("Archived Count", "Archive Failed Count", "Archiving Failing",
+                     "Replay Lag", "Replay Backlog", "WAL Receiver Connected"):
+            self.assertEqual(out[name], 0, name)
+        self.assertNotIn("Last Archive Age", out)   # no honest value exists
+
+
+class TruthfulZeroTests(unittest.TestCase):
+
+    def test_standby_and_archiving_keep_real_values(self):
+        node = mock.Mock(is_recovery=True, settings={"archive_mode": "on"})
+        self.assertEqual(pg.truthful_zeros(node, {}), {"WAL Generated Per Sec": 0.0})
+
+    def test_existing_values_are_never_overwritten(self):
+        node = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
+        self.assertNotIn("Archived Count", pg.truthful_zeros(node, {"Archived Count": 7}))
+
+    def test_cluster_without_standbys_reports_zero_lag(self):
+        view = pg.ClusterView([pg.node_row("a", "primary", "up", True)], links=None, primary_name="a")
+        out = pg.cluster_metrics(view, "standalone", [], 100.0)
+        self.assertEqual((out["Standbys Streaming"], out["Max Standby Replay Lag"], out["Failovers 24h"]),
+                         (0, 0.0, 0))
+        self.assertNotIn("Last Failover Age", out)
 
 
 def row(name, role, status=1):

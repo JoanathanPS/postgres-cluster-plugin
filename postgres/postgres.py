@@ -269,10 +269,11 @@ QUERIES = [
          M("Waiting Locks", "locks", "Activity")])]),
 
     Query("table_stats", [Variant((9, 6),
-        "SELECT (SELECT sum(idx_scan) FROM pg_stat_user_indexes),"
-        " (SELECT sum(idx_tup_read) FROM pg_stat_user_indexes),"
-        " (SELECT sum(idx_tup_fetch) FROM pg_stat_user_indexes),"
-        " sum(seq_scan), sum(n_dead_tup), sum(n_live_tup),"
+        # with no user tables these counts are truly 0, so they are coalesced
+        "SELECT (SELECT coalesce(sum(idx_scan), 0) FROM pg_stat_user_indexes),"
+        " (SELECT coalesce(sum(idx_tup_read), 0) FROM pg_stat_user_indexes),"
+        " (SELECT coalesce(sum(idx_tup_fetch), 0) FROM pg_stat_user_indexes),"
+        " coalesce(sum(seq_scan), 0), coalesce(sum(n_dead_tup), 0), coalesce(sum(n_live_tup), 0),"
         " count(*) FILTER (WHERE coalesce(last_vacuum, last_autovacuum) IS NULL AND n_live_tup > 0),"
         " floor(extract(epoch FROM now() - min(greatest(last_vacuum, last_autovacuum))))::bigint"
         " FROM pg_stat_user_tables",
@@ -286,7 +287,7 @@ QUERIES = [
          M("Oldest Table Vacuum Age", "s", "Vacuum and Wraparound")])]),
 
     Query("heap", [Variant((9, 6),
-        "SELECT sum(heap_blks_read), sum(heap_blks_hit),"
+        "SELECT coalesce(sum(heap_blks_read), 0), coalesce(sum(heap_blks_hit), 0),"
         " CASE WHEN coalesce(sum(heap_blks_hit) + sum(heap_blks_read), 0) = 0 THEN NULL"
         " ELSE round(sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)), 4) END,"
         " CASE WHEN coalesce(sum(idx_blks_hit) + sum(idx_blks_read), 0) = 0 THEN NULL"
@@ -312,7 +313,8 @@ QUERIES = [
         [M("Total Database Size", "MB", "DB and IO stats", float)])]),
 
     Query("checksums", [Variant((12, 0),
-        "SELECT sum(checksum_failures) FROM pg_stat_database",
+        # failures detected; 0 when none were (or checksums are off and none can be)
+        "SELECT coalesce(sum(checksum_failures), 0) FROM pg_stat_database",
         [M("Checksum Failures", "failures", "DB and IO stats")])]),
 
     Query("wal_position", [
@@ -408,9 +410,10 @@ QUERIES = [
             [M("Replication Slots", "slots", "Replication"),
              M("Inactive Replication Slots", "slots", "Replication"),
              M("Max Slot Retained WAL", "MB", "Replication", float)])],
-        # On standbys HA managers keep idle slots for failover on purpose (Patroni does);
-        # counting them would raise false alerts. The table still lists them.
-        role=PRIMARY),
+        # Reported on every node: the template only registers metrics that have a value,
+        # so a standby-registered template must carry them too. Note that HA managers
+        # (Patroni) keep idle slots on standbys on purpose; see the README.
+        ),
 
     Query("subscriptions", [
         Variant((15, 0),
@@ -432,8 +435,7 @@ QUERIES = [
             " ON s.subid = sub.oid AND s.relid IS NULL",
             [M("Subscriptions", "subscriptions", "Replication"),
              M("Active Subscriptions", "subscriptions", "Replication"),
-             M("Last Subscription Message Age", "s", "Replication")])],
-        role=PRIMARY),
+             M("Last Subscription Message Age", "s", "Replication")])]),
 ]
 
 RATES = [
@@ -838,10 +840,12 @@ def applies(entry, node):
     return entry.when is None or bool(entry.when(node))
 
 
-def collect_metrics(node, deadline):
-    """Runs every applicable single-row query; returns {metric: value}."""
+def collect_metrics(node, deadline, only=None):
+    """Runs every applicable single-row query (or only the keys in `only`, in that
+    order); returns {metric: value}."""
     out = {}
-    for q in QUERIES:
+    queries = QUERIES if only is None else [q for k in only for q in QUERIES if q.key == k]
+    for q in queries:
         if time.time() > deadline:
             node.failures.append("cycle time budget exhausted before '%s'" % q.key)
             break
@@ -912,7 +916,7 @@ def compute_rates(metrics, prev, now, identity):
     out = {}
     prev_counters = prev.get("counters") or {}
     dt = now - float(prev.get("ts") or 0)
-    if prev.get("identity") != identity or not (RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S):
+    if prev.get("identity") != identity or dt <= 0 or not (RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S):
         return out
     for r in RATES:
         cur = metrics.get(r.source)
@@ -924,6 +928,53 @@ def compute_rates(metrics, prev, now, identity):
             continue
         out[r.name] = int(diff) if r.delta else round(diff * r.scale / dt, 2)
     return out
+
+
+RATE_SAMPLE_S = 5.0          # 2 s was measured 75% off under load; 5 s within ~10%
+
+
+def sampled_rates(node, deadline):
+    """Real rates on a monitor's first poll, when there is no previous sample: reads
+    the rate counters twice, RATE_SAMPLE_S apart.
+
+    Site24x7 builds the template only from metrics that have a value when a monitor
+    registers, so without this no rate metric would ever be registered. The counter
+    queries run back to back, with `database_totals` last in the first reading and
+    first in the second, so only one of the plugin's own statements (one commit)
+    falls between its two readings; that commit is taken off.
+    Returns (rates, second_reading, time_of_second_reading)."""
+    sources = {r.source for r in RATES}
+    keys = [q.key for q in QUERIES if q.key != "database_totals"
+            and any(f.name in sources for v in q.variants for f in v.fields)]
+    if time.time() + RATE_SAMPLE_S + 5 > deadline:
+        return {}, {}, time.time()
+    first = collect_metrics(node, deadline, only=keys + ["database_totals"])
+    t_first = time.time()
+    time.sleep(RATE_SAMPLE_S)
+    second = collect_metrics(node, deadline, only=["database_totals"] + keys)
+    t_second = time.time()
+    counters = {k: v for k, v in first.items() if k in sources}
+    if "Total Commits" in counters and "Total Commits" in second:
+        counters["Total Commits"] = min(counters["Total Commits"] + 1, second["Total Commits"])
+    prev = {"ts": t_first, "identity": node.identity, "counters": counters}
+    return compute_rates(second, prev, t_second, node.identity), second, t_second
+
+
+def truthful_zeros(node, metrics):
+    """Values that are genuinely 0 for this node rather than unknown, so the metric is
+    sent (and registered in the template) instead of left out."""
+    zeros = {}
+    if node.settings.get("archive_mode", "off") == "off":
+        # nothing is archived, so nothing has been archived, failed or is waiting
+        zeros.update({"Archived Count": 0, "Archive Failed Count": 0, "Archiving Failing": 0,
+                      "Archive Ready Files": 0, "New Archive Failures": 0})
+    if not node.is_recovery:
+        # a primary replays nothing and receives WAL from no one
+        zeros.update({"Replay Lag": 0, "Replay Backlog": 0.0, "WAL Receiver Connected": 0})
+    else:
+        # a standby generates no WAL of its own
+        zeros.update({"WAL Generated Per Sec": 0.0})
+    return {k: v for k, v in zeros.items() if k not in metrics}
 
 
 def derive_metrics(node, metrics):
@@ -1601,20 +1652,20 @@ def cluster_metrics(view, cluster_type, history, now, single_writer=True):
     }
     if view.primary_name:
         out["Primary Node"] = view.primary_name
-    if view.links is not None:
-        out["Standbys Streaming"] = len([l for l in view.links if l["state"] == "streaming"])
-        out["Sync Standbys"] = len([l for l in view.links if l["sync_state"] in ("sync", "quorum")])
+    links = view.links if view.links is not None else ([] if not standbys else None)
+    if links is not None:          # with no standbys at all, 0 streaming is the truth
+        out["Standbys Streaming"] = len([l for l in links if l["state"] == "streaming"])
+        out["Sync Standbys"] = len([l for l in links if l["sync_state"] in ("sync", "quorum")])
     lags = [r["replay_lag_s"] for r in standbys if r.get("replay_lag_s") is not None]
     backlogs = [r["backlog_mb"] for r in standbys if r.get("backlog_mb") is not None]
-    if lags:
-        out["Max Standby Replay Lag"] = max(lags)
-    if backlogs:
-        out["Max Standby Backlog"] = max(backlogs)
+    if lags or not standbys:       # no standby means no standby is behind
+        out["Max Standby Replay Lag"] = max(lags) if lags else 0.0
+    if backlogs or not standbys:
+        out["Max Standby Backlog"] = max(backlogs) if backlogs else 0.0
     promotions = [e["ts"] for e in history if e["event"] == "promoted"]
     if promotions:
         out["Last Failover Age"] = int(now - max(promotions))
-    if cluster_type != "standalone":
-        out["Failovers 24h"] = len([t for t in promotions if now - t <= 86400])
+    out["Failovers 24h"] = len([t for t in promotions if now - t <= 86400])
     return out
 
 
@@ -1885,7 +1936,13 @@ def run(param):
                         % (node.version + VERSION_FLOOR))
         metrics = collect_metrics(node, deadline)
         tables = collect_tables(node, deadline)
-        metrics.update(compute_rates(metrics, prev, t0, node.identity))
+        sample_ts = t0
+        rates = compute_rates(metrics, prev, t0, node.identity)
+        if not rates:                   # first poll of this server process
+            rates, second, sample_ts = sampled_rates(node, deadline)
+            metrics.update(second)
+        metrics.update(rates)
+        metrics.update(truthful_zeros(node, metrics))
         metrics.update(derive_metrics(node, metrics))
         try:
             cluster_out, cluster_tables, events, cluster_state = collect_cluster(
@@ -1896,7 +1953,7 @@ def run(param):
         node.close()
 
     save_state(path, {
-        "ts": t0, "identity": node.identity,
+        "ts": sample_ts, "identity": node.identity,
         "counters": {r.source: metrics[r.source] for r in RATES if r.source in metrics},
         "cluster": cluster_state,
     })

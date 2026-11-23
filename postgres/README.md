@@ -136,7 +136,11 @@ Every table is capped at 25 rows. In `Nodes`, down nodes are listed first so a f
 
 ## Supported metrics
 
-Rates (`... Per Sec`) and per-poll deltas (`New ...`) need two polls of the same server process, so they appear from the second poll onward. A metric that cannot be read on a given server is left out, never reported as 0.
+Rates (`... Per Sec`) and per-poll deltas (`New ...`) are measured between polls. On a monitor's first poll there is no previous poll yet, so the plugin reads the counters twice, 5 seconds apart, and reports that measurement. This adds 5 seconds to the first poll only.
+
+Where 0 is the true value, 0 is sent. Examples: archive counts when archiving is off, replay lag on a primary, WAL generated on a standby. A metric with no honest value on a given server is left out, never reported as 0. Examples: Last Archive Age when nothing has been archived, Cache Hit Ratio when there are no tables.
+
+This matters because Site24x7 builds the monitor template only from metrics that have a value when a monitor first registers.
 
 | Metric | Unit | Description |
 | :--- | :--- | :--- |
@@ -211,8 +215,8 @@ Rates (`... Per Sec`) and per-poll deltas (`New ...`) need two polls of the same
 | Replay Lag | s | Standby: how far replay is behind (0 when fully caught up) |
 | Replay Backlog | MB | Standby: WAL received but not yet replayed |
 | Last WAL Message Age | s | Standby: time since the last message from the upstream |
-| Replication Slots, Inactive Replication Slots | slots | Primary only (HA managers keep idle slots on standbys on purpose) |
-| Max Slot Retained WAL | MB | Largest WAL volume held back by a slot (primary) |
+| Replication Slots, Inactive Replication Slots | slots | Slots on this node. Patroni and similar managers keep idle slots on standbys on purpose, so alert on inactive slots on the primary. |
+| Max Slot Retained WAL | MB | Largest WAL volume held back by a slot |
 | Subscriptions, Active Subscriptions | subscriptions | Logical subscriptions and those with a running worker |
 | Last Subscription Message Age | s | Time since the last message from a publisher |
 | Subscription Apply Errors, Subscription Sync Errors | errors | Logical replication errors (15+) |

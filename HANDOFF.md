@@ -80,12 +80,12 @@ Read this instead of the old chat. The v6 handoff, research, docs and console ev
       2. Declaring the full catalogue in `tabs`/`units` does not add keys (commit `1848d41`; registration at 17:33 still gave 119).
       3. Sending missing metrics as `null` does not add keys either. A fresh `postgres_nulltest` plugin registered 103 metrics, and the 38 nulls were all left out. Reverted.
     - **Conclusion:** a key enters the template only with a real value in the registration run.
-    - **Decision needed (user/TL, not Claude):**
-      - (a) accept an incomplete template, or
-      - (b) send 0 where 0 is true (for example archive counts when archiving is off), or
-      - (c) send placeholder 0 for everything at registration, which breaks the never-fabricate rule.
-    - **Option (a) note:** register monitors so the richest node registers first; a standby with archiving and user tables covers the most.
-    - **Console cleanup:** the `postgres_nulltest-Joana-PC.` monitor can be deleted.
+    - **Fixed (user chose option b), with no fake values:**
+      - **True zeros:** `truthful_zeros()` sends 0 where 0 is the truth: archive counts when archiving is off, replay lag and the receiver on a primary, WAL generated on a standby. Empty sums are coalesced to 0, Standbys Streaming and Max Standby Lag are 0 with no standbys, and Failovers 24h is always sent.
+      - **Slot and subscription metrics on every node:** previously primary-only. The README notes that Patroni keeps idle slots on standbys.
+      - **First-poll rates are real measurements:** `sampled_rates()` reads the counters twice, `RATE_SAMPLE_S` = 5 s apart. Measured against a true rate under pgbench, 5 s is within about 10%; 2 s was 75% off because busy sessions publish stats about once a second.
+    - **Verified:** a fresh registration from the streaming *standby* (`postgres_tpltest`) gave a 132-metric template with only 9 missing. Six have no honest value (Cache Hit Ratio and Index Hit Percent with no tables; Last Archive / Failover / Subscription Message Age; Oldest Table Vacuum Age), two need `pg_monitor` (WAL Directory Size, WAL Files), and one doesn't exist on a standby (WAL Written). Before the fix: 29 missing.
+    - **Rule:** the existing `postgres` monitors keep their old 119-metric template until they register fresh. Delete them in the console (and `postgres_nulltest-Joana-PC.`, `postgres_tpltest-Joana-PC.`) and the agent re-registers them with the new version.
   - **Bug B (minor), repmgr seeded at a standby has no Max Standby Replay Lag or Backlog.** `RepmgrAdapter` only gets links when the seed is the primary. Connect to the registry's primary for `replication_view` like `PatroniAdapter` does.
   - **Expected gaps, not bugs:** Buffers Backend on PG17, primary-only metrics on standby-seeded monitors, no standby lag on standalone.
 
