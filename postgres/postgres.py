@@ -403,7 +403,33 @@ QUERIES = [
             " FROM pg_replication_slots",
             [M("Replication Slots", "slots", "Replication"),
              M("Inactive Replication Slots", "slots", "Replication"),
-             M("Max Slot Retained WAL", "MB", "Replication", float)])]),
+             M("Max Slot Retained WAL", "MB", "Replication", float)])],
+        # On standbys HA managers keep idle slots for failover on purpose (Patroni does);
+        # counting them would raise false alerts. The table still lists them.
+        role=PRIMARY),
+
+    Query("subscriptions", [
+        Variant((15, 0),
+            "SELECT count(*), count(s.pid),"
+            " floor(extract(epoch FROM now() - max(s.last_msg_receipt_time)))::bigint,"
+            " (SELECT coalesce(sum(apply_error_count), 0) FROM pg_stat_subscription_stats),"
+            " (SELECT coalesce(sum(sync_error_count), 0) FROM pg_stat_subscription_stats)"
+            " FROM pg_subscription sub LEFT JOIN pg_stat_subscription s"
+            " ON s.subid = sub.oid AND s.relid IS NULL",
+            [M("Subscriptions", "subscriptions", "Replication"),
+             M("Active Subscriptions", "subscriptions", "Replication"),
+             M("Last Subscription Message Age", "s", "Replication"),
+             M("Subscription Apply Errors", "errors", "Replication"),
+             M("Subscription Sync Errors", "errors", "Replication")]),
+        Variant((10, 0),
+            "SELECT count(*), count(s.pid),"
+            " floor(extract(epoch FROM now() - max(s.last_msg_receipt_time)))::bigint"
+            " FROM pg_subscription sub LEFT JOIN pg_stat_subscription s"
+            " ON s.subid = sub.oid AND s.relid IS NULL",
+            [M("Subscriptions", "subscriptions", "Replication"),
+             M("Active Subscriptions", "subscriptions", "Replication"),
+             M("Last Subscription Message Age", "s", "Replication")])],
+        role=PRIMARY),
 ]
 
 RATES = [
@@ -468,7 +494,9 @@ CLUSTER_TABLES = {
 
 # Health Code values: what the plugin alone can know about the cluster.
 HEALTH_OK, HEALTH_NODE_DOWN, HEALTH_NO_PRIMARY, HEALTH_SPLIT_BRAIN = 0, 1, 2, 3
-HEALTH_SEVERITY = {HEALTH_OK: 0, HEALTH_NODE_DOWN: 1, HEALTH_NO_PRIMARY: 2, HEALTH_SPLIT_BRAIN: 2}
+HEALTH_MANAGER_DISAGREES = 4
+HEALTH_SEVERITY = {HEALTH_OK: 0, HEALTH_NODE_DOWN: 1, HEALTH_NO_PRIMARY: 2,
+                   HEALTH_SPLIT_BRAIN: 2, HEALTH_MANAGER_DISAGREES: 1}
 
 NODE_FORGET_S = 24 * 3600      # a missing node is reported for a day, then dropped
 PROBE_TIMEOUT_S = 3
@@ -957,9 +985,15 @@ def upstream_of(seed):
         return None
 
 
-def replication_view(primary):
-    """The primary's pg_stat_replication rows: one dict per attached standby."""
+def replication_view(primary, by_app_name=False, logical=False):
+    """The primary's pg_stat_replication rows: one dict per attached standby.
+
+    Logical walsenders (subscribers, not standbys) are excluded unless `logical`.
+    `by_app_name` names rows by application_name, which Patroni sets to the member name."""
     if primary.version >= (10, 0):
+        kind = "" if logical else (
+            " WHERE pid NOT IN (SELECT active_pid FROM pg_replication_slots"
+            " WHERE slot_type = 'logical' AND active_pid IS NOT NULL)")
         sql = ("SELECT application_name, coalesce(host(client_addr), ''), state, sync_state,"
                " round(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) / 1048576.0, 2),"
                " round(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn) / 1048576.0, 2),"
@@ -967,7 +1001,7 @@ def replication_view(primary):
                " round(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) / 1048576.0, 2),"
                " extract(epoch FROM write_lag), extract(epoch FROM flush_lag),"
                " extract(epoch FROM replay_lag), current_setting('port')"
-               " FROM pg_stat_replication ORDER BY application_name")
+               " FROM pg_stat_replication" + kind + " ORDER BY application_name")
     else:
         sql = ("SELECT application_name, coalesce(host(client_addr), ''), state, sync_state,"
                " round(pg_xlog_location_diff(pg_current_xlog_location(), sent_location) / 1048576.0, 2),"
@@ -982,7 +1016,8 @@ def replication_view(primary):
     links, used = [], set()
     for r in rows:
         app, addr = str(r[0] or "").strip(), str(r[1] or "")
-        name = addr or (app if app and app != "walreceiver" else "standby")
+        meaningful_app = app if app and app != "walreceiver" else ""
+        name = (meaningful_app or addr) if by_app_name else (addr or meaningful_app or "standby")
         if name in used:
             name = "%s-%d" % (name, len(used) + 1)
         used.add(name)
@@ -1004,8 +1039,295 @@ def replication_view(primary):
     return links
 
 
+def quiet_query(node, sql, all_rows=False):
+    """A probe query whose failure is expected on most servers and is not a collection error."""
+    before = len(node.failures)
+    result = node.query_all(sql) if all_rows else node.query_one(sql)
+    del node.failures[before:]
+    return result
+
+
+def preloaded(seed, library):
+    """True if the server loads `library`. Reading shared_preload_libraries needs
+    pg_read_all_settings; without it, an installed extension of that name counts."""
+    row = quiet_query(seed, "SELECT current_setting('shared_preload_libraries')")
+    if row and library in str(row[0]):
+        return True
+    ext = quiet_query(seed, "SELECT count(*) FROM pg_extension WHERE extname = '%s'" % library)
+    return bool(ext and ext[0])
+
+
+def metadata_node(seed, ctx, dbname):
+    """A connection to the same server for metadata kept in another database
+    (repmgr keeps it in `repmgr`, pg_auto_failover in `pg_auto_failover`)."""
+    if seed.dbname == dbname:
+        return seed, False
+    node = ctx["connect"](seed.host, seed.port, dbname)
+    return node, node is not None
+
+
+def fetch_json(host, port, path, timeout=PROBE_TIMEOUT_S):
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://%s:%s%s" % (host, port, path), timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def address_matches(row_host, row_port, seed, seed_addr):
+    return (str(row_host) in (seed.host, seed_addr) and int(row_port) == seed.port) or \
+        (seed_addr and str(row_host) == seed_addr)
+
+
+def registry_rows(seed, ctx, members):
+    """Rows for nodes listed by a cluster manager: (name, host, port, claimed_role, state, alive, extra)."""
+    seed_addr_row = quiet_query(seed, "SELECT coalesce(host(inet_server_addr()), '')")
+    seed_addr = seed_addr_row[0] if seed_addr_row else ""
+    rows, seed_seen = [], False
+    for name, host, port, role, state, alive, extra in members:
+        mhost, mport = map_address(host, port, ctx["address_map"])
+        if not seed_seen and (address_matches(host, port, seed, seed_addr)
+                              or (mhost, mport) == (seed.host, seed.port)):
+            row = seed_row(seed, ctx, name=name)
+            row["state"] = state
+            seed_seen = True
+            if role in (ROLE_PRIMARY, ROLE_STANDBY):
+                row["_claimed"] = role
+            else:
+                row["role"] = role
+        else:
+            row = node_row(name, role, state, alive, address="%s:%s" % (mhost, mport))
+            row["_probe"] = (mhost, mport)
+            if role in (ROLE_PRIMARY, ROLE_STANDBY):
+                row["_claimed"] = role
+        row.update({k: v for k, v in extra.items() if v is not None})
+        rows.append(row)
+    return rows
+
+
+class PatroniAdapter(object):
+    """Patroni's REST API lists every member, including stopped ones. Used only when
+    `patroni_port` is configured."""
+    name = "patroni"
+    single_writer = True
+
+    def detect(self, seed, ctx):
+        port = ctx["args"].get("patroni_port")
+        if not port:
+            return False
+        host, rport = map_address(seed.host, port, ctx["address_map"])
+        ctx["patroni"] = fetch_json(host, rport, "/cluster")
+        return bool(ctx["patroni"] and ctx["patroni"].get("members"))
+
+    def nodes(self, seed, ctx):
+        members, leader = [], ""
+        for m in ctx["patroni"]["members"]:
+            role = ROLE_PRIMARY if m.get("role") in ("leader", "master") else ROLE_STANDBY
+            state = str(m.get("state") or "unknown")
+            if role == ROLE_PRIMARY:
+                leader = m.get("name", "")
+            lag = m.get("lag")
+            members.append((m.get("name") or m.get("host"), m.get("host"), int(m.get("port") or 5432),
+                            role, state, state in ("running", "streaming", "in archive recovery"),
+                            {"timeline": to_number(m.get("timeline"), int),
+                             "backlog_mb": round(lag / 1048576.0, 2) if isinstance(lag, (int, float)) else None}))
+        rows = registry_rows(seed, ctx, members)
+        links = None
+        lrow = next((r for r in rows if r["name"] == leader), None)
+        if lrow is not None:
+            lnode = seed if "_probe" not in lrow else ctx["connect"](*lrow["_probe"])
+            if lnode is not None:
+                try:
+                    links = replication_view(lnode, by_app_name=True)
+                finally:
+                    if lnode is not seed:
+                        lnode.close()
+        for r in rows:
+            link = next((l for l in links or [] if l["name"] == r["name"]), None)
+            if link and r["role"] == ROLE_STANDBY:
+                r["replay_lag_s"] = link["replay_lag_s"]
+                r["backlog_mb"] = link["replay_lag_mb"]
+        return ClusterView(nodes=rows, links=links, primary_name=leader)
+
+
+class RepmgrAdapter(object):
+    """repmgr's node registry (repmgr.nodes), read from the `repmgr` database."""
+    name = "repmgr"
+    single_writer = True
+
+    def detect(self, seed, ctx):
+        return preloaded(seed, "repmgr")
+
+    def nodes(self, seed, ctx):
+        meta, opened = metadata_node(seed, ctx, "repmgr")
+        if meta is None:
+            return StreamingAdapter().nodes(seed, ctx)
+        try:
+            reg = quiet_query(meta, "SELECT node_name, conninfo, type, active FROM repmgr.nodes"
+                                    " ORDER BY node_id", all_rows=True)
+        finally:
+            if opened:
+                meta.close()
+        if not reg:
+            return StreamingAdapter().nodes(seed, ctx)
+        members = []
+        for name, conninfo, ntype, active in reg:
+            host = re.search(r"host=(\S+)", str(conninfo or ""))
+            port = re.search(r"port=(\d+)", str(conninfo or ""))
+            role = {"primary": ROLE_PRIMARY, "standby": ROLE_STANDBY}.get(ntype, ntype)
+            members.append((name, host.group(1) if host else name, int(port.group(1)) if port else seed.port,
+                            role, "active" if active else "inactive", bool(active), {}))
+        rows = registry_rows(seed, ctx, members)
+        primary = next((r["name"] for r in rows if r.get("_claimed", r["role"]) == ROLE_PRIMARY), "")
+        links = replication_view(seed) if not seed.is_recovery else None
+        return ClusterView(nodes=rows, links=links, primary_name=primary)
+
+
+class AutoFailoverMonitorAdapter(object):
+    """pg_auto_failover, when the configured address is its monitor node. (Pointed at a
+    data node, the streaming adapter finds the pair instead.)"""
+    name = "pg_auto_failover"
+    single_writer = True
+
+    def detect(self, seed, ctx):
+        return preloaded(seed, "pgautofailover")
+
+    def nodes(self, seed, ctx):
+        meta, opened = metadata_node(seed, ctx, "pg_auto_failover")
+        reg = None
+        if meta is not None:
+            try:
+                # goalstate is what the monitor has decided; reportedstate can be stale
+                # for a crashed node. health is the monitor's own check (1 = healthy).
+                reg = quiet_query(meta, "SELECT nodename, nodehost, nodeport, goalstate, health"
+                                        " FROM pgautofailover.node ORDER BY nodeid", all_rows=True)
+            finally:
+                if opened:
+                    meta.close()
+        monitor = seed_row(seed, ctx)
+        monitor["role"] = "monitor"
+        members = []
+        for name, host, port, goal, health in reg or []:
+            role = ROLE_PRIMARY if goal in ("primary", "single", "wait_primary") else ROLE_STANDBY
+            members.append((name, host, int(port), role, str(goal), health == 1, {}))
+        rows = [monitor] + [r for r in registry_rows(seed, ctx, members) if r["name"] != monitor["name"]]
+        primary = next((r["name"] for r in rows if r.get("_claimed") == ROLE_PRIMARY), "")
+        return ClusterView(nodes=rows, primary_name=primary)
+
+
+class CitusAdapter(object):
+    """Citus: a coordinator plus workers, each its own primary (pg_dist_node)."""
+    name = "citus"
+    single_writer = False
+
+    def detect(self, seed, ctx):
+        row = seed.query_one("SELECT count(*) FROM pg_extension WHERE extname = 'citus'")
+        return bool(row and row[0])
+
+    def nodes(self, seed, ctx):
+        reg = quiet_query(seed, "SELECT nodename, nodeport, groupid, noderole, isactive"
+                                " FROM pg_dist_node ORDER BY groupid, nodename", all_rows=True) or []
+        members = [(n, n, int(p), "coordinator" if g == 0 else
+                    ("worker" if r == "primary" else "worker standby"),
+                    "active" if a else "inactive", bool(a), {}) for n, p, g, r, a in reg]
+        rows = registry_rows(seed, ctx, members)
+        if not any("_probe" not in r for r in rows):      # the coordinator is not registered
+            coord = seed_row(seed, ctx)
+            coord["role"] = "coordinator"
+            rows.insert(0, coord)
+        return ClusterView(nodes=rows, primary_name=rows[0]["name"])
+
+
+class PgpoolAdapter(object):
+    """pgpool-II: the configured address is the pool; SHOW POOL_NODES lists the backends.
+    The probe fails on plain PostgreSQL, so it is retried at most once a day."""
+    name = "pgpool"
+    single_writer = True
+
+    def detect(self, seed, ctx):
+        memo = ctx["prev_cluster"].get("pgpool_checked", 0)
+        if not ctx["prev_cluster"].get("pgpool") and ctx["now"] - memo < 86400:
+            return False
+        ctx["state_extra"]["pgpool_checked"] = ctx["now"]
+        if seed.conn is None:
+            return False
+        try:
+            cur = seed.conn.cursor()
+            cur.execute("SHOW POOL_NODES")
+            cols = [d[0] for d in cur.description]
+            ctx["pool_nodes"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            cur.close()
+        except Exception:
+            ctx["pool_nodes"] = None
+        ctx["state_extra"]["pgpool"] = bool(ctx["pool_nodes"])
+        return bool(ctx["pool_nodes"])
+
+    def nodes(self, seed, ctx):
+        members = []
+        for n in ctx["pool_nodes"]:
+            role = ROLE_PRIMARY if str(n.get("role", "")).lower() in ("primary", "master") else ROLE_STANDBY
+            state = str(n.get("status", "unknown"))
+            members.append(("%s:%s" % (n.get("hostname"), n.get("port")), n.get("hostname"),
+                            int(n.get("port") or 5432), role, state, state in ("up", "waiting"), {}))
+        rows = []
+        for name, host, port, role, state, alive, _ in members:
+            mhost, mport = map_address(host, port, ctx["address_map"])
+            row = node_row(name, role, state, alive, address="%s:%s" % (mhost, mport))
+            row["_probe"], row["_claimed"] = (mhost, mport), role
+            rows.append(row)
+        primary = next((r["name"] for r in rows if r["_claimed"] == ROLE_PRIMARY), "")
+        return ClusterView(nodes=rows, primary_name=primary)
+
+
+class LogicalAdapter(object):
+    """Logical replication between writable nodes: native publications/subscriptions,
+    and the extensions built on logical decoding (pglogical, Spock, BDR/PGD). Every
+    node is a writer; peers are found from the logical walsenders and subscriptions."""
+    name = "logical"
+    single_writer = False
+    EXTENSIONS = ("bdr", "spock", "pglogical")
+
+    def detect(self, seed, ctx):
+        if seed.is_recovery or seed.version < (10, 0):
+            return False
+        row = seed.query_one(
+            "SELECT (SELECT count(*) FROM pg_subscription),"
+            " (SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'logical' AND active),"
+            " (SELECT string_agg(extname, ',') FROM pg_extension WHERE extname IN ('bdr', 'spock', 'pglogical'))")
+        if not row:
+            return False
+        ctx["logical_ext"] = (row[2] or "").split(",")[0]
+        # both directions present, or an extension that is multi-writer by design
+        return bool((row[0] and row[1]) or ctx["logical_ext"])
+
+    def nodes(self, seed, ctx):
+        peers = quiet_query(seed,
+            "SELECT DISTINCT host(r.client_addr) FROM pg_stat_replication r"
+            " JOIN pg_replication_slots s ON s.active_pid = r.pid"
+            " WHERE s.slot_type = 'logical' AND r.client_addr IS NOT NULL", all_rows=True) or []
+        port_row = seed.query_one("SELECT current_setting('port')")
+        port = int(port_row[0]) if port_row else seed.port
+        me = seed_row(seed, ctx)
+        me["role"] = "writer"
+        rows = [me]
+        for (addr,) in peers:
+            if addr == me["name"]:
+                continue
+            host, mport = map_address(addr, port, ctx["address_map"])
+            row = node_row(addr, "writer", "replicating", True, address="%s:%s" % (host, mport))
+            row["_probe"] = (host, mport)
+            rows.append(row)
+        return ClusterView(nodes=rows, links=replication_view(seed, logical=True))
+
+    @property
+    def label(self):
+        return self.name
+
+
 class StandaloneAdapter(object):
     name = "standalone"
+    single_writer = True
 
     def detect(self, seed, ctx):
         return True
@@ -1019,12 +1341,13 @@ class StreamingAdapter(object):
     keepalived, managed services). Nodes come from the primary's pg_stat_replication;
     a standby seed is followed to its primary first."""
     name = "streaming"
+    single_writer = True
 
     def detect(self, seed, ctx):
         if seed.is_recovery:
             return upstream_of(seed) is not None or bool(ctx["remembered"])
-        row = seed.query_one("SELECT count(*) FROM pg_stat_replication")
-        return bool(row and row[0]) or bool(ctx["remembered"])
+        links = replication_view(seed)
+        return bool(links) or bool(ctx["remembered"])
 
     def nodes(self, seed, ctx):
         if not seed.is_recovery:
@@ -1083,7 +1406,8 @@ class StreamingAdapter(object):
 
 
 # Most specific first; Standalone always matches.
-ADAPTERS = [StreamingAdapter(), StandaloneAdapter()]
+ADAPTERS = [PatroniAdapter(), RepmgrAdapter(), AutoFailoverMonitorAdapter(), CitusAdapter(),
+            PgpoolAdapter(), LogicalAdapter(), StreamingAdapter(), StandaloneAdapter()]
 
 
 class ClusterView(object):
@@ -1132,7 +1456,8 @@ def probe_nodes(rows, ctx, deadline):
             if row["state"] in ("down", "unreachable"):
                 row["state"] = "up"
             if res:
-                row["role"] = ROLE_STANDBY if res[0] else ROLE_PRIMARY
+                if row["role"] in (ROLE_PRIMARY, ROLE_STANDBY):   # PostgreSQL decides, not the registry
+                    row["role"] = ROLE_STANDBY if res[0] else ROLE_PRIMARY
                 for key, val in zip(("conn_pct", "uptime_s", "longest_query_s", "last_msg_age_s"), res[1:]):
                     num = to_number(val, float if key == "conn_pct" else int)
                     if num is not None:
@@ -1192,14 +1517,20 @@ def detect_events(rows, prev_nodes, forgotten, now):
             for e in events]
 
 
-def evaluate_health(rows, cluster_type):
+def evaluate_health(rows, cluster_type, single_writer=True):
     up = [r for r in rows if r["status"]]
     primaries = [r for r in up if r["role"] == ROLE_PRIMARY]
-    if cluster_type != "standalone" and len(primaries) > 1:
+    clustered = cluster_type != "standalone" and single_writer
+    if clustered and len(primaries) > 1:
         return HEALTH_SPLIT_BRAIN, "split brain: %s are all writable" % ", ".join(
             r["name"] for r in primaries)
-    if cluster_type != "standalone" and not primaries:
+    if clustered and not primaries:
         return HEALTH_NO_PRIMARY, "no reachable primary"
+    disagree = [r["name"] for r in rows if r.get("_claimed") and r.get("reachable")
+                and r["_claimed"] != r["role"]]
+    if disagree:
+        return HEALTH_MANAGER_DISAGREES, "cluster manager role differs from PostgreSQL on: %s" % (
+            ", ".join(disagree))
     down_nodes = [r["name"] for r in rows if not r["status"] or r["state"] == "not streaming"]
     if down_nodes:
         return HEALTH_NODE_DOWN, "%d node(s) down or not streaming: %s" % (
@@ -1207,9 +1538,9 @@ def evaluate_health(rows, cluster_type):
     return HEALTH_OK, "%d of %d nodes up" % (len(up), len(rows))
 
 
-def cluster_metrics(view, cluster_type, history, now):
+def cluster_metrics(view, cluster_type, history, now, single_writer=True):
     rows = view.nodes
-    code, reason = evaluate_health(rows, cluster_type)
+    code, reason = evaluate_health(rows, cluster_type, single_writer)
     standbys = [r for r in rows if r["role"] == ROLE_STANDBY]
     out = {
         "Cluster Type": cluster_type,
@@ -1267,7 +1598,8 @@ def public_rows(rows):
 def discover_cluster(seed, ctx):
     """Runs the first adapter that recognises the seed."""
     adapter = next(a for a in ADAPTERS if a.detect(seed, ctx))
-    return adapter.name, adapter.nodes(seed, ctx)
+    label = ctx.get("logical_ext") or adapter.name if adapter.name == "logical" else adapter.name
+    return adapter, label, adapter.nodes(seed, ctx)
 
 
 # =============================================================================
@@ -1398,6 +1730,10 @@ def resolve_args(param):
         plugin_version = int(p.get("plugin_version") or PLUGIN_VERSION)
     except ValueError:
         plugin_version = PLUGIN_VERSION
+    try:
+        patroni_port = int(p.get("patroni_port") or 0)
+    except ValueError:
+        patroni_port = 0
     password = p.get("password") or ""
     return {
         "host": p.get("host") or "localhost",
@@ -1413,6 +1749,7 @@ def resolve_args(param):
         "plugin_version": plugin_version,
         "heartbeat": parse_bool(p.get("heartbeat"), HEARTBEAT),
         "address_map": parse_address_map(p.get("address_map")),
+        "patroni_port": patroni_port if 0 < patroni_port < 65536 else 0,
         "logs_enabled": parse_bool(p.get("logs_enabled"), False),
         "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
         "log_file_path": p.get("log_file_path") or "",
@@ -1421,10 +1758,10 @@ def resolve_args(param):
 
 def make_connector(args, deadline):
     """Opens a short-timeout connection to another cluster node, or returns None."""
-    def connect(host, port):
+    def connect(host, port, dbname=None):
         if time.time() > deadline:
             return None
-        n = Node(host, port, args["username"], args["password"], args["db"], args["sslmode"],
+        n = Node(host, port, args["username"], args["password"], dbname or args["db"], args["sslmode"],
                  args["sslrootcert"], args["sslcert"], args["sslkey"],
                  min(PROBE_TIMEOUT_S, args["timeout"]))
         return n if n.connect() else None
@@ -1448,10 +1785,14 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     if sysid and prev_cluster.get("sysid") and prev_cluster["sysid"] != sysid:
         prev_cluster = {}               # the address now reaches a different cluster
     prev_nodes = prev_cluster.get("nodes") or {}
-    ctx = {"metrics": metrics, "address_map": args["address_map"],
-           "connect": make_connector(args, deadline),
+    ctx = {"metrics": metrics, "address_map": args["address_map"], "args": args,
+           "connect": make_connector(args, deadline), "now": now,
+           "prev_cluster": prev_cluster, "state_extra": {},
            "remembered": [n for n in prev_nodes if prev_nodes[n].get("role")]}
-    cluster_type, view = discover_cluster(seed, ctx)
+    for key in ("pgpool", "pgpool_checked"):
+        if key in prev_cluster:
+            ctx["state_extra"][key] = prev_cluster[key]
+    adapter, cluster_type, view = discover_cluster(seed, ctx)
     forgotten = merge_remembered(view.nodes, prev_nodes, now)
     probe_nodes(view.nodes, ctx, deadline)
     events = detect_events(view.nodes, prev_nodes, forgotten, now)
@@ -1464,11 +1805,12 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
         nodes_state[r["name"]] = {
             "role": r["role"], "status": r["status"], "address": r.get("address", ""),
             "last_seen": now if r["status"] else old.get("last_seen", now)}
-    out = cluster_metrics(view, cluster_type, history, now)
+    out = cluster_metrics(view, cluster_type, history, now, adapter.single_writer)
     tables = {"Nodes": public_rows(view.nodes), "Events": event_rows(history, now)}
     if view.links is not None:
         tables["Replication_Links"] = link_rows(view.links)
     state = {"sysid": sysid, "nodes": nodes_state, "events": history}
+    state.update(ctx["state_extra"])
     return out, tables, events, state
 
 
@@ -1550,6 +1892,7 @@ def parse_cli(argv=None):
     parser.add_argument("--plugin_version", default=str(PLUGIN_VERSION))
     parser.add_argument("--heartbeat", default="true")
     parser.add_argument("--address_map", default="")
+    parser.add_argument("--patroni_port", default="")
     parser.add_argument("--logs_enabled", default="false")
     parser.add_argument("--log_type_name", default="")
     parser.add_argument("--log_file_path", default="")

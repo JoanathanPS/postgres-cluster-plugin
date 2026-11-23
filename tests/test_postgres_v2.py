@@ -288,6 +288,89 @@ class ClusterLogicTests(unittest.TestCase):
         self.assertEqual(out["Primary Node"], "b")
 
 
+class SeedStub(object):
+    """Minimal seed node for adapter tests."""
+
+    def __init__(self, host="10.0.0.1", port=5432, recovery=False, answers=None):
+        self.host, self.port, self.dbname = host, port, "postgres"
+        self.is_recovery, self.version, self.failures = recovery, (16, 0), []
+        self.answers = answers or {}
+        self.conn = None
+
+    @property
+    def role(self):
+        return "standby" if self.is_recovery else "primary"
+
+    def query_all(self, sql):
+        for key, val in self.answers.items():
+            if key in sql:
+                return val
+        return []
+
+    def query_one(self, sql):
+        rows = self.query_all(sql)
+        return rows[0] if rows else ()
+
+
+def ctx_for(seed, **extra):
+    ctx = {"metrics": {}, "address_map": {}, "args": {"patroni_port": 8008},
+           "connect": lambda *a, **k: None, "now": 1000.0, "prev_cluster": {},
+           "state_extra": {}, "remembered": []}
+    ctx.update(extra)
+    return ctx
+
+
+class AdapterTests(unittest.TestCase):
+
+    def test_patroni_members_become_rows_and_seed_is_matched(self):
+        seed = SeedStub(host="pg-node1", recovery=True,
+                        answers={"inet_server_addr": [("172.30.0.11",)]})
+        cluster = {"members": [
+            {"name": "pg-node1", "role": "replica", "state": "streaming", "host": "pg-node1",
+             "port": 5432, "timeline": 7, "lag": 1048576},
+            {"name": "pg-node2", "role": "leader", "state": "running", "host": "pg-node2",
+             "port": 5432, "timeline": 7},
+            {"name": "pg-node3", "role": "replica", "state": "stopped", "host": "pg-node3", "port": 5432}]}
+        with mock.patch.object(pg, "fetch_json", return_value=cluster):
+            ctx = ctx_for(seed)
+            adapter = pg.PatroniAdapter()
+            self.assertTrue(adapter.detect(seed, ctx))
+            view = adapter.nodes(seed, ctx)
+        rows = {r["name"]: r for r in view.nodes}
+        self.assertEqual(view.primary_name, "pg-node2")
+        self.assertEqual(rows["pg-node1"]["reachable"], 1)          # the seed itself
+        self.assertEqual(rows["pg-node1"]["backlog_mb"], 1.0)
+        self.assertEqual(rows["pg-node3"]["status"], 0)
+        self.assertEqual(rows["pg-node2"]["_probe"], ("pg-node2", 5432))
+
+    def test_patroni_needs_a_configured_port(self):
+        self.assertFalse(pg.PatroniAdapter().detect(SeedStub(), ctx_for(SeedStub(), args={})))
+
+    def test_manager_disagreement_is_reported(self):
+        r = pg.node_row("n1", "standby", "up", True)
+        r.update({"_claimed": "primary", "reachable": 1})
+        rows = [pg.node_row("n0", "primary", "up", True), r]
+        self.assertEqual(pg.evaluate_health(rows, "patroni")[0], pg.HEALTH_MANAGER_DISAGREES)
+
+    def test_multi_writer_clusters_skip_primary_rules(self):
+        rows = [pg.node_row("a", "writer", "up", True), pg.node_row("b", "writer", "up", True)]
+        self.assertEqual(pg.evaluate_health(rows, "logical", single_writer=False)[0], pg.HEALTH_OK)
+        rows = [pg.node_row("c", "coordinator", "up", True), pg.node_row("w", "worker", "down", False)]
+        self.assertEqual(pg.evaluate_health(rows, "citus", single_writer=False)[0], pg.HEALTH_NODE_DOWN)
+
+    def test_pgpool_probe_is_retried_at_most_daily(self):
+        seed = SeedStub()
+        ctx = ctx_for(seed, prev_cluster={"pgpool": False, "pgpool_checked": 900.0})
+        self.assertFalse(pg.PgpoolAdapter().detect(seed, ctx))
+        self.assertNotIn("pgpool_checked", ctx["state_extra"])
+
+    def test_quiet_query_does_not_count_as_failure(self):
+        seed = SeedStub()
+        seed.query_all = lambda sql: seed.failures.append("boom")
+        pg.quiet_query(seed, "SELECT 1", all_rows=True)
+        self.assertEqual(seed.failures, [])
+
+
 class EventsLogTests(unittest.TestCase):
 
     def test_log_stays_in_plugin_folder(self):
