@@ -1487,7 +1487,10 @@ def probe_nodes(rows, ctx, deadline):
             res = node.query_one(PROBE_SQL)
             row["reachable"] = 1
             row["status"] = 1
-            if row["state"] in ("down", "unreachable"):
+            # A cluster manager's own state is kept as reported (pgpool may say "down"
+            # for a node that is up but detached from the pool); only states the plugin
+            # inferred itself are corrected.
+            if row["state"] in ("down", "unreachable") and "_claimed" not in row:
                 row["state"] = "up"
             if res:
                 if row["role"] in (ROLE_PRIMARY, ROLE_STANDBY):   # PostgreSQL decides, not the registry

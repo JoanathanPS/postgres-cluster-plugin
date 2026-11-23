@@ -49,3 +49,4 @@ postgres_cluster/postgres_cluster_state.json
 postgres/.state/
 postgres/*.log*
 postgres/.summ.py
+postgres/.e2e.py
