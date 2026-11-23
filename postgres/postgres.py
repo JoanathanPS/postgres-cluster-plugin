@@ -1214,7 +1214,18 @@ class RepmgrAdapter(object):
                             role, "active" if active else "inactive", bool(active), {}))
         rows = registry_rows(seed, ctx, members)
         primary = next((r["name"] for r in rows if r.get("_claimed", r["role"]) == ROLE_PRIMARY), "")
-        links = replication_view(seed) if not seed.is_recovery else None
+        links = None
+        prow = next((r for r in rows if r["name"] == primary), None)
+        if prow is not None:
+            # a standby seed reads the links from the registry's primary
+            pnode = seed if "_probe" not in prow else ctx["connect"](*prow["_probe"])
+            if pnode is not None:
+                try:
+                    if not pnode.is_recovery:
+                        links = replication_view(pnode)
+                finally:
+                    if pnode is not seed:
+                        pnode.close()
         return ClusterView(nodes=rows, links=links, primary_name=primary)
 
 
@@ -1688,12 +1699,9 @@ def base_payload(args):
 
 
 def finalize(payload):
-    """Drops tab and unit entries for anything not emitted this poll."""
-    emitted = {k for k in payload if k not in RESERVED_KEYS}
-    for tab in payload.get("tabs", {}).values():
-        tab["tablist"] = [m for m in tab["tablist"] if m in emitted]
-    payload["tabs"] = {k: v for k, v in payload.get("tabs", {}).items() if v["tablist"]}
-    payload["units"] = {k: v for k, v in payload.get("units", {}).items() if k in emitted}
+    """Keeps the full catalogue in `tabs` and `units` on every poll, so the shared
+    template is the same whichever monitor registers first. Metrics with no value this
+    poll are declared but not sent."""
     if "msg" in payload:
         payload["msg"] = str(payload["msg"])[:MAX_MSG_CHARS]
     return payload
@@ -1735,9 +1743,7 @@ def validate_output(payload):
     units = payload.get("units", {})
     for tab, content in payload.get("tabs", {}).items():
         for item in content.get("tablist", []):
-            if item not in payload:
-                problems.append("tab %s lists %s, which is not emitted" % (tab, item))
-            elif not isinstance(payload[item], (str, list)) and item not in units:
+            if item in payload and not isinstance(payload[item], (str, list)) and item not in units:
                 problems.append("%s has no unit" % item)
     return problems
 

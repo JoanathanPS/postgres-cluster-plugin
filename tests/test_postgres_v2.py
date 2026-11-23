@@ -110,13 +110,15 @@ class RateTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
 
-    def test_finalize_removes_unemitted_tab_entries(self):
+    def test_finalize_keeps_full_catalogue_in_tabs_and_units(self):
+        full_tabs, full_units = pg.build_tabs_and_units()
         p = pg.base_payload(pg.resolve_args({}))
         p["Uptime"] = 10
         p["Locks Count"] = 3
         out = pg.finalize(p)
-        self.assertEqual(out["tabs"]["Activity"]["tablist"], ["Locks Count"])
-        self.assertNotIn("BG Writer", out["tabs"])
+        self.assertEqual(out["tabs"], full_tabs)
+        self.assertEqual(out["units"], full_units)
+        self.assertNotIn("Replay Lag", out)
         self.assertEqual(pg.validate_output(out), [])
 
     def test_validator_flags_limit_breaches(self):
