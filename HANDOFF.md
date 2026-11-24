@@ -127,3 +127,20 @@ Run through the Windows agent with the `[postgres]` (primary) and `[streaming]` 
   - `patroni_scheme` / `patroni_verify` for HTTPS;
   - Stats_per_DB unreadable sizes now blank instead of 0.
 - **Rerun on today's code:** the PostgreSQL 9.6–18 matrix and Python 3.6, both passing.
+
+## 8. Real Linux agent test (2026-11-24)
+
+- **Agent:** Site24x7 Full-Stack Linux agent 22.3.01, installed with the org device key in a Debian 13 container (`pg-linux-agent`, server `pg-linux-agent` in the console). The container is attached to every test bed network, so no `address_map` is needed.
+- **Plugin:** installed with `postgres/installer/Site24x7PostgresPluginInstaller.sh --from-dir`, then one cfg section per cluster type: postgres (standalone), streaming, patroni, repmgr, logical, pgpool, citus, autofailover.
+- **Result:** all 8 registered (as `postgres.py-<section>-pg-linux-agent`) with status 1 and a **complete template (0 metrics missing)**.
+- **How the Linux agent runs Python plugins:** with `use_agent_python=1` it imports `postgres.py` as a module and calls `run(param)` (params arrive quoted; `clean_quotes` handles that). Its bundled Python 3.11 already includes `psycopg2` (`/opt/site24x7/monagent/lib/lib/psycopg2`), so Linux customers install nothing.
+- **Fixed from this test:**
+  - The installer didn't recognise current agents ("full-stack agent service" wording).
+  - The installer now skips installing `psycopg2` when the agent bundles it.
+  - pgpool and pg_auto_failover monitors now ask the primary for its replication links (`fill_links_from_primary`), so standby counts and lag are real.
+- **Upgrade path on the real agent:** the installer replaced only the code. The cfg was byte-for-byte unchanged (9 sections, encrypted passwords) and polling resumed with status 1.
+- **Caught:** a Windows edit had given the installer CRLF line endings, which bash rejects. Git stores `.sh` as LF (`.gitattributes`), so the published file was never affected; the working copy is fixed.
+- **To discuss with the user before changing (main / README):**
+  - The README could say Linux needs no `psycopg2` install (the agent bundles it) and Windows needs `use_agent_python=0` plus `psycopg2-binary`.
+  - Merging `v7` into `main`.
+- **Test bed state:** Patroni and repmgr are stopped (memory), so those two Linux monitors show down. Everything else is running.

@@ -1661,6 +1661,27 @@ def merge_remembered(rows, prev_nodes, now):
     return forgotten
 
 
+def fill_links_from_primary(view, seed, ctx):
+    """Adapters that read a registry (pgpool, pg_auto_failover) know the nodes but not
+    the replication links. Ask the primary itself, so standby counts and lag are real."""
+    primary = next((r for r in view.nodes if r["role"] == ROLE_PRIMARY and r["status"]), None)
+    if primary is None:
+        return
+    if "_probe" not in primary:
+        node = seed if not seed.is_recovery else None
+    else:
+        node = ctx["connect"](*primary["_probe"])
+    if node is None:
+        return
+    try:
+        if not node.is_recovery:
+            view.links = replication_view(node)
+            apply_link_lag(view.nodes, view.links)
+    finally:
+        if node is not seed:
+            node.close()
+
+
 def dedupe_nodes(rows):
     """Removes a remembered row that turned out to be a server already listed under
     another name (same postmaster start time). Without this, one primary known by a
@@ -1741,6 +1762,9 @@ def cluster_metrics(view, cluster_type, history, now, single_writer=True, since=
         out["Sync Standbys"] = len([l for l in links if l["sync_state"] in ("sync", "quorum")])
     lags = [r["replay_lag_s"] for r in standbys if r.get("replay_lag_s") is not None]
     backlogs = [r["backlog_mb"] for r in standbys if r.get("backlog_mb") is not None]
+    if not lags and view.links:     # node names didn't match link names: use the links
+        lags = [l["replay_lag_s"] for l in view.links if l.get("replay_lag_s") is not None]
+        backlogs = [l["replay_lag_mb"] for l in view.links if l.get("replay_lag_mb") is not None]
     if lags or not standbys:       # no standby means no standby is behind
         out["Max Standby Replay Lag"] = max(lags) if lags else 0.0
     if backlogs or not standbys:
@@ -1991,6 +2015,8 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     forgotten = merge_remembered(view.nodes, prev_nodes, now)
     probe_nodes(view.nodes, ctx, deadline)
     dedupe_nodes(view.nodes)
+    if view.links is None and adapter.single_writer:
+        fill_links_from_primary(view, seed, ctx)
     events = detect_events(view.nodes, prev_nodes, forgotten, now)
     history = [e for e in (prev_cluster.get("events") or []) if now - e.get("ts", 0) <= 7 * 86400]
     history = (history + events)[-MAX_EVENTS:]

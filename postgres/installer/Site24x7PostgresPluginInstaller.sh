@@ -113,6 +113,12 @@ download() {
 }
 
 install_driver() {
+    # The Full-Stack Linux agent runs plugins in its own Python (use_agent_python=1),
+    # which already bundles psycopg2: nothing to install.
+    if ls -d "$agent_dir"/lib/lib/psycopg2 >/dev/null 2>&1; then
+        echo "The agent's own Python already includes psycopg2."
+        return
+    fi
     if "$python" -c "import psycopg2" >/dev/null 2>&1; then
         echo "The psycopg2 module is already installed."
         return

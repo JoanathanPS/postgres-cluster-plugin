@@ -438,6 +438,18 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("_probe", rows["repmgr-node2"])            # matched as the seed
         self.assertEqual(rows["repmgr-node1"]["_probe"], ("127.0.0.1", 5461))
 
+    def test_registry_clusters_get_links_from_the_primary(self):
+        """pgpool / pg_auto_failover list nodes but not links: ask the primary."""
+        link = ("walreceiver", "10.0.0.2", "streaming", "async", 0, 0, 0, 0.5, None, None, 1.5, "5432")
+        seed = SeedStub(answers={"pg_stat_replication": [link]})
+        rows = [pg.node_row("pgp-pg1:5432", "primary", "up", True),
+                pg.node_row("pgp-pg2:5432", "standby", "up", True)]
+        view = pg.ClusterView(rows, links=None, primary_name="pgp-pg1:5432")
+        pg.fill_links_from_primary(view, seed, ctx_for(seed))
+        self.assertEqual(len(view.links), 1)
+        out = pg.cluster_metrics(view, "pgpool", [], 100.0)
+        self.assertEqual((out["Standbys Streaming"], out["Max Standby Replay Lag"]), (1, 1.5))
+
     def test_patroni_needs_a_configured_port(self):
         self.assertFalse(pg.PatroniAdapter().detect(SeedStub(), ctx_for(SeedStub(), args={})))
 
