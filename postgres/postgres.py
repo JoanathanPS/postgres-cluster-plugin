@@ -514,7 +514,7 @@ TABLES = [
     Table("Stats_per_DB", "DB and IO stats", [((9, 6),
         "SELECT d.datname AS name, s.numbackends AS active_connections,"
         " round(CASE WHEN has_database_privilege(d.oid, 'CONNECT')"
-        " THEN pg_database_size(d.oid) ELSE 0 END / 1048576.0, 2) AS size_in_mb,"
+        " THEN pg_database_size(d.oid) END / 1048576.0, 2) AS size_in_mb,"  # not readable: left blank, not 0
         " s.tup_inserted AS rows_inserted, s.tup_updated AS rows_updated,"
         " s.tup_deleted AS rows_deleted, s.tup_fetched AS rows_fetched,"
         " s.tup_returned AS rows_returned, s.blks_read AS block_reads, s.blks_hit AS block_hits,"
@@ -523,7 +523,7 @@ TABLES = [
         " s.deadlocks AS deadlocks, s.temp_files AS temp_files"
         " FROM pg_database d JOIN pg_stat_database s ON d.oid = s.datid"
         " WHERE d.datname NOT IN ('template0', 'template1')"
-        " ORDER BY size_in_mb DESC, d.datname")],
+        " ORDER BY size_in_mb DESC NULLS LAST, d.datname")],
         {"active_connections": "connections", "size_in_mb": "MB", "rows_inserted": "rows",
          "rows_updated": "rows", "rows_deleted": "rows", "rows_fetched": "rows",
          "rows_returned": "rows", "block_reads": "blocks", "block_hits": "blocks",
@@ -745,7 +745,15 @@ class Node(object):
             if getattr(self, key):
                 kwargs[key] = getattr(self, key)
         try:
-            self.conn = psycopg2.connect(**kwargs)
+            try:
+                self.conn = psycopg2.connect(**kwargs)
+            except Exception as e:
+                # Connection poolers (PgBouncer) refuse the "options" startup parameter.
+                # Every query this plugin runs is a read, so retrying without it is safe.
+                if "options" not in str(e).lower():
+                    raise
+                kwargs.pop("options")
+                self.conn = psycopg2.connect(**kwargs)
             self.conn.autocommit = True
         except Exception as e:
             text = str(e)
@@ -1164,10 +1172,20 @@ def metadata_node(seed, ctx, dbname):
     return node, node is not None
 
 
-def fetch_json(host, port, path, timeout=PROBE_TIMEOUT_S):
+def fetch_json(host, port, path, scheme="http", verify=True, timeout=PROBE_TIMEOUT_S):
+    """GET a JSON document from a cluster manager's REST API (Patroni).
+    HTTPS certificates are verified unless the user explicitly turned that off."""
+    import ssl
     import urllib.request
+    context = None
+    if scheme == "https":
+        context = ssl.create_default_context()
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen("http://%s:%s%s" % (host, port, path), timeout=timeout) as resp:
+        url = "%s://%s:%s%s" % (scheme, host, port, path)
+        with urllib.request.urlopen(url, timeout=timeout, context=context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -1215,7 +1233,8 @@ class PatroniAdapter(object):
         if not port:
             return False
         host, rport = map_address(seed.host, port, ctx["address_map"])
-        ctx["patroni"] = fetch_json(host, rport, "/cluster")
+        ctx["patroni"] = fetch_json(host, rport, "/cluster", ctx["args"].get("patroni_scheme", "http"),
+                                    ctx["args"].get("patroni_verify", True))
         return bool(ctx["patroni"] and ctx["patroni"].get("members"))
 
     def nodes(self, seed, ctx):
@@ -1880,6 +1899,8 @@ def resolve_args(param):
         "heartbeat": parse_bool(p.get("heartbeat"), HEARTBEAT),
         "address_map": parse_address_map(p.get("address_map")),
         "patroni_port": patroni_port if 0 < patroni_port < 65536 else 0,
+        "patroni_scheme": "https" if str(p.get("patroni_scheme") or "").lower() == "https" else "http",
+        "patroni_verify": parse_bool(p.get("patroni_verify"), True),
         "logs_enabled": parse_bool(p.get("logs_enabled"), False),
         "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
         "log_file_path": p.get("log_file_path") or "",
@@ -2057,6 +2078,8 @@ def parse_cli(argv=None):
     parser.add_argument("--heartbeat", default="true")
     parser.add_argument("--address_map", default="")
     parser.add_argument("--patroni_port", default="")
+    parser.add_argument("--patroni_scheme", default="http")
+    parser.add_argument("--patroni_verify", default="true")
     parser.add_argument("--logs_enabled", default="false")
     parser.add_argument("--log_type_name", default="")
     parser.add_argument("--log_file_path", default="")

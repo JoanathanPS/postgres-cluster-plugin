@@ -107,11 +107,17 @@ Each section is one monitor. Add more sections (`[postgres-db2]`) to monitor mor
 | `db` | `postgres` | Database to connect to. Per-table metrics and `Top_Queries` come from this database. |
 | `sslmode` | libpq default | `disable`, `require`, `verify-ca` or `verify-full`. Optional: `sslrootcert`, `sslcert`, `sslkey`. |
 | `timeout` | `10` | Connect timeout in seconds (1–30). Other nodes are always probed with a 3 s timeout. |
+| `plugin_version` | `2` | Plugin template version. Leave as is. |
+| `heartbeat` | `true` | Alert when the agent cannot post this plugin's data. |
 | `patroni_port` | — | Patroni REST API port (usually `8008`). Patroni is used only when this is set. |
+| `patroni_scheme` | `http` | `https` if the Patroni REST API uses TLS. The certificate is verified. |
+| `patroni_verify` | `true` | Set to `false` only for a self-signed Patroni certificate. |
 | `address_map` | — | Only needed when the addresses the cluster reports are not reachable from the agent (NAT, containers). Example: `10.0.0.5:5432=192.168.1.5:6432,pg-node2=192.168.1.6`. |
 | `logs_enabled` | `false` | Write cluster events (failovers, nodes down and recovered) to a log file in the plugin folder and send it to Site24x7 AppLogs. |
 | `log_type_name` | `PostgreSQL Cluster Events` | AppLogs log type. |
 | `log_file_path` | `postgres_events.log` | File name only. The file is always kept in the plugin folder and rotated at 1 MB, keeping three old files. |
+
+**Connection poolers:** the plugin can monitor through PgBouncer (or similar). The pooler is transparent to it, but per-node metrics then describe whichever server the pooler connects to.
 
 ## Health
 
