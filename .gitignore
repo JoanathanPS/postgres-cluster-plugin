@@ -1,32 +1,4 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Virtual environments
-.env
-.venv/
-env/
-venv/
-ENV/
-
-# Operating System & IDE files
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Local runtime & execution artifacts
-*.log
-*.tmp
-out.json
-.pgcluster*/
-
-# Configuration files
-# Ignores local / agent-encrypted configs while keeping the template tracked
-*.cfg
-!postgres_cluster.cfg
-!*.cfg.example
+*.pyc
+postgres/.state/
+postgres/*.log
