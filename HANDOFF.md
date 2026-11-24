@@ -144,3 +144,23 @@ Run through the Windows agent with the `[postgres]` (primary) and `[streaming]` 
   - The README could say Linux needs no `psycopg2` install (the agent bundles it) and Windows needs `use_agent_python=0` plus `psycopg2-binary`.
   - Merging `v7` into `main`.
 - **Test bed state:** Patroni and repmgr are stopped (memory), so those two Linux monitors show down. Everything else is running.
+
+## 9. Value correctness (2026-11-24)
+
+`scripts/value_check.py` creates known conditions on a real server and checks each metric against them, or against the server's own counters:
+- an idle transaction holding a lock;
+- a second session blocked behind it;
+- a forced deadlock;
+- 5 rollbacks;
+- a temp-file spill;
+- dead rows;
+- a new database;
+- an unused replication slot;
+- with `--standby-port`, replay paused on the standby.
+
+**Results:**
+- **Standalone PG16:** 24/24 pass.
+- **Streaming pair:** 29/29 pass, including replay lag/backlog while paused, the primary's view of the same backlog, and the reset after resuming.
+- **Console vs server:** Site24x7 shows the same values as the server for the Linux standalone monitor (read back through the API).
+
+Run it again after any change to the catalogue.
