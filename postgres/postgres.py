@@ -466,6 +466,7 @@ DERIVED = [
     M("Buffer Cache Hit Percent", "%", SUMMARY, float),
     M("Collection Time", "ms", "Plugin"),
     M("Failed Queries", "queries", "Plugin"),
+    M("Permission Gaps", "queries", "Plugin"),
     # Cluster layer (built in section 6 from the discovered nodes)
     M("Cluster Type", tab="Cluster", kind=str),
     M("Cluster Health", "status", SUMMARY),
@@ -723,7 +724,8 @@ class Node(object):
         self.identity = ""
         self.error = ""
         self.auth_failed = False
-        self.failures = []
+        self.failures = []      # real query failures
+        self.denied = []        # objects this user may not read (permission gaps)
 
     @property
     def role(self):
@@ -765,6 +767,16 @@ class Node(object):
             self.settings["pg_stat_statements"] = bool(row[3]) if len(row) > 3 else False
         return True
 
+    def record_failure(self, exc):
+        """Sorts a query error into a permission gap (the user chose not to grant a role)
+        or a real failure. Only real failures are collection problems."""
+        text = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if getattr(exc, "pgcode", None) == "42501" or "permission denied" in text.lower():
+            what = re.sub(r"(?i)^.*permission denied (for )?", "", text).strip() or text
+            self.denied.append(scrub(what))
+        else:
+            self.failures.append(scrub(text))
+
     def query_all(self, sql):
         if self.conn is None:
             return None
@@ -774,7 +786,7 @@ class Node(object):
             cur.execute("/* site24x7 */ " + sql)
             return cur.fetchall()
         except Exception as e:
-            self.failures.append(scrub(str(e).splitlines()[0] if str(e) else type(e).__name__))
+            self.record_failure(e)
             return None
         finally:
             if cur is not None:
@@ -883,7 +895,7 @@ def collect_tables(node, deadline):
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
         except Exception as e:
-            node.failures.append(scrub(str(e).splitlines()[0] if str(e) else type(e).__name__))
+            node.record_failure(e)
             continue
         finally:
             if cur is not None:
@@ -1126,9 +1138,10 @@ def replication_view(primary, by_app_name=False, logical=False):
 
 def quiet_query(node, sql, all_rows=False):
     """A probe query whose failure is expected on most servers and is not a collection error."""
-    before = len(node.failures)
+    before, denied_before = len(node.failures), len(node.denied)
     result = node.query_all(sql) if all_rows else node.query_one(sql)
     del node.failures[before:]
+    del node.denied[denied_before:]
     return result
 
 
@@ -1889,9 +1902,10 @@ def cluster_identity(seed):
     """The cluster's system identifier, if this user may read it (PG 10+)."""
     if seed.version < (10, 0):
         return ""
-    before = len(seed.failures)
+    before, denied_before = len(seed.failures), len(seed.denied)
     row = seed.query_one("SELECT system_identifier::text FROM pg_control_system()")
     del seed.failures[before:]          # optional: not a collection failure
+    del seed.denied[denied_before:]
     return row[0] if row else ""
 
 
@@ -1932,6 +1946,21 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history}
     state.update(ctx["state_extra"])
     return out, tables, events, state
+
+
+def permission_note(denied, prev_denied):
+    """Text about permission gaps, shown only when they change: on a monitor's first poll
+    (registration), when a new gap appears, or when gaps are fixed. A user who chose not
+    to grant pg_monitor is told once, not on every poll; the Permission Gaps metric
+    carries the count every poll for anyone who wants to alert on it."""
+    if prev_denied is not None and sorted(prev_denied) == denied:
+        return ""
+    if denied:
+        return "Not readable by this user: %s. Grant pg_monitor to include them (shown once)." % (
+            ", ".join(denied))
+    if prev_denied:
+        return "Permission gaps resolved: all metrics are readable now."
+    return ""
 
 
 def run(param):
@@ -1982,6 +2011,7 @@ def run(param):
         "ts": sample_ts, "identity": node.identity,
         "counters": {r.source: metrics[r.source] for r in RATES if r.source in metrics},
         "cluster": cluster_state,
+        "denied": sorted(set(node.denied)),
     })
     if args["logs_enabled"]:
         write_events_log(log_path(args), events, cluster_state.get("sysid") or
@@ -1991,12 +2021,18 @@ def run(param):
 
     metrics.update(cluster_out)
     metrics["Failed Queries"] = len(node.failures)
+    denied = sorted(set(node.denied))
+    metrics["Permission Gaps"] = len(denied)
     metrics["Collection Time"] = int((time.time() - t0) * 1000)
     payload.update(metrics)
     payload.update(tables)
     payload.update(cluster_tables)
     if node.failures:
         payload["msg"] = "%d queries failed: %s" % (len(node.failures), node.failures[0])
+    else:
+        note = permission_note(denied, prev.get("denied"))
+        if note:
+            payload["msg"] = note
     payload = finalize(payload)
     problems = validate_output(payload)
     if problems:

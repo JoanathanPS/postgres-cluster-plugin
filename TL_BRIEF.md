@@ -22,11 +22,17 @@ Each question comes with the reason it matters and what you'd suggest, so you ar
 
 **Suggest:** whichever the agent team considers standard. The plugin works with both; it's a cfg and README line.
 
-### 3. "Should a partial failure show in `msg` while the monitor is up?"
+### 3. "Is this the right way to handle missing permissions?" (already built, ask for his OK)
 
-**Why:** if, say, `pg_ls_waldir` is denied, the plugin stays up and reports "1 queries failed: permission denied…" in `msg`. That's useful for troubleshooting, but some teams only want `msg` when the monitor is down.
+**Why:** some customers will deliberately not grant `pg_monitor`. Repeating "permission denied" on every poll would be nagging.
 
-**Suggest:** keep it. It's the only place the user sees which permission is missing.
+**What v2 does:**
+- **Separate from real failures:** a permission gap is not counted as a failure.
+- **Text once:** the note appears in `msg` only when things change: on the monitor's first poll (registration), when a new gap appears, or when one is fixed ("resolved").
+- **A number every poll:** **Permission Gaps** is a plain count, so anyone who cares can set a threshold. Nobody gets repeated text.
+- **Real failures still always show:** **Failed Queries** counts timeouts and errors, and those are always reported in `msg`.
+
+**Ask:** whether he wants the note repeated now and then (for example once a day), or once is enough.
 
 ### 4. "Can a plugin ship default threshold profiles?"
 

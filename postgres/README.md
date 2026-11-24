@@ -46,7 +46,7 @@ A node's role is always taken from PostgreSQL (`pg_is_in_recovery()`), never onl
   GRANT pg_monitor TO site24x7;
   ```
 
-  Without `pg_monitor` the plugin still runs. Metrics the user cannot read, for example WAL directory size, are left out instead of shown as 0, and `msg` names the permission that is missing.
+  Without `pg_monitor` the plugin still runs. Metrics the user cannot read, for example WAL directory size, are left out instead of shown as 0. `msg` names what is not readable once, when the monitor registers or when that list changes; it is not repeated every poll. The `Permission Gaps` metric carries the count on every poll.
 
 ## Installation using the installer (Linux)
 
@@ -241,7 +241,8 @@ This matters because Site24x7 builds the monitor template only from metrics that
 | Last Failover Age, Failovers 24h | s, count | From promotions this monitor has observed |
 | **Plugin** | | |
 | Collection Time | ms | Time taken by this poll |
-| Failed Queries | queries | Queries that failed this poll (their metrics are left out) |
+| Failed Queries | queries | Queries that failed this poll, for example on a timeout (their metrics are left out) |
+| Permission Gaps | queries | Queries this user is not allowed to run (grant `pg_monitor` to close them) |
 
 ## Changes from version 1
 

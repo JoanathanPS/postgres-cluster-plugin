@@ -154,14 +154,15 @@ class PayloadTests(unittest.TestCase):
 class FakeCursor(object):
     """Answers each catalogue query with a row of 1s; tables get one row."""
 
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, error="permission denied for function pg_ls_waldir"):
         self.fail_on = fail_on
+        self.error = error
         self.description = None
         self.rows = []
 
     def execute(self, sql):
         if self.fail_on and self.fail_on in sql:
-            raise Exception("permission denied for function pg_ls_waldir")
+            raise Exception(self.error)
         if "pg_is_in_recovery(), current_setting('archive_mode')" in sql:
             self.rows = [(False, "off", "2026-11-23 00:00:00+00")]
         elif " AS name" in sql:
@@ -182,11 +183,12 @@ class FakeConn(object):
     server_version = 160004
     autocommit = False
 
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, error="permission denied for function pg_ls_waldir"):
         self.fail_on = fail_on
+        self.error = error
 
     def cursor(self):
-        return FakeCursor(self.fail_on)
+        return FakeCursor(self.fail_on, self.error)
 
     def close(self):
         pass
@@ -194,13 +196,13 @@ class FakeConn(object):
 
 class RunTests(unittest.TestCase):
 
-    def run_with(self, fail_on=None):
+    def run_with(self, fail_on=None, error="permission denied for function pg_ls_waldir", prev=None):
         fake = mock.Mock()
-        fake.connect.return_value = FakeConn(fail_on)
+        fake.connect.return_value = FakeConn(fail_on, error)
         with mock.patch.object(pg, "psycopg2", fake), \
                 mock.patch.object(pg, "HAVE_PSYCOPG2", True), \
                 mock.patch.object(pg, "save_state", return_value=True), \
-                mock.patch.object(pg, "load_state", return_value={}), \
+                mock.patch.object(pg, "load_state", return_value=prev or {}), \
                 mock.patch.object(pg, "RATE_SAMPLE_S", 0.6):
             return pg.run({"host": "h", "port": "5432", "username": "u", "password": "p"})
 
@@ -212,12 +214,27 @@ class RunTests(unittest.TestCase):
         self.assertEqual(pg.validate_output(out), [])
 
     def test_failed_query_drops_only_its_metrics(self):
-        out = self.run_with(fail_on="pg_ls_waldir")
+        out = self.run_with(fail_on="pg_ls_waldir", error="canceling statement due to statement timeout")
         self.assertEqual(out["status"], 1)
         self.assertNotIn("WAL Directory Size", out)
         self.assertIn("Total Commits", out)
         self.assertEqual(out["Failed Queries"], 1)
-        self.assertIn("permission denied", out["msg"])
+        self.assertEqual(out["Permission Gaps"], 0)
+        self.assertIn("statement timeout", out["msg"])
+
+    def test_permission_gap_is_reported_once_not_every_poll(self):
+        first = self.run_with(fail_on="pg_ls_waldir")              # registration poll
+        self.assertEqual((first["Failed Queries"], first["Permission Gaps"]), (0, 1))
+        self.assertIn("function pg_ls_waldir", first["msg"])
+        self.assertNotIn("WAL Directory Size", first)
+        later = self.run_with(fail_on="pg_ls_waldir", prev={"denied": ["function pg_ls_waldir"]})
+        self.assertEqual(later["Permission Gaps"], 1)               # still counted every poll
+        self.assertNotIn("msg", later)                               # but no repeated text
+
+    def test_resolved_permission_gap_is_announced(self):
+        out = self.run_with(prev={"denied": ["function pg_ls_waldir"]})
+        self.assertEqual(out["Permission Gaps"], 0)
+        self.assertIn("resolved", out["msg"])
 
     def test_first_poll_samples_real_rates(self):
         """No previous state: rates come from two readings inside the poll, and the
@@ -332,6 +349,7 @@ class SeedStub(object):
     def __init__(self, host="10.0.0.1", port=5432, recovery=False, answers=None):
         self.host, self.port, self.dbname = host, port, "postgres"
         self.is_recovery, self.version, self.failures = recovery, (16, 0), []
+        self.denied = []
         self.answers = answers or {}
         self.conn = None
 
