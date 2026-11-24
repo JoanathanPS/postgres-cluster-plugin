@@ -41,7 +41,7 @@ error_handler() {
 
 agent_check() {
     for i in 0 1 2; do
-        if [ -x "$agent_dir/bin/monagent" ] && "$agent_dir/bin/monagent" status 2>/dev/null | grep -q "Site24x7 monitoring agent service"; then
+        if [ -x "$agent_dir/bin/monagent" ] && "$agent_dir/bin/monagent" status 2>/dev/null | grep -Eq "Site24x7 (monitoring|full-stack) agent service"; then
             return
         fi
         agent_path_change=true

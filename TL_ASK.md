@@ -2,9 +2,14 @@
 
 ## Answered
 
-1. **Template gaps → TL: "pre-declare them as zero, nothing wrong with that."**
-   - **To do:** send 0 for the 7 metrics that have no value yet, so every metric registers in the template.
-   - **README note:** for the "Age" metrics, 0 means "hasn't happened yet". Alert on "Failovers 24h", not "Last Failover Age".
+1. **Template gaps → TL: "pre-declare them as zero, nothing wrong with that." Done.**
+   - **Why it has to happen at registration:** Site24x7 builds a monitor's chart layout once, when the monitor first registers, and only from metrics that have a value then. A metric that appears later is never added; we tested that.
+   - **What v2 does:** every metric now has a value from the first poll, so every metric gets a chart. The 7 that used to be missing get a safe stand-in until their event happens:
+     - Last Archive Age, Last WAL Message Age, Last Subscription Message Age, Oldest Table Vacuum Age → **0** ("nothing pending"; lower is better, so it never alerts)
+     - Cache Hit Ratio, Index Hit Percent → **100 %** (no reads yet means no misses; a 0 % hit rate would trip every cache alert)
+     - Last Failover Age → **time since monitoring began** ("no failover for at least this long"; 0 would read as "just failed over")
+     - WAL Written on a standby → **0**, kept out of rate maths so a later promotion doesn't show a fake WAL spike
+   - **Where it's documented:** the README has the same table.
 
 2. **Minimums → TL: "whatever works."** PostgreSQL 9.6+ and Python 3.6+ stay.
 
@@ -47,7 +52,17 @@ From Patroni's documentation (4.1.5) and the main distributions:
    - **Ask:** "Which Python should plugins use on Linux, the agent's own or the system one? Should the installer put psycopg2 into the agent's Python?"
    - **Once he answers:** the installer can install `psycopg2` into the right one automatically.
 
-6. **Permission note: once or repeated?** Waiting on you to decide. Today it's once (on registration, on change and when resolved), plus the "Permission Gaps" count every poll.
+6. **Missing permissions (explain to him, then ask once-or-repeat):**
+   - **Who it happens to:**
+     - **Every v1 customer who upgrades.** The old v1 installer told customers to grant `pg_read_all_stats`, not `pg_monitor`. With only that role, PostgreSQL won't let the user read the WAL directory or the archive status folder, so WAL Directory Size, WAL Files and Archive Ready Files can't be collected. Everything else works.
+     - **Security teams that only allow a bare login user.** Some companies won't grant `pg_monitor` at all.
+     - **Managed databases** (Amazon RDS, Azure, Google Cloud SQL), which block some of PostgreSQL's file-reading functions even for admin-like users.
+   - **What v2 does about it:**
+     - The plugin keeps running, and only the blocked metrics are left out.
+     - `msg` says once which metrics are blocked and that granting `pg_monitor` fixes it: on the first poll, when something new gets blocked, and when it's fixed.
+     - The **Permission Gaps** count is sent every poll, so anyone who cares can set a threshold. Nobody gets the same text every 5 minutes.
+     - It isn't counted as a failure. **Failed Queries** stays for real errors such as timeouts.
+   - **The only question:** is "once" right, or should the note repeat now and then, for example daily?
 
 7. **Linux agent test, when he asks for it.** In plain words:
    - **Why:** most customers' database servers run Linux, so the plugin has to be proven with the real Site24x7 **Linux** agent.
