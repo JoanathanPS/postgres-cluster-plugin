@@ -9,12 +9,12 @@ become. A small engine runs the catalogue, so adding a metric is one entry and
 never a new branch of code.
 
 Rules the engine enforces:
-  * A failed or inapplicable query removes its metrics; it never reports 0.
-  * A NULL value removes that metric for this poll.
+  * A failed or inapplicable query removes its metrics instead of reporting 0.
+    The only fixed values are the safe stand-ins in truthful_zeros().
   * `status` is 0 only when the server cannot be monitored at all (driver
     missing, connection or authentication failure, unsupported version).
-  * Rates and deltas need a previous sample of the same server process; until
-    then they are omitted, never shown as 0.
+  * Rates and deltas come from the previous poll of the same server process.
+    On a monitor's first poll they are measured over RATE_SAMPLE_S seconds.
 """
 
 import argparse
@@ -23,7 +23,6 @@ import json
 import math
 import os
 import re
-import sys
 import time
 
 try:
@@ -429,18 +428,18 @@ QUERIES = [
 ]
 
 RATES = [
-    Rate("Transactions Per Sec", "Total Commits", "transactions/s", SUMMARY),
-    Rate("Rollbacks Per Sec", "Total Rollbacks", "transactions/s", "Transactions and Sessions"),
-    Rate("Rows Inserted Per Sec", "Total Rows Inserted", "rows/s", "DB and IO stats"),
-    Rate("Rows Updated Per Sec", "Total Rows Updated", "rows/s", "DB and IO stats"),
-    Rate("Rows Deleted Per Sec", "Total Rows Deleted", "rows/s", "DB and IO stats"),
-    Rate("Rows Fetched Per Sec", "Total Rows Fetched", "rows/s", "DB and IO stats"),
-    Rate("Rows Returned Per Sec", "Total Rows Returned", "rows/s", "DB and IO stats"),
-    Rate("Block Reads Per Sec", "Total Block Reads", "blocks/s", "DB and IO stats"),
-    Rate("Sequential Scans Per Sec", "Sequential Scans", "scans/s", "DB and IO stats"),
-    Rate("Index Scans Per Sec", "Index Scans", "scans/s", "DB and IO stats"),
-    Rate("Temp Data Per Sec", "Total Temp Data", "MB/s", "DB and IO stats"),
-    Rate("WAL Generated Per Sec", "WAL Written", "MB/s", "WAL and Archiving"),
+    Rate("Transactions Per Sec", "Total Commits", "transactions", SUMMARY),
+    Rate("Rollbacks Per Sec", "Total Rollbacks", "transactions", "Transactions and Sessions"),
+    Rate("Rows Inserted Per Sec", "Total Rows Inserted", "rows", "DB and IO stats"),
+    Rate("Rows Updated Per Sec", "Total Rows Updated", "rows", "DB and IO stats"),
+    Rate("Rows Deleted Per Sec", "Total Rows Deleted", "rows", "DB and IO stats"),
+    Rate("Rows Fetched Per Sec", "Total Rows Fetched", "rows", "DB and IO stats"),
+    Rate("Rows Returned Per Sec", "Total Rows Returned", "rows", "DB and IO stats"),
+    Rate("Block Reads Per Sec", "Total Block Reads", "blocks", "DB and IO stats"),
+    Rate("Sequential Scans Per Sec", "Sequential Scans", "scans", "DB and IO stats"),
+    Rate("Index Scans Per Sec", "Index Scans", "scans", "DB and IO stats"),
+    Rate("Temp Data Per Sec", "Total Temp Data", "MB", "DB and IO stats"),
+    Rate("WAL Generated Per Sec", "WAL Written", "MB", "WAL and Archiving"),
     Rate("New Deadlocks", "Total Deadlocks", "deadlocks", "Transactions and Sessions", delta=True),
     Rate("New Conflicts", "Total Conflicts", "conflicts", "Transactions and Sessions", delta=True),
     Rate("New Requested Checkpoints", "Checkpoints Req", "checkpoints", "BG Writer", delta=True),
@@ -775,14 +774,16 @@ class Node(object):
         else:
             self.failures.append(scrub(text))
 
-    def query_all(self, sql):
+    def query_all(self, sql, with_columns=False):
+        """Rows of `sql` (with column names first if asked), or None if it failed."""
         if self.conn is None:
             return None
         cur = None
         try:
             cur = self.conn.cursor()
             cur.execute("/* site24x7 */ " + sql)
-            return cur.fetchall()
+            rows = cur.fetchall()
+            return ([d[0] for d in cur.description], rows) if with_columns else rows
         except Exception as e:
             self.record_failure(e)
             return None
@@ -884,23 +885,10 @@ def collect_tables(node, deadline):
         if not applies(t, node):
             continue
         sql = t.pick(node.version)
-        if sql is None or node.conn is None:
+        result = node.query_all(sql, with_columns=True) if sql else None
+        if result is None:
             continue
-        cur = None
-        try:
-            cur = node.conn.cursor()
-            cur.execute("/* site24x7 */ " + sql)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-        except Exception as e:
-            node.record_failure(e)
-            continue
-        finally:
-            if cur is not None:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
+        cols, rows = result
         table_rows = []
         seen = set()
         for r in rows:
@@ -926,7 +914,7 @@ def compute_rates(metrics, prev, now, identity):
     out = {}
     prev_counters = prev.get("counters") or {}
     dt = now - float(prev.get("ts") or 0)
-    if prev.get("identity") != identity or dt <= 0 or not (RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S):
+    if prev.get("identity") != identity or not RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S:
         return out
     for r in RATES:
         cur = metrics.get(r.source)
@@ -984,7 +972,7 @@ def truthful_zeros(node, metrics):
     else:
         # a standby generates no WAL of its own
         zeros.update({"WAL Generated Per Sec": 0.0, "WAL Written": 0.0})
-    # Pre-declared so every metric registers in the template (TL decision, 2026-11-24).
+    # Sent so every metric registers in the Site24x7 template on the first poll.
     # Each value is safe for alerting: "lower is better" ages are 0 (nothing pending),
     # and hit ratios with no reads are 100 % (no misses), never a fake 0 % hit rate.
     zeros.update({"Last Archive Age": 0, "Last Subscription Message Age": 0,
@@ -1274,11 +1262,7 @@ class PatroniAdapter(object):
                 finally:
                     if lnode is not seed:
                         lnode.close()
-        for r in rows:
-            link = next((l for l in links or [] if l["name"] == r["name"]), None)
-            if link and r["role"] == ROLE_STANDBY:
-                r["replay_lag_s"] = link["replay_lag_s"]
-                r["backlog_mb"] = link["replay_lag_mb"]
+        apply_link_lag(rows, links)
         return ClusterView(nodes=rows, links=links, primary_name=leader)
 
 
@@ -1476,10 +1460,6 @@ class LogicalAdapter(object):
             row["_probe"] = (host, mport)
             rows.append(row)
         return ClusterView(nodes=rows, links=replication_view(seed, logical=True))
-
-    @property
-    def label(self):
-        return self.name
 
 
 class StandaloneAdapter(object):
@@ -1816,7 +1796,9 @@ def public_rows(rows):
 def discover_cluster(seed, ctx):
     """Runs the first adapter that recognises the seed."""
     adapter = next(a for a in ADAPTERS if a.detect(seed, ctx))
-    label = ctx.get("logical_ext") or adapter.name if adapter.name == "logical" else adapter.name
+    label = adapter.name
+    if label == "logical" and ctx.get("logical_ext"):
+        label = ctx["logical_ext"]          # pglogical, spock or bdr
     return adapter, label, adapter.nodes(seed, ctx)
 
 
@@ -1873,7 +1855,7 @@ def finalize(payload):
 
     The repository rules require every `units` key to exist in the data. Declaring
     unsent metrics would not help either: Site24x7 builds the template only from
-    metrics that carry a value (tested 2026-11-23), which is why truthful_zeros() and
+    metrics that carry a value, which is why truthful_zeros() and
     sampled_rates() exist."""
     emitted = {k for k in payload if k not in RESERVED_KEYS}
     for tab in payload.get("tabs", {}).values():
@@ -1933,12 +1915,13 @@ def down(payload, message):
 
 
 # =============================================================================
-# 7. ENTRY POINTS
+# 9. ENTRY POINTS
 # =============================================================================
 
 def resolve_args(param):
     """Normalises cfg/CLI parameters. Unknown keys are ignored."""
     p = {k: clean_quotes(v) for k, v in (param or {}).items()}
+    p = {k: ("" if v == "None" else v) for k, v in p.items()}   # cfg placeholder
     try:
         port = int(p.get("port") or 5432)
     except ValueError:
@@ -1955,12 +1938,11 @@ def resolve_args(param):
         patroni_port = int(p.get("patroni_port") or 0)
     except ValueError:
         patroni_port = 0
-    password = p.get("password") or ""
     return {
         "host": p.get("host") or "localhost",
         "port": port if 0 < port < 65536 else 5432,
         "username": p.get("username") or "postgres",
-        "password": "" if password == "None" else password,
+        "password": p.get("password") or "",
         "db": p.get("db") or "postgres",
         "sslmode": p.get("sslmode") or "",
         "sslrootcert": p.get("sslrootcert") or "",
@@ -1977,7 +1959,7 @@ def resolve_args(param):
         "patroni_certfile": p.get("patroni_certfile") or "",
         "patroni_keyfile": p.get("patroni_keyfile") or "",
         "patroni_username": p.get("patroni_username") or "",
-        "patroni_password": "" if (p.get("patroni_password") or "") == "None" else (p.get("patroni_password") or ""),
+        "patroni_password": p.get("patroni_password") or "",
         "logs_enabled": parse_bool(p.get("logs_enabled"), False),
         "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
         "log_file_path": p.get("log_file_path") or "",
@@ -2080,7 +2062,7 @@ def run(param):
     if not node.connect():
         reason = "authentication failed for user %s" % args["username"] if node.auth_failed \
             else "cannot connect to %s:%s (%s)" % (args["host"], args["port"], node.error)
-        if not param.get("host"):
+        if not (param or {}).get("host"):
             reason = "no configuration received from agent; " + reason
         return down(payload, reason)
 
