@@ -248,14 +248,18 @@ class RunTests(unittest.TestCase):
         for name in ("Archived Count", "Archive Failed Count", "Archiving Failing",
                      "Replay Lag", "Replay Backlog", "WAL Receiver Connected"):
             self.assertEqual(out[name], 0, name)
-        self.assertNotIn("Last Archive Age", out)   # no honest value exists
+        self.assertEqual(out["Last Archive Age"], 0)     # pre-declared (TL decision)
+        self.assertEqual(out["Cache Hit Ratio"], 1.0)     # no reads: no misses, not 0 % hits
 
 
 class TruthfulZeroTests(unittest.TestCase):
 
     def test_standby_and_archiving_keep_real_values(self):
         node = mock.Mock(is_recovery=True, settings={"archive_mode": "on"})
-        self.assertEqual(pg.truthful_zeros(node, {}), {"WAL Generated Per Sec": 0.0})
+        zeros = pg.truthful_zeros(node, {})
+        self.assertNotIn("Replay Lag", zeros)            # a standby has a real replay lag
+        self.assertNotIn("Archived Count", zeros)        # archiving on: real counts
+        self.assertEqual((zeros["WAL Generated Per Sec"], zeros["WAL Written"]), (0.0, 0.0))
 
     def test_existing_values_are_never_overwritten(self):
         node = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
@@ -266,7 +270,9 @@ class TruthfulZeroTests(unittest.TestCase):
         out = pg.cluster_metrics(view, "standalone", [], 100.0)
         self.assertEqual((out["Standbys Streaming"], out["Max Standby Replay Lag"], out["Failovers 24h"]),
                          (0, 0.0, 0))
-        self.assertNotIn("Last Failover Age", out)
+        self.assertNotIn("Last Failover Age", out)      # no start time given
+        out = pg.cluster_metrics(view, "standalone", [], 100.0, since=40.0)
+        self.assertEqual(out["Last Failover Age"], 60)   # "none for at least 60 s", never 0
 
 
 def row(name, role, status=1):

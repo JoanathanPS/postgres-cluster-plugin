@@ -993,7 +993,13 @@ def truthful_zeros(node, metrics):
         zeros.update({"Replay Lag": 0, "Replay Backlog": 0.0, "WAL Receiver Connected": 0})
     else:
         # a standby generates no WAL of its own
-        zeros.update({"WAL Generated Per Sec": 0.0})
+        zeros.update({"WAL Generated Per Sec": 0.0, "WAL Written": 0.0})
+    # Pre-declared so every metric registers in the template (TL decision, 2026-11-24).
+    # Each value is safe for alerting: "lower is better" ages are 0 (nothing pending),
+    # and hit ratios with no reads are 100 % (no misses), never a fake 0 % hit rate.
+    zeros.update({"Last Archive Age": 0, "Last Subscription Message Age": 0,
+                  "Last WAL Message Age": 0, "Oldest Table Vacuum Age": 0,
+                  "Cache Hit Ratio": 1.0, "Index Hit Percent": 100.0})
     return {k: v for k, v in zeros.items() if k not in metrics}
 
 
@@ -1714,7 +1720,7 @@ def evaluate_health(rows, cluster_type, single_writer=True):
     return HEALTH_OK, "%d of %d nodes up" % (len(up), len(rows))
 
 
-def cluster_metrics(view, cluster_type, history, now, single_writer=True):
+def cluster_metrics(view, cluster_type, history, now, single_writer=True, since=None):
     rows = view.nodes
     code, reason = evaluate_health(rows, cluster_type, single_writer)
     standbys = [r for r in rows if r["role"] == ROLE_STANDBY]
@@ -1742,6 +1748,10 @@ def cluster_metrics(view, cluster_type, history, now, single_writer=True):
     promotions = [e["ts"] for e in history if e["event"] == "promoted"]
     if promotions:
         out["Last Failover Age"] = int(now - max(promotions))
+    elif since is not None:
+        # no failover seen since monitoring began: report that time, a true lower bound
+        # ("no failover for at least this long"), never 0, which would read as "just now"
+        out["Last Failover Age"] = int(now - since)
     out["Failovers 24h"] = len([t for t in promotions if now - t <= 86400])
     return out
 
@@ -1991,11 +2001,13 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
         nodes_state[r["name"]] = {
             "role": r["role"], "status": r["status"], "address": r.get("address", ""),
             "last_seen": now if r["status"] else old.get("last_seen", now)}
-    out = cluster_metrics(view, cluster_type, history, now, adapter.single_writer)
+    since = float(prev_cluster.get("since") or now)
+    out = cluster_metrics(view, cluster_type, history, now, adapter.single_writer, since)
     tables = {"Nodes": public_rows(view.nodes), "Events": event_rows(history, now)}
     if view.links is not None:
         tables["Replication_Links"] = link_rows(view.links)
-    state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history}
+    state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history,
+             "since": since}
     state.update(ctx["state_extra"])
     return out, tables, events, state
 
@@ -2049,7 +2061,8 @@ def run(param):
             rates, second, sample_ts = sampled_rates(node, deadline)
             metrics.update(second)
         metrics.update(rates)
-        metrics.update(truthful_zeros(node, metrics))
+        filled = truthful_zeros(node, metrics)
+        metrics.update(filled)
         metrics.update(derive_metrics(node, metrics))
         try:
             cluster_out, cluster_tables, events, cluster_state = collect_cluster(
@@ -2061,7 +2074,10 @@ def run(param):
 
     save_state(path, {
         "ts": sample_ts, "identity": node.identity,
-        "counters": {r.source: metrics[r.source] for r in RATES if r.source in metrics},
+        # pre-declared values are not counters: a standby's 0 "WAL Written" must not turn
+        # into a fake WAL spike after it is promoted
+        "counters": {r.source: metrics[r.source] for r in RATES
+                     if r.source in metrics and r.source not in filled},
         "cluster": cluster_state,
         "denied": sorted(set(node.denied)),
     })

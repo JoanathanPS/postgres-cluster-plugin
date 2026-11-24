@@ -158,6 +158,15 @@ Where 0 is the true value, 0 is sent. Examples: archive counts when archiving is
 
 This matters because Site24x7 builds the monitor template only from metrics that have a value when a monitor first registers.
 
+For the same reason, a few metrics are sent with a safe stand-in value until their event first happens:
+
+| Metric | Stand-in | Meaning |
+| :--- | :--- | :--- |
+| Last Archive Age, Last WAL Message Age, Last Subscription Message Age, Oldest Table Vacuum Age | 0 | Nothing pending. These are "lower is better", so 0 never raises an alert. |
+| Cache Hit Ratio, Index Hit Percent | 1.0 / 100 % | No reads yet, so no misses. Never a false 0 % hit rate. |
+| Last Failover Age | seconds since monitoring began | No failover for at least that long. Never 0, which would read as "just failed over". |
+| WAL Written (standby) | 0 | A standby writes no WAL of its own. It is not used for rates, so a later promotion doesn't show a fake spike. |
+
 | Metric | Unit | Description |
 | :--- | :--- | :--- |
 | **Summary** | | |
