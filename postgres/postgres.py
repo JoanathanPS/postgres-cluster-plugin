@@ -1522,6 +1522,7 @@ class StreamingAdapter(object):
         else:
             p_row = node_row(p_label, ROLE_PRIMARY, "up", True,
                              address="%s:%s" % (primary.host, primary.port), reachable=1)
+            p_row["_fp"] = node_fingerprint(primary)
         rows = [p_row]
         seed_app = own_application_name(seed) if seed.is_recovery else ""
         seed_addr = ""
@@ -1560,15 +1561,23 @@ class ClusterView(object):
         self.primary_name = primary_name
 
 
+def node_fingerprint(node):
+    """The server's postmaster start time: identical for every name it is reached by."""
+    identity = getattr(node, "identity", "") or ""
+    return identity.split("|", 1)[1] if "|" in identity else ""
+
+
 def seed_row(seed, ctx, name=None):
     m = ctx["metrics"]
-    return node_row(
+    row = node_row(
         name or seed_name(seed), seed.role, "up", True,
         address="%s:%s" % (seed.host, seed.port), reachable=1,
         conn_pct=m.get("Connection Utilization"), uptime_s=m.get("Uptime"),
         longest_query_s=m.get("Longest Transaction"), timeline=m.get("Timeline"),
         replay_lag_s=m.get("Replay Lag"), backlog_mb=m.get("Replay Backlog"),
         last_msg_age_s=m.get("Last WAL Message Age"))
+    row["_fp"] = node_fingerprint(seed)
+    return row
 
 
 PROBE_SQL = (
@@ -1579,7 +1588,8 @@ PROBE_SQL = (
     " (SELECT coalesce(floor(max(extract(epoch FROM now() - xact_start))), 0)::bigint"
     " FROM pg_stat_activity WHERE datname IS NOT NULL AND pid <> pg_backend_pid()),"
     " (SELECT floor(extract(epoch FROM now() - max(last_msg_receipt_time)))::bigint"
-    " FROM pg_stat_wal_receiver)")
+    " FROM pg_stat_wal_receiver),"
+    " pg_postmaster_start_time()::text")   # fingerprint: the same server under two names
 
 
 def probe_nodes(rows, ctx, deadline):
@@ -1604,7 +1614,9 @@ def probe_nodes(rows, ctx, deadline):
             if res:
                 if row["role"] in (ROLE_PRIMARY, ROLE_STANDBY):   # PostgreSQL decides, not the registry
                     row["role"] = ROLE_STANDBY if res[0] else ROLE_PRIMARY
-                for key, val in zip(("conn_pct", "uptime_s", "longest_query_s", "last_msg_age_s"), res[1:]):
+                if len(res) > 5 and res[5]:
+                    row["_fp"] = str(res[5])
+                for key, val in zip(("conn_pct", "uptime_s", "longest_query_s", "last_msg_age_s"), res[1:5]):
                     num = to_number(val, float if key == "conn_pct" else int)
                     if num is not None:
                         row[key] = num
@@ -1621,10 +1633,13 @@ def probe_nodes(rows, ctx, deadline):
 def merge_remembered(rows, prev_nodes, now):
     """Adds nodes seen in earlier polls but missing now. Returns names to forget."""
     present = {r["name"] for r in rows}
+    addresses = {r.get("address") for r in rows if r.get("address")}
     forgotten = []
     for name, info in sorted(prev_nodes.items()):
         if name in present:
             continue
+        if info.get("address") and info["address"] in addresses:
+            continue    # the same server, now listed under another name: drop the old name
         age = now - float(info.get("last_seen") or 0)
         if age > NODE_FORGET_S:
             forgotten.append(name)
@@ -1638,6 +1653,21 @@ def merge_remembered(rows, prev_nodes, now):
             row["_probe"] = (host, int(port))   # it may be up but detached, or a second primary
         rows.append(row)
     return forgotten
+
+
+def dedupe_nodes(rows):
+    """Removes a remembered row that turned out to be a server already listed under
+    another name (same postmaster start time). Without this, one primary known by a
+    hostname yesterday and by its IP today looks like a split brain."""
+    seen, out = {}, []
+    for r in sorted(rows, key=lambda r: "last_seen_s" in r):   # live rows before remembered ones
+        fp = r.get("_fp")
+        if fp and fp in seen:
+            continue
+        if fp:
+            seen[fp] = r["name"]
+        out.append(r)
+    rows[:] = [r for r in rows if r in out]
 
 
 def detect_events(rows, prev_nodes, forgotten, now):
@@ -1950,6 +1980,7 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
     adapter, cluster_type, view = discover_cluster(seed, ctx)
     forgotten = merge_remembered(view.nodes, prev_nodes, now)
     probe_nodes(view.nodes, ctx, deadline)
+    dedupe_nodes(view.nodes)
     events = detect_events(view.nodes, prev_nodes, forgotten, now)
     history = [e for e in (prev_cluster.get("events") or []) if now - e.get("ts", 0) <= 7 * 86400]
     history = (history + events)[-MAX_EVENTS:]

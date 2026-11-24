@@ -303,6 +303,23 @@ class ClusterLogicTests(unittest.TestCase):
         rows = [row("p", "primary")]
         self.assertEqual(pg.merge_remembered(rows, prev, pg.NODE_FORGET_S + 1.0), ["s1"])
 
+    def test_same_server_under_two_names_is_not_split_brain(self):
+        """Found on the real agent: the primary was remembered as 'pg-primary' (its
+        hostname, seen from a standby) and is now listed by IP. Same server, one row."""
+        live = pg.node_row("172.18.0.2", "primary", "up", True, address="127.0.0.1:5432")
+        live["_fp"] = "2026-11-24 06:00:00+00"
+        rows = [live, row("172.18.0.3", "standby")]
+        prev = {"pg-primary": {"role": "primary", "status": 1, "last_seen": 90.0,
+                               "address": "127.0.0.1:5432"}}
+        pg.merge_remembered(rows, prev, 100.0)            # same address: old name dropped
+        self.assertEqual([r["name"] for r in rows], ["172.18.0.2", "172.18.0.3"])
+        ghost = pg.node_row("pg-primary", "primary", "up", True, address="pg-primary:5432")
+        ghost.update({"_fp": "2026-11-24 06:00:00+00", "last_seen_s": 10})
+        rows.append(ghost)                                 # different address, same server
+        pg.dedupe_nodes(rows)
+        self.assertNotIn("pg-primary", [r["name"] for r in rows])
+        self.assertEqual(pg.evaluate_health(rows, "streaming")[0], pg.HEALTH_OK)
+
     def test_recovered_node_is_an_event(self):
         prev = {"s1": {"role": "standby", "status": 0}}
         events = pg.detect_events([row("s1", "standby")], prev, [], 1.0)

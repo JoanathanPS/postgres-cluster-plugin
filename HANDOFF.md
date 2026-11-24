@@ -116,3 +116,14 @@ Read this instead of the old chat. The v6 handoff, research, docs and console ev
 - **Copy the fixed file into the agent folder** (see section 4). It re-registers by itself; wait for one poll.
 - **Commit per fix** on `v7`. Plain commit messages, no AI attribution.
 - **Model:** Sonnet is fine for fixing listed bugs, since the code is catalogue- and adapter-shaped and fixes are local. Use Opus only for design calls such as issue 2.
+
+## 7. Real-agent failover test (2026-11-24)
+
+Run through the Windows agent with the `[postgres]` (primary) and `[streaming]` (standby, logs on) monitors, capturing the agent's own payloads at each poll:
+- **Correct:** standby down (Health 1 plus a `down` event), standby back (`recovered`), primary down (Health 2, no reachable primary), promotion (`promoted`, timeline 1→2) and old primary back (Health 3, split brain). The events log file in the agent folder recorded every event.
+- **Bug found and fixed:** the same primary was listed twice, once by its hostname (`pg-primary`, remembered from when it was unreachable from the standby) and once by IP. That showed as a false split brain. `merge_remembered` now drops a remembered name whose address is already listed, and `dedupe_nodes` drops a row with the same postmaster start time (a fingerprint gathered by every probe). Verified on the agent: the split brain lists 2 nodes, not 3.
+- **Also fixed today:**
+  - monitoring through PgBouncer (the `options` startup parameter was rejected, so the monitor showed down);
+  - `patroni_scheme` / `patroni_verify` for HTTPS;
+  - Stats_per_DB unreadable sizes now blank instead of 0.
+- **Rerun on today's code:** the PostgreSQL 9.6–18 matrix and Python 3.6, both passing.
