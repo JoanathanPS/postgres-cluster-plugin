@@ -1,130 +1,150 @@
-# PostgreSQL Plugin
+Plugin for PostgreSQL Monitoring
+=============================
 
-Monitors a PostgreSQL server and, when it is part of a cluster, every node of that cluster from a single address.
+PostgreSQL is an ORDBMS server whose primary function is to store data securely, and allows retrieval at the request of other software applications. Analyze and optimize your Postgres server by configuring our Postgres plugin and proactively monitor the availability and performance of business-critical Postgres database servers.
 
-Version 2 replaces version 1. The configuration keys are unchanged, and most version 1 metrics keep their names. The few that newer metrics cover were dropped, and one table was renamed. See [Changes from version 1](#changes-from-version-1).
+Version 2 of the plugin also monitors **PostgreSQL clusters** from the same single address. It finds every node of the cluster by itself, without a node list, and reports which node is primary, whether each standby is healthy and replicating, and every failover. It works for standalone servers, streaming replication, Patroni, repmgr, pgpool-II, Citus, pg_auto_failover and logical (multi-master) replication.
 
-## What it monitors
+Learn more https://www.site24x7.com/plugins/postgres-monitoring.html
 
-**This node:** the server at `host:port`. That is its activity, transactions, I/O, background writer, vacuum and XID wraparound, WAL and archiving, replication slots and standby replay.
+## Quick installation
 
-**The cluster:** the plugin finds the other nodes by itself, starting from that one address. It reports a row per node that answers "is this node OK?", plus replication links, a health code and a history of failovers.
+If you're using Linux servers, use the postgres plugin installer that checks the prerequisites and installs the plugin with a bash script. You don't need to manually set up the plugin if you're using the installer.
 
-| Cluster type | How the nodes are found | Notes |
-| :--- | :--- | :--- |
-| Standalone | — | One node. Same as version 1. |
-| Streaming replication | `pg_stat_replication`, `pg_stat_wal_receiver` | Also covers keepalived/VIP, CloudNativePG, Stolon and managed services. Works from the primary or from any standby. |
-| Patroni | REST API `/cluster` | Set `patroni_port`. Lists stopped members too. |
-| repmgr | `repmgr.nodes` (database `repmgr`) | Includes witness nodes. |
-| pg_auto_failover | `pgautofailover.node` | Point the plugin at the monitor node. A data node is handled as streaming replication. |
-| Citus | `pg_dist_node` | Point the plugin at the coordinator. |
-| pgpool-II | `SHOW POOL_NODES` | Point the plugin at the pgpool port. |
-| Logical / multi-master | logical walsenders, subscriptions | Native logical replication, pglogical, Spock, BDR/PGD. Every node is a writer. |
-
-A node's role is always taken from PostgreSQL (`pg_is_in_recovery()`), never only from a cluster manager. If the two disagree, that is reported as Health Code 4.
-
-**One address, two ways to deploy:**
-
-- **Agent on each database server** (`host="localhost"`): each monitor reports its own server in full, plus the shared cluster view. This is how version 1 is usually installed.
-- **One agent, one cluster address** (a VIP, DNS name or HAProxy write port): one monitor follows whichever node is primary. This is recommended for new installs.
-
-## Prerequisites
-
-- Site24x7 Linux or Windows server agent.
-- Python 3.6 or later.
-- The `psycopg2` module, installed for the Python the agent uses:
-
-  ```bash
-  pip3 install psycopg2-binary
-  ```
-
-- PostgreSQL 9.6 or later. Older servers are reported as unsupported.
-- A monitoring user that exists on every node with the same password and has the `pg_monitor` role:
-
-  ```sql
-  CREATE USER site24x7 WITH PASSWORD '<password>';
-  GRANT pg_monitor TO site24x7;
-  ```
-
-  Without `pg_monitor` the plugin still runs. Metrics the user cannot read, for example WAL directory size, are left out instead of shown as 0. `msg` names what is not readable once, when the monitor registers or when that list changes; it is not repeated every poll. The `Permission Gaps` metric carries the count on every poll.
-
-## Installation using the installer (Linux)
+Execute the command below in the terminal to run the installer and follow the instructions displayed on-screen:
 
 ```bash
 wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/installer/Site24x7PostgresPluginInstaller.sh && sudo bash Site24x7PostgresPluginInstaller.sh
 ```
 
-The installer checks the agent, installs `psycopg2-binary` if it is missing, asks for the connection details, test-runs the plugin and moves it into the agent's plugin folder.
+**Upgrading from version 1:** run the same command. The installer detects the installed plugin and replaces only `postgres.py` and this README. Your `postgres.cfg`, with every monitor and its encrypted credentials, is kept as it is.
 
-**Upgrading from version 1:** run the same command. The installer detects the existing plugin and replaces only `postgres.py` and this README. Your `postgres.cfg`, with every monitor and its encrypted credentials, is kept as it is.
+### Prerequisites
 
-## Plugin installation (manual)
+- Download and install the latest version of the [Site24x7 agent](https://www.site24x7.com/app/client#/admin/inventory/add-monitor) in the server where you plan to run the plugin.
+- Python version 3.6 or higher.
+- The psycopg2 module:
+  - **Linux:** nothing to install. The Site24x7 Linux agent runs the plugin with its own Python, which already includes psycopg2.
+  - **Windows:** install it for the server's Python:
 
-1. Create a folder named `postgres` and download `postgres.py` and `postgres.cfg` into it:
+		pip3 install psycopg2-binary
 
-   ```bash
-   mkdir postgres && cd postgres
-   wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/postgres.py
-   wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/postgres.cfg
-   ```
+- PostgreSQL 9.6 or higher.
+- A user with the **pg_monitor** role. For a cluster, create it on every node with the same password. For example, create a user `site24x7` with password `site24x7` and grant it `pg_monitor`:
 
-2. Check the output by running the plugin by hand:
+	```sql
+	CREATE USER site24x7 WITH PASSWORD 'site24x7';
+	GRANT pg_monitor TO site24x7;
+	```
 
-   ```bash
-   python3 postgres.py --host localhost --port 5432 --username site24x7 --password <password> --db postgres
-   ```
+  Without `pg_monitor` the plugin still works. The few metrics the user can't read (for example WAL directory size) are left out, and the monitor message names them once, not on every poll.
 
-3. Fill in `postgres.cfg` (see below).
-4. Move the folder into the agent's plugin directory:
-   - Linux: `/opt/site24x7/monagent/plugins/`
-   - Windows: `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\plugins\`
+### Plugin Installation
 
-The agent encrypts `password` on its first run.
+- Create a directory named `postgres`.
 
-## Configuration
+	```bash
+	mkdir postgres
+	cd postgres/
+	```
 
-```ini
-[global_configurations]
-use_agent_python=1
+- Download all the files and place them under the `postgres` directory.
 
-[postgres]
-host="localhost"
-port="5432"
-username="site24x7"
-password="<password>"
-db="postgres"
-plugin_version=2
-heartbeat="true"
-```
+	```bash
+	wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/postgres.py
+	wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/postgres.cfg
+	```
 
-Each section is one monitor. Add more sections (`[postgres-db2]`) to monitor more servers from one agent.
+- Execute the below command with appropriate arguments to check for the valid json output:
+
+	```bash
+	python3 postgres.py --host "localhost" --port "5432" --username "username" --password "password" --db "postgres"
+	```
+
+- Provide your Postgres DB configurations in the postgres.cfg file.
+
+    ```ini
+    [postgres]
+    host="localhost"
+    port="5432"
+    username="None"
+    password="None"
+    db="postgres"
+    plugin_version=2
+    ```
+
+  For a cluster, `host` can be any node, a VIP, a DNS name or an HAProxy write port; the other nodes are found automatically. Add one section per server or cluster to monitor more than one from the same agent. All optional settings are listed under [Configuration options](#configuration-options).
+
+  #### Linux
+
+- Move the directory `postgres` under the Site24x7 Linux Agent plugin directory:
+
+	```bash
+	mv postgres /opt/site24x7/monagent/plugins/
+	```
+
+  #### Windows
+
+- Since it's a Python plugin, to run the plugin in a Windows server please follow the steps in [this link](https://support.site24x7.com/portal/en/kb/articles/run-python-plugin-scripts-in-windows-servers). The remaining configuration steps are the same.
+- Set `use_agent_python=0` in the `[global_configurations]` section of postgres.cfg, so the plugin runs with the server's Python, where psycopg2 is installed.
+- Move the folder `postgres` under the Site24x7 Windows Agent plugin directory:
+
+	```bash
+	C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins
+	```
+
+The agent will automatically execute the plugin within five minutes and the user can see the plugin monitor under Site24x7 > Plugins > Plugin Integrations.
+
+## Monitoring a PostgreSQL cluster
+
+Point the plugin at any one address of the cluster. It works out the cluster type and finds the other nodes itself:
+
+| Cluster type | How the nodes are found | Point the plugin at |
+| :--- | :--- | :--- |
+| Standalone | — | The server |
+| Streaming replication (also keepalived/VIP, CloudNativePG, Stolon, managed services) | `pg_stat_replication`, `pg_stat_wal_receiver` | The primary, any standby, or a VIP |
+| Patroni | Patroni REST API `/cluster` | Any node, with `patroni_port` set |
+| repmgr | `repmgr.nodes` | Any node |
+| pgpool-II | `SHOW POOL_NODES` | The pgpool port |
+| Citus | `pg_dist_node` | The coordinator |
+| pg_auto_failover | `pgautofailover.node` | The monitor node |
+| Logical / multi-master (native, pglogical, Spock, BDR/PGD) | Logical replication connections | Any node |
+
+A node's role (primary or standby) always comes from PostgreSQL itself, never only from a cluster manager. If the two disagree, the plugin reports it.
+
+**Two ways to deploy:**
+
+- **One agent, one cluster address** (a VIP, DNS name or HAProxy write port): one monitor follows whichever node is primary. Recommended for new installs.
+- **An agent on every database server** (`host="localhost"`): each monitor shows its own server in full, plus the same cluster view. This is how version 1 is usually installed, so upgraded monitors keep working this way.
+
+## Configuration options
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
-| `host` | `localhost` | Server to monitor. A node, a VIP, a DNS name or a proxy port. |
+| `host` | `localhost` | Server to monitor: a node, a VIP, a DNS name or a proxy port. |
 | `port` | `5432` | PostgreSQL port. |
-| `username`, `password` | — | Monitoring user (see Prerequisites). |
+| `username`, `password` | — | The monitoring user (see Prerequisites). The agent encrypts the password. |
 | `db` | `postgres` | Database to connect to. Per-table metrics and `Top_Queries` come from this database. |
 | `sslmode` | libpq default | `disable`, `require`, `verify-ca` or `verify-full`. Optional: `sslrootcert`, `sslcert`, `sslkey`. |
-| `timeout` | `10` | Connect timeout in seconds (1–30). Other nodes are always probed with a 3 s timeout. |
-| `plugin_version` | `2` | Plugin template version. Leave as is. |
+| `timeout` | `10` | Connect timeout in seconds (1–30). |
+| `plugin_version` | `2` | Leave as is. |
 | `heartbeat` | `true` | Alert when the agent cannot post this plugin's data. |
 | `patroni_port` | — | Patroni REST API port (usually `8008`). Patroni is used only when this is set. |
-| `patroni_scheme` | `http` | `https` if the Patroni REST API uses TLS. The certificate is verified. |
-| `patroni_verify` | `true` | Set to `false` only for a self-signed Patroni certificate. |
-| `patroni_cafile` | — | CA certificate to verify Patroni's HTTPS certificate against (for example the cluster's own CA on Kubernetes). Safer than `patroni_verify=false`. |
-| `patroni_certfile`, `patroni_keyfile` | — | Client certificate and key, for Patroni configured with `verify_client: required`. |
-| `patroni_username`, `patroni_password` | — | Basic auth for a proxy in front of the Patroni API. Patroni itself does not ask for a password on the read the plugin uses. The agent encrypts the password. |
-| `address_map` | — | Only needed when the addresses the cluster reports are not reachable from the agent (NAT, containers). Example: `10.0.0.5:5432=192.168.1.5:6432,pg-node2=192.168.1.6`. |
-| `logs_enabled` | `false` | Write cluster events (failovers, nodes down and recovered) to a log file in the plugin folder and send it to Site24x7 AppLogs. |
+| `patroni_scheme` | `http` | `https` if the Patroni REST API uses TLS. |
+| `patroni_verify` | `true` | `false` only for a self-signed Patroni certificate. |
+| `patroni_cafile` | — | CA certificate to verify Patroni's HTTPS certificate against. Safer than `patroni_verify=false`. |
+| `patroni_certfile`, `patroni_keyfile` | — | Client certificate and key, for Patroni with `verify_client: required`. |
+| `patroni_username`, `patroni_password` | — | Basic auth, only for a proxy in front of the Patroni API. Patroni itself doesn't ask for a password on the read the plugin uses. |
+| `address_map` | — | Only when the addresses the cluster reports aren't reachable from the agent (NAT, containers). Example: `10.0.0.5:5432=192.168.1.5:6432,pg-node2=192.168.1.6`. |
+| `logs_enabled` | `false` | Write cluster events (failovers, nodes down or back) to `postgres_events.log` in the plugin folder and send it to Site24x7 AppLogs. |
 | `log_type_name` | `PostgreSQL Cluster Events` | AppLogs log type. |
-| `log_file_path` | `postgres_events.log` | File name only. The file is always kept in the plugin folder and rotated at 1 MB, keeping three old files. |
+| `log_file_path` | `postgres_events.log` | File name only. The file always stays in the plugin folder and is rotated at 1 MB. |
 
-**Connection poolers:** the plugin can monitor through PgBouncer (or similar). The pooler is transparent to it, but per-node metrics then describe whichever server the pooler connects to.
+The plugin can also monitor through a connection pooler such as PgBouncer.
 
 ## Health
 
-`status` is 0 (monitor down) only when the server itself cannot be monitored. That covers a missing driver, a connection or authentication failure, or an unsupported version. Problems elsewhere in the cluster are reported through these metrics and keep the monitor up:
+The monitor is down only when the server itself can't be monitored: the driver is missing, the connection or login fails, or the PostgreSQL version is below 9.6. Problems elsewhere in a cluster keep the monitor up and are reported through these metrics:
 
 | Health Code | Cluster Health | Meaning |
 | :--- | :--- | :--- |
@@ -134,43 +154,13 @@ Each section is one monitor. Add more sections (`[postgres-db2]`) to monitor mor
 | 3 | 2 | Split brain: more than one writable node in a single-primary cluster |
 | 4 | 1 | A cluster manager and PostgreSQL disagree about a node's role |
 
-Lag, wraparound, connection saturation, slots and archiving are reported as numbers. Set Site24x7 threshold profiles on the ones you care about, for example `Max Standby Replay Lag`, `XID Wraparound Percent`, `Connection Utilization`, `Inactive Replication Slots` and `Archiving Failing`.
+Set Site24x7 thresholds on the metrics you care about, for example `Cluster Health`, `Max Standby Replay Lag`, `XID Wraparound Percent`, `Connection Utilization` and `Archiving Failing`.
 
-A node that disappears stays in the `Nodes` table as down or not streaming for 24 hours, and is still probed. That is how a former primary coming back writable is caught as a split brain.
+## PostgreSQL Server Monitoring Plugin Metrics
 
-## Child tables
+Rates (`... Per Sec`) and per-poll counts (`New ...`) are measured between polls. On a monitor's very first poll the plugin measures them over 5 seconds, so every metric has a value from the start.
 
-| Table | Rows | Columns |
-| :--- | :--- | :--- |
-| `Stats_per_DB` | databases | connections, size, rows inserted/updated/deleted/fetched/returned, block reads and hits, cache hit %, deadlocks, temp files |
-| `Transactions_and_Sessions_per_Database` | databases | commits, rollbacks, conflicts; session counts and times on PostgreSQL 14+ |
-| `Wait_Events` | wait event | active sessions waiting on it |
-| `Replication_Slots` | slots | type, active, retained WAL, WAL status; catalog_xmin age and spill size on 14+ |
-| `Top_Queries` | top 10 by total time | calls, total and mean time, rows, query text (only when `pg_stat_statements` is installed in `db`) |
-| `Nodes` | cluster nodes | role, state, status, reachable, replay lag, backlog, timeline, connection %, uptime, longest query, last WAL message age, last seen |
-| `Replication_Links` | standbys / subscribers | state, sync state, address, sent/write/flush/replay lag in MB and seconds |
-| `Events` | last 25 cluster events | event (`promoted`, `demoted`, `down`, `recovered`, `joined`, `removed`), node, old and new role, age |
-
-Every table is capped at 25 rows. In `Nodes`, down nodes are listed first so a failure is never cut off.
-
-## Supported metrics
-
-Rates (`... Per Sec`) and per-poll deltas (`New ...`) are measured between polls. On a monitor's first poll there is no previous poll yet, so the plugin reads the counters twice, 5 seconds apart, and reports that measurement. This adds 5 seconds to the first poll only.
-
-Where 0 is the true value, 0 is sent. Examples: archive counts when archiving is off, replay lag on a primary, WAL generated on a standby. A metric with no honest value on a given server is left out, never reported as 0. Examples: Last Archive Age when nothing has been archived, Index Hit Percent when there are no indexes.
-
-This matters because Site24x7 builds the monitor template only from metrics that have a value when a monitor first registers.
-
-For the same reason, a few metrics are sent with a safe stand-in value until their event first happens:
-
-| Metric | Stand-in | Meaning |
-| :--- | :--- | :--- |
-| Last Archive Age, Last WAL Message Age, Last Subscription Message Age, Oldest Table Vacuum Age | 0 | Nothing pending. These are "lower is better", so 0 never raises an alert. |
-| Index Hit Percent | 100 % | No reads yet, so no misses. Never a false 0 % hit rate. |
-| Last Failover Age | seconds since monitoring began | No failover for at least that long. Never 0, which would read as "just failed over". |
-| WAL Written (standby) | 0 | A standby writes no WAL of its own. It is not used for rates, so a later promotion doesn't show a fake spike. |
-
-| Metric | Unit | Description |
+| **Metric Name** | **Unit** | **Description** |
 | :--- | :--- | :--- |
 | **Summary** | | |
 | Uptime | s | Time since the server started |
@@ -198,29 +188,28 @@ For the same reason, a few metrics are sent with a safe stand-in value until the
 | Total Commits, Total Rollbacks | transactions | Cumulative since statistics reset |
 | Total Conflicts | conflicts | Queries cancelled by recovery conflicts (standbys) |
 | Total Deadlocks | deadlocks | Cumulative deadlocks |
-| Total Sessions, … Abandoned, … Fatal, … Killed | sessions | Session counts (14+) |
+| Total Sessions, Total Sessions Abandoned, Total Sessions Fatal, Total Sessions Killed | sessions | Session counts (PostgreSQL 14+) |
 | Rollbacks Per Sec | transactions/s | Rollbacks per second |
 | New Deadlocks, New Conflicts | count | Since the previous poll |
 | **DB and IO stats** | | |
 | Database Count, Table Count | count | Databases (excluding templates); tables in `db` |
 | Total Rows Inserted / Updated / Deleted / Fetched / Returned | rows | Cumulative row activity |
-| Rows … Per Sec | rows/s | The same, per second |
+| Rows Inserted / Updated / Deleted / Fetched / Returned Per Sec | rows/s | The same, per second |
 | Total Block Reads, Total Block Hits | blocks | Blocks read from disk / found in shared buffers |
 | Block Reads Per Sec | blocks/s | Disk block reads per second |
 | Total Temp Files, Total Temp Data | files, MB | Temporary files written by queries |
 | Temp Data Per Sec | MB/s | Temporary data written per second |
-| Index Scans | scans | User-index scans in `db` |
-| Sequential Scans | scans | Sequential scans of user tables in `db` |
+| Index Scans, Sequential Scans | scans | Index and sequential scans of user tables in `db` |
 | Index Scans Per Sec, Sequential Scans Per Sec | scans/s | The same, per second |
 | Index Hit Percent | % | User-index cache hit percentage in `db` |
 | Total Database Size | MB | Size of all databases the user may connect to |
-| Checksum Failures, New Checksum Failures | failures | Data checksum failures (12+) |
+| Checksum Failures, New Checksum Failures | failures | Data checksum failures (PostgreSQL 12+) |
 | **BG Writer** | | |
 | Checkpoints Timed, Checkpoints Req | checkpoints | Scheduled and requested checkpoints |
 | Checkpoint Write Time, Checkpoint Sync Time | ms | Time spent writing and syncing checkpoint files |
 | Buffers Checkpoint, Buffers Clean, Buffers Alloc | buffers | Buffers written by checkpoints / by the background writer; buffers allocated |
 | Maxwritten Clean | times | Background writer stopped for writing too many buffers |
-| Buffers Backend, Buffers Backend Fsync | buffers, fsyncs | Written directly by backends (up to 16; removed in 17) |
+| Buffers Backend, Buffers Backend Fsync | buffers, fsyncs | Written directly by backends (up to PostgreSQL 16) |
 | New Requested Checkpoints | checkpoints | Requested checkpoints since the previous poll |
 | **Vacuum and Wraparound** | | |
 | Dead Tuples, Live Tuples | rows | In user tables of `db` |
@@ -230,43 +219,82 @@ For the same reason, a few metrics are sent with a safe stand-in value until the
 | XID Wraparound Percent | % | Max XID Age relative to `autovacuum_freeze_max_age` |
 | **WAL and Archiving** | | |
 | WAL Written, WAL Generated Per Sec | MB, MB/s | WAL position and rate (primary) |
-| WAL Buffers Full, New WAL Buffers Full | times | WAL buffer exhaustion (14+) |
+| WAL Buffers Full, New WAL Buffers Full | times | WAL buffer exhaustion (PostgreSQL 14+) |
 | WAL Files, WAL Directory Size | files, MB | Contents of `pg_wal` |
-| Archived Count, Archive Failed Count, New Archive Failures | files | Archiver results (when `archive_mode` is on) |
+| Archived Count, Archive Failed Count, New Archive Failures | files | Archiver results |
 | Last Archive Age | s | Time since the last successful archive |
 | Archiving Failing | flag | 1 if the last archive attempt failed |
-| Archive Ready Files | files | WAL files waiting to be archived (12+) |
+| Archive Ready Files | files | WAL files waiting to be archived (PostgreSQL 12+) |
 | **Replication** | | |
-| WAL Receiver Connected | flag | Standby: 1 if streaming from its upstream |
-| Replay Lag | s | Standby: how far replay is behind (0 when fully caught up) |
+| WAL Receiver Connected | flag | Standby: 1 if streaming from its primary |
+| Replay Lag | s | Standby: how far replay is behind (0 when caught up) |
 | Replay Backlog | MB | Standby: WAL received but not yet replayed |
-| Last WAL Message Age | s | Standby: time since the last message from the upstream |
-| Replication Slots, Inactive Replication Slots | slots | Slots on this node. Patroni and similar managers keep idle slots on standbys on purpose, so alert on inactive slots on the primary. |
+| Last WAL Message Age | s | Standby: time since the last message from its primary |
+| Replication Slots, Inactive Replication Slots | slots | Slots on this node. Patroni keeps idle slots on standbys on purpose, so alert on inactive slots on the primary. |
 | Max Slot Retained WAL | MB | Largest WAL volume held back by a slot |
-| Subscriptions, Active Subscriptions | subscriptions | Logical subscriptions and those with a running worker |
+| Subscriptions, Active Subscriptions | subscriptions | Logical subscriptions, and those with a running worker |
 | Last Subscription Message Age | s | Time since the last message from a publisher |
-| Subscription Apply Errors, Subscription Sync Errors | errors | Logical replication errors (15+) |
-| Max Standby Replay Lag, Max Standby Backlog | s, MB | Worst standby across the cluster |
+| Subscription Apply Errors, Subscription Sync Errors | errors | Logical replication errors (PostgreSQL 15+) |
+| Max Standby Replay Lag, Max Standby Backlog | s, MB | Worst standby in the cluster |
 | **Cluster** | | |
 | Timeline | timeline | Current timeline; increases at every promotion |
 | Cluster Type | text | `standalone`, `streaming`, `patroni`, `repmgr`, `pg_auto_failover`, `citus`, `pgpool`, `logical`, `pglogical`, `spock`, `bdr` |
 | Health Code, Health Reason | code, text | See Health |
 | Primary Node | text | Current primary |
 | Nodes Total, Nodes Down | nodes | Known nodes, and those down or not streaming |
-| Standbys Streaming, Sync Standbys | nodes | From the primary's view (`quorum` counts as synchronous) |
-| Last Failover Age, Failovers 24h | s, count | From promotions this monitor has observed |
+| Standbys Streaming, Sync Standbys | nodes | Standbys streaming from the primary, and how many are synchronous |
+| Last Failover Age, Failovers 24h | s, count | Time since the last failover this monitor saw; failovers in the last 24 hours |
 | **Plugin** | | |
 | Collection Time | ms | Time taken by this poll |
-| Failed Queries | queries | Queries that failed this poll, for example on a timeout (their metrics are left out) |
-| Permission Gaps | queries | Queries this user is not allowed to run (grant `pg_monitor` to close them) |
+| Failed Queries | queries | Queries that failed this poll, for example on a timeout |
+| Permission Gaps | queries | Queries this user isn't allowed to run (grant `pg_monitor` to include them) |
+
+A few metrics have no value until their event first happens, for example Last Archive Age before the first archive. Until then they show a safe stand-in, so that every metric gets a chart from the first poll: 0 for "lower is better" ages, 100 % for Index Hit Percent with no reads, and the time since monitoring began for Last Failover Age.
+
+## Transactions and Sessions per Database
+
+Table `Transactions_and_Sessions_per_Database`, one row per database:
+
+| **Column** | **Description** |
+| :--- | :--- |
+| commits, rollbacks | Transactions committed and rolled back |
+| conflicts | Queries cancelled by recovery conflicts |
+| sessions, sessions_abandoned, sessions_fatal, sessions_killed | Session counts (PostgreSQL 14+) |
+| session_time, sessions_active_time, session_idle_in_transaction_time | Time spent in sessions (ms, PostgreSQL 14+) |
+
+## Stats per Database
+
+Table `Stats_per_DB`, one row per database:
+
+| **Column** | **Description** |
+| :--- | :--- |
+| active_connections | Connections to the database |
+| size_in_mb | Database size |
+| rows_inserted, rows_updated, rows_deleted, rows_fetched, rows_returned | Row activity |
+| block_reads, block_hits | Blocks read from disk / found in shared buffers |
+| cache_hit_percent | Buffer cache hit percentage |
+| deadlocks, temp_files | Deadlocks and temporary files |
+
+## Other tables
+
+| **Table** | **Rows** | **Columns** |
+| :--- | :--- | :--- |
+| `Wait_Events` | wait event | active sessions waiting on it |
+| `Replication_Slots` | slots | type, active, retained WAL, WAL status; catalog_xmin age and spill size (PostgreSQL 14+) |
+| `Top_Queries` | top 10 by total time | calls, total and mean time, rows, query text (only when `pg_stat_statements` is installed in `db`) |
+| `Nodes` | cluster nodes | role, state, status, reachable, replay lag, backlog, timeline, connection %, uptime, longest query, last message age, last seen |
+| `Replication_Links` | standbys / subscribers | state, sync state, address, sent/write/flush/replay lag |
+| `Events` | last 25 cluster events | event (`promoted`, `demoted`, `down`, `recovered`, `joined`, `removed`), node, old and new role, age |
+
+Every table holds at most 25 rows. In `Nodes`, down nodes are listed first.
 
 ## Changes from version 1
 
-- Numbers are reported as numbers, not strings.
-- When there are no user tables, metrics are left out instead of reported as the text `None` or a false `0`.
-- `Active Queries` counts client sessions only. Version 1 also counted background processes.
-- `Locks Count` excludes the plugin's own session. Version 1 counted the locks of its own open transaction.
-- `template0` and `template1` are no longer listed as databases.
-- The table `Tranasctions_and_Session_per_Database` is renamed `Transactions_and_Sessions_per_Database`, fixing the spelling.
+- Cluster monitoring, and the `Nodes`, `Replication_Links`, `Events`, `Wait_Events`, `Replication_Slots` and `Top_Queries` tables, are new.
+- The required role is `pg_monitor` (version 1 used `pg_read_all_stats`).
+- The table `Tranasctions_and_Session_per_Database` is renamed `Transactions_and_Sessions_per_Database`.
 - Dropped, because newer metrics cover them: Cache Hit Ratio (use Buffer Cache Hit Percent), Heap Blocks Read/Hit (use Total Block Reads/Hits), Index Rows Read/Fetched (use Index Scans).
-- Cluster support, the metrics listed above, and the `Nodes`, `Replication_Links`, `Events`, `Wait_Events`, `Replication_Slots` and `Top_Queries` tables are new.
+- Numbers are sent as numbers, not as text.
+- `Active Queries` counts client sessions only; version 1 also counted background processes.
+- `Locks Count` no longer counts the plugin's own locks.
+- `template0` and `template1` are no longer listed as databases.
