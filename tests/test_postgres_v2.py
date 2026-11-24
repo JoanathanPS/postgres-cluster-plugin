@@ -11,8 +11,9 @@ sys.path.insert(0, os.path.join(ROOT, "postgres"))
 
 import postgres as pg  # noqa: E402
 
-# Metric names emitted by the version 1 plugin (reference/postgres/postgres.py).
-# Version 2 must keep every one that the server version supports.
+# Version 1 metric names that version 2 still sends (reference/postgres/postgres.py).
+# v1-only metrics already covered by newer ones were dropped on purpose: the backend
+# migrates old charts, so they are not carried (see V1_DROPPED).
 V1_METRICS = [
     "Table Count", "Active Queries", "Active Waiting Queries", "Transactions Open",
     "Transactions Idle In Transaction", "Active Connections", "Total Commits",
@@ -21,24 +22,28 @@ V1_METRICS = [
     "Maxwritten Clean", "Buffers Alloc", "Locks Count", "Max Connections",
     "Total Rows Inserted", "Total Rows Updated", "Total Rows Deleted", "Total Rows Fetched",
     "Total Rows Returned", "Total Block Reads", "Total Block Hits", "Index Scans",
-    "Index Rows Read", "Index Rows Fetched", "Server Version", "Uptime", "Database Count",
+    "Server Version", "Uptime", "Database Count",
     "Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal",
-    "Total Sessions Killed", "Heap Blocks Read", "Heap Blocks Hit", "Cache Hit Ratio",
+    "Total Sessions Killed",
 ]
+V1_DROPPED = ["Index Rows Read", "Index Rows Fetched", "Heap Blocks Read", "Heap Blocks Hit",
+              "Cache Hit Ratio"]
 V1_METRICS_BEFORE_17 = ["Buffers Backend", "Buffers Backend Fsync"]
 
 
 class CatalogueTests(unittest.TestCase):
 
-    def test_every_v1_metric_is_in_the_catalogue(self):
+    def test_kept_v1_metrics_are_in_the_catalogue(self):
         names = {m.name for m in pg.all_metric_defs()}
         for name in V1_METRICS + V1_METRICS_BEFORE_17:
             self.assertIn(name, names)
+        for name in V1_DROPPED:
+            self.assertNotIn(name, names)
 
-    def test_v1_table_names_are_kept(self):
+    def test_table_names(self):
         names = {t.name for t in pg.TABLES}
         self.assertIn("Stats_per_DB", names)
-        self.assertIn("Tranasctions_and_Session_per_Database", names)
+        self.assertIn("Transactions_and_Sessions_per_Database", names)   # v1's typo fixed
 
     def test_catalogue_fits_platform_limits(self):
         self.assertLessEqual(len(pg.all_metric_defs()), pg.MAX_METRICS)
@@ -249,7 +254,7 @@ class RunTests(unittest.TestCase):
                      "Replay Lag", "Replay Backlog", "WAL Receiver Connected"):
             self.assertEqual(out[name], 0, name)
         self.assertEqual(out["Last Archive Age"], 0)     # pre-declared (TL decision)
-        self.assertEqual(out["Cache Hit Ratio"], 1.0)     # no reads: no misses, not 0 % hits
+        self.assertEqual(out["Index Hit Percent"], 1.0)   # fake server: real value, not the stand-in
 
 
 class TruthfulZeroTests(unittest.TestCase):
@@ -500,3 +505,43 @@ class EventsLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PatroniHttpTests(unittest.TestCase):
+    """fetch_json against a real local HTTP server."""
+
+    def serve(self, need_auth=None):
+        import http.server, threading, json as _json
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if need_auth and self.headers.get("Authorization") != need_auth:
+                    self.send_response(401); self.end_headers(); return
+                body = _json.dumps({"members": [{"name": "n1"}]}).encode()
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def test_plain_http(self):
+        port = self.serve()
+        self.assertEqual(pg.fetch_json("127.0.0.1", port, "/cluster")["members"][0]["name"], "n1")
+
+    def test_basic_auth_header_is_sent(self):
+        import base64
+        port = self.serve(need_auth="Basic " + base64.b64encode(b"mon:secret").decode())
+        self.assertIsNone(pg.fetch_json("127.0.0.1", port, "/cluster"))      # refused without it
+        out = pg.fetch_json("127.0.0.1", port, "/cluster", username="mon", password="secret")
+        self.assertEqual(out["members"][0]["name"], "n1")
+
+    def test_bad_client_cert_path_fails_softly(self):
+        self.assertIsNone(pg.fetch_json("127.0.0.1", 1, "/cluster", scheme="https",
+                                        certfile="/no/such/cert.pem"))
+
+    def test_options_reach_the_args(self):
+        a = pg.resolve_args({"patroni_cafile": "/etc/ca.pem", "patroni_username": "mon",
+                             "patroni_password": '"secret"'})
+        self.assertEqual((a["patroni_cafile"], a["patroni_username"], a["patroni_password"]),
+                         ("/etc/ca.pem", "mon", "secret"))

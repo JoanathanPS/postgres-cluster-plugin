@@ -271,32 +271,22 @@ QUERIES = [
     Query("table_stats", [Variant((9, 6),
         # with no user tables these counts are truly 0, so they are coalesced
         "SELECT (SELECT coalesce(sum(idx_scan), 0) FROM pg_stat_user_indexes),"
-        " (SELECT coalesce(sum(idx_tup_read), 0) FROM pg_stat_user_indexes),"
-        " (SELECT coalesce(sum(idx_tup_fetch), 0) FROM pg_stat_user_indexes),"
         " coalesce(sum(seq_scan), 0), coalesce(sum(n_dead_tup), 0), coalesce(sum(n_live_tup), 0),"
         " count(*) FILTER (WHERE coalesce(last_vacuum, last_autovacuum) IS NULL AND n_live_tup > 0),"
         " floor(extract(epoch FROM now() - min(greatest(last_vacuum, last_autovacuum))))::bigint"
         " FROM pg_stat_user_tables",
         [M("Index Scans", "scans", "DB and IO stats"),
-         M("Index Rows Read", "rows", "DB and IO stats"),
-         M("Index Rows Fetched", "rows", "DB and IO stats"),
          M("Sequential Scans", "scans", "DB and IO stats"),
          M("Dead Tuples", "rows", "Vacuum and Wraparound"),
          M("Live Tuples", "rows", "Vacuum and Wraparound"),
          M("Tables Never Vacuumed", "tables", "Vacuum and Wraparound"),
          M("Oldest Table Vacuum Age", "s", "Vacuum and Wraparound")])]),
 
-    Query("heap", [Variant((9, 6),
-        "SELECT coalesce(sum(heap_blks_read), 0), coalesce(sum(heap_blks_hit), 0),"
-        " CASE WHEN coalesce(sum(heap_blks_hit) + sum(heap_blks_read), 0) = 0 THEN NULL"
-        " ELSE round(sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)), 4) END,"
-        " CASE WHEN coalesce(sum(idx_blks_hit) + sum(idx_blks_read), 0) = 0 THEN NULL"
+    Query("index_hit", [Variant((9, 6),
+        "SELECT CASE WHEN coalesce(sum(idx_blks_hit) + sum(idx_blks_read), 0) = 0 THEN NULL"
         " ELSE round(100.0 * sum(idx_blks_hit) / (sum(idx_blks_hit) + sum(idx_blks_read)), 2) END"
         " FROM pg_statio_user_tables",
-        [M("Heap Blocks Read", "blocks", "DB and IO stats"),
-         M("Heap Blocks Hit", "blocks", "DB and IO stats"),
-         M("Cache Hit Ratio", "ratio", "DB and IO stats", float),
-         M("Index Hit Percent", "%", "DB and IO stats", float)])]),
+        [M("Index Hit Percent", "%", "DB and IO stats", float)])]),
 
     Query("wraparound", [Variant((9, 6),
         "SELECT max(age(datfrozenxid)), max(mxid_age(datminmxid)),"
@@ -529,7 +519,7 @@ TABLES = [
          "rows_returned": "rows", "block_reads": "blocks", "block_hits": "blocks",
          "cache_hit_percent": "%", "deadlocks": "deadlocks", "temp_files": "files"}),
 
-    Table("Tranasctions_and_Session_per_Database", "Transactions and Sessions", [
+    Table("Transactions_and_Sessions_per_Database", "Transactions and Sessions", [
         ((14, 0),
          "SELECT datname AS name, xact_commit AS commits, xact_rollback AS rollbacks,"
          " conflicts, sessions, sessions_abandoned, sessions_fatal, sessions_killed,"
@@ -601,8 +591,8 @@ TABLES = [
         when=lambda node: node.settings.get("pg_stat_statements")),
 ]
 
-# Tables kept for continuity with version 1 monitors.
-CHILD_DISCOVERY = ["Tranasctions_and_Session_per_Database", "Stats_per_DB"]
+# Per-database tables Site24x7 discovers as child items (as in version 1).
+CHILD_DISCOVERY = ["Transactions_and_Sessions_per_Database", "Stats_per_DB"]
 
 
 def all_metric_defs():
@@ -999,7 +989,7 @@ def truthful_zeros(node, metrics):
     # and hit ratios with no reads are 100 % (no misses), never a fake 0 % hit rate.
     zeros.update({"Last Archive Age": 0, "Last Subscription Message Age": 0,
                   "Last WAL Message Age": 0, "Oldest Table Vacuum Age": 0,
-                  "Cache Hit Ratio": 1.0, "Index Hit Percent": 100.0})
+                  "Index Hit Percent": 100.0})
     return {k: v for k, v in zeros.items() if k not in metrics}
 
 
@@ -1178,20 +1168,32 @@ def metadata_node(seed, ctx, dbname):
     return node, node is not None
 
 
-def fetch_json(host, port, path, scheme="http", verify=True, timeout=PROBE_TIMEOUT_S):
+def fetch_json(host, port, path, scheme="http", verify=True, timeout=PROBE_TIMEOUT_S,
+               cafile="", certfile="", keyfile="", username="", password=""):
     """GET a JSON document from a cluster manager's REST API (Patroni).
-    HTTPS certificates are verified unless the user explicitly turned that off."""
+
+    HTTPS certificates are verified (against `cafile` if given) unless the user
+    explicitly turned that off. `certfile`/`keyfile` present a client certificate,
+    for Patroni's `verify_client: required`. `username`/`password` send basic auth,
+    for a proxy in front of the API; Patroni itself never asks for it on reads."""
+    import base64
     import ssl
     import urllib.request
     context = None
-    if scheme == "https":
-        context = ssl.create_default_context()
-        if not verify:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
     try:
+        if scheme == "https":   # inside the try: a bad cert path falls back to SQL discovery
+            context = ssl.create_default_context(cafile=cafile or None)
+            if not verify:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            if certfile:
+                context.load_cert_chain(certfile, keyfile or None)
         url = "%s://%s:%s%s" % (scheme, host, port, path)
-        with urllib.request.urlopen(url, timeout=timeout, context=context) as resp:
+        request = urllib.request.Request(url)
+        if username:
+            token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
+            request.add_header("Authorization", "Basic " + token)
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -1239,8 +1241,14 @@ class PatroniAdapter(object):
         if not port:
             return False
         host, rport = map_address(seed.host, port, ctx["address_map"])
-        ctx["patroni"] = fetch_json(host, rport, "/cluster", ctx["args"].get("patroni_scheme", "http"),
-                                    ctx["args"].get("patroni_verify", True))
+        a = ctx["args"]
+        ctx["patroni"] = fetch_json(host, rport, "/cluster", a.get("patroni_scheme", "http"),
+                                    a.get("patroni_verify", True),
+                                    cafile=a.get("patroni_cafile", ""),
+                                    certfile=a.get("patroni_certfile", ""),
+                                    keyfile=a.get("patroni_keyfile", ""),
+                                    username=a.get("patroni_username", ""),
+                                    password=a.get("patroni_password", ""))
         return bool(ctx["patroni"] and ctx["patroni"].get("members"))
 
     def nodes(self, seed, ctx):
@@ -1965,6 +1973,11 @@ def resolve_args(param):
         "patroni_port": patroni_port if 0 < patroni_port < 65536 else 0,
         "patroni_scheme": "https" if str(p.get("patroni_scheme") or "").lower() == "https" else "http",
         "patroni_verify": parse_bool(p.get("patroni_verify"), True),
+        "patroni_cafile": p.get("patroni_cafile") or "",
+        "patroni_certfile": p.get("patroni_certfile") or "",
+        "patroni_keyfile": p.get("patroni_keyfile") or "",
+        "patroni_username": p.get("patroni_username") or "",
+        "patroni_password": "" if (p.get("patroni_password") or "") == "None" else (p.get("patroni_password") or ""),
         "logs_enabled": parse_bool(p.get("logs_enabled"), False),
         "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
         "log_file_path": p.get("log_file_path") or "",
@@ -2153,6 +2166,9 @@ def parse_cli(argv=None):
     parser.add_argument("--patroni_port", default="")
     parser.add_argument("--patroni_scheme", default="http")
     parser.add_argument("--patroni_verify", default="true")
+    for opt in ("patroni_cafile", "patroni_certfile", "patroni_keyfile",
+                "patroni_username", "patroni_password"):
+        parser.add_argument("--" + opt, default="")
     parser.add_argument("--logs_enabled", default="false")
     parser.add_argument("--log_type_name", default="")
     parser.add_argument("--log_file_path", default="")

@@ -2,7 +2,7 @@
 
 Monitors a PostgreSQL server and, when it is part of a cluster, every node of that cluster from a single address.
 
-Version 2 replaces version 1. The configuration keys are unchanged, and every metric and child table that version 1 reported is still reported under the same name.
+Version 2 replaces version 1. The configuration keys are unchanged, and most version 1 metrics keep their names. The few that newer metrics cover were dropped, and one table was renamed. See [Changes from version 1](#changes-from-version-1).
 
 ## What it monitors
 
@@ -112,6 +112,9 @@ Each section is one monitor. Add more sections (`[postgres-db2]`) to monitor mor
 | `patroni_port` | — | Patroni REST API port (usually `8008`). Patroni is used only when this is set. |
 | `patroni_scheme` | `http` | `https` if the Patroni REST API uses TLS. The certificate is verified. |
 | `patroni_verify` | `true` | Set to `false` only for a self-signed Patroni certificate. |
+| `patroni_cafile` | — | CA certificate to verify Patroni's HTTPS certificate against (for example the cluster's own CA on Kubernetes). Safer than `patroni_verify=false`. |
+| `patroni_certfile`, `patroni_keyfile` | — | Client certificate and key, for Patroni configured with `verify_client: required`. |
+| `patroni_username`, `patroni_password` | — | Basic auth for a proxy in front of the Patroni API. Patroni itself does not ask for a password on the read the plugin uses. The agent encrypts the password. |
 | `address_map` | — | Only needed when the addresses the cluster reports are not reachable from the agent (NAT, containers). Example: `10.0.0.5:5432=192.168.1.5:6432,pg-node2=192.168.1.6`. |
 | `logs_enabled` | `false` | Write cluster events (failovers, nodes down and recovered) to a log file in the plugin folder and send it to Site24x7 AppLogs. |
 | `log_type_name` | `PostgreSQL Cluster Events` | AppLogs log type. |
@@ -140,7 +143,7 @@ A node that disappears stays in the `Nodes` table as down or not streaming for 2
 | Table | Rows | Columns |
 | :--- | :--- | :--- |
 | `Stats_per_DB` | databases | connections, size, rows inserted/updated/deleted/fetched/returned, block reads and hits, cache hit %, deadlocks, temp files |
-| `Tranasctions_and_Session_per_Database` | databases | commits, rollbacks, conflicts; session counts and times on PostgreSQL 14+. The name is kept from version 1. |
+| `Transactions_and_Sessions_per_Database` | databases | commits, rollbacks, conflicts; session counts and times on PostgreSQL 14+ |
 | `Wait_Events` | wait event | active sessions waiting on it |
 | `Replication_Slots` | slots | type, active, retained WAL, WAL status; catalog_xmin age and spill size on 14+ |
 | `Top_Queries` | top 10 by total time | calls, total and mean time, rows, query text (only when `pg_stat_statements` is installed in `db`) |
@@ -154,7 +157,7 @@ Every table is capped at 25 rows. In `Nodes`, down nodes are listed first so a f
 
 Rates (`... Per Sec`) and per-poll deltas (`New ...`) are measured between polls. On a monitor's first poll there is no previous poll yet, so the plugin reads the counters twice, 5 seconds apart, and reports that measurement. This adds 5 seconds to the first poll only.
 
-Where 0 is the true value, 0 is sent. Examples: archive counts when archiving is off, replay lag on a primary, WAL generated on a standby. A metric with no honest value on a given server is left out, never reported as 0. Examples: Last Archive Age when nothing has been archived, Cache Hit Ratio when there are no tables.
+Where 0 is the true value, 0 is sent. Examples: archive counts when archiving is off, replay lag on a primary, WAL generated on a standby. A metric with no honest value on a given server is left out, never reported as 0. Examples: Last Archive Age when nothing has been archived, Index Hit Percent when there are no indexes.
 
 This matters because Site24x7 builds the monitor template only from metrics that have a value when a monitor first registers.
 
@@ -163,7 +166,7 @@ For the same reason, a few metrics are sent with a safe stand-in value until the
 | Metric | Stand-in | Meaning |
 | :--- | :--- | :--- |
 | Last Archive Age, Last WAL Message Age, Last Subscription Message Age, Oldest Table Vacuum Age | 0 | Nothing pending. These are "lower is better", so 0 never raises an alert. |
-| Cache Hit Ratio, Index Hit Percent | 1.0 / 100 % | No reads yet, so no misses. Never a false 0 % hit rate. |
+| Index Hit Percent | 100 % | No reads yet, so no misses. Never a false 0 % hit rate. |
 | Last Failover Age | seconds since monitoring began | No failover for at least that long. Never 0, which would read as "just failed over". |
 | WAL Written (standby) | 0 | A standby writes no WAL of its own. It is not used for rates, so a later promotion doesn't show a fake spike. |
 
@@ -206,11 +209,9 @@ For the same reason, a few metrics are sent with a safe stand-in value until the
 | Block Reads Per Sec | blocks/s | Disk block reads per second |
 | Total Temp Files, Total Temp Data | files, MB | Temporary files written by queries |
 | Temp Data Per Sec | MB/s | Temporary data written per second |
-| Index Scans, Index Rows Read, Index Rows Fetched | count | User-index activity in `db` |
+| Index Scans | scans | User-index scans in `db` |
 | Sequential Scans | scans | Sequential scans of user tables in `db` |
 | Index Scans Per Sec, Sequential Scans Per Sec | scans/s | The same, per second |
-| Heap Blocks Read, Heap Blocks Hit | blocks | User-table block I/O in `db` |
-| Cache Hit Ratio | ratio | User-table cache hit ratio in `db`, 0–1 (as in version 1) |
 | Index Hit Percent | % | User-index cache hit percentage in `db` |
 | Total Database Size | MB | Size of all databases the user may connect to |
 | Checksum Failures, New Checksum Failures | failures | Data checksum failures (12+) |
@@ -266,4 +267,6 @@ For the same reason, a few metrics are sent with a safe stand-in value until the
 - `Active Queries` counts client sessions only. Version 1 also counted background processes.
 - `Locks Count` excludes the plugin's own session. Version 1 counted the locks of its own open transaction.
 - `template0` and `template1` are no longer listed as databases.
+- The table `Tranasctions_and_Session_per_Database` is renamed `Transactions_and_Sessions_per_Database`, fixing the spelling.
+- Dropped, because newer metrics cover them: Cache Hit Ratio (use Buffer Cache Hit Percent), Heap Blocks Read/Hit (use Total Block Reads/Hits), Index Rows Read/Fetched (use Index Scans).
 - Cluster support, the metrics listed above, and the `Nodes`, `Replication_Links`, `Events`, `Wait_Events`, `Replication_Slots` and `Top_Queries` tables are new.

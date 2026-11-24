@@ -13,9 +13,10 @@
 
 2. **Minimums → TL: "whatever works."** PostgreSQL 9.6+ and Python 3.6+ stay.
 
-3. **Old metric names → TL: keep both, the old metrics plus the new ones.**
-   - **v2 already does this.** Every v1 name is still sent exactly as before ("Total Commits", "Checkpoints Req", the misspelled `Tranasctions_and_Session_per_Database`, and the rest), and the new metrics are added next to them. Existing alerts and charts keep working.
-   - **Nothing to change**, unless he meant also sending a cleaned-up copy of each old name. Confirm with him.
+3. **Old metric names → TL: old charts are migrated in the backend, so don't carry v1 baggage. Done.**
+   - **Dropped (newer metrics cover them):** Cache Hit Ratio, Heap Blocks Read/Hit, Index Rows Read/Fetched.
+   - **Renamed:** the misspelled table `Tranasctions_and_Session_per_Database` is now `Transactions_and_Sessions_per_Database`.
+   - **For the backend migration:** the README's "Changes from version 1" lists every rename and drop with its replacement.
 
 4. **Default thresholds → TL: "customers do that, a plugin can't."**
    - **Confirmed by Site24x7's plugin docs:** thresholds are set per monitor in the console ("Threshold and Availability"). A plugin cannot ship threshold profiles.
@@ -23,22 +24,44 @@
 
 ## Patroni REST API (research done)
 
-From Patroni's documentation (4.1.5) and the main distributions:
+### What Patroni's REST API is, and why the plugin uses it
+- **What it is:** every Patroni node runs a small web server, port 8008 by default, that answers questions about the cluster. `GET /cluster` returns every member: its name, host, port, role (leader/replica), state (running, streaming, stopped…), timeline and lag.
+- **Why the plugin uses it:** it's the only source that also lists **stopped** members. SQL discovery (`pg_stat_replication`) only sees standbys that are currently connected, so a dead standby simply vanishes from it. Patroni still lists it as "stopped".
+- **When it's used:** only if the customer sets `patroni_port` in the cfg. Without it, the plugin uses SQL discovery, which works for every cluster, Patroni included.
+- **What the plugin does with it:** one read-only `GET /cluster` per poll, with a 3 s timeout. It never calls an endpoint that changes anything (switchover, restart, reinitialize).
+- **Roles still come from PostgreSQL:** Patroni's answer says which nodes exist. Each node's role is then checked with `pg_is_in_recovery()`. If Patroni and PostgreSQL disagree, that's Health Code 4.
 
-| Setup | What it means for us |
-| :--- | :--- |
-| Username/password (`restapi.authentication`) | **Only protects the endpoints that change things** (switchover, restart). The read we use, `GET /cluster`, needs no password. We don't need username/password support. |
-| TLS (`certfile`) | The API becomes HTTPS. **Supported** (`patroni_scheme=https`). |
-| Self-signed certificate | **Supported** (`patroni_verify=false`). |
-| Client certificate, `verify_client: optional` | Only demanded on the changing endpoints, so reads still work. |
-| Client certificate, `verify_client: required` | Demanded on **every** call, which blocks our read. **Not supported yet.** The plugin then falls back to SQL discovery: it still works, but stopped members aren't seen. |
+### How Patroni can be secured, and what each option means for us
+Patroni has three security settings for its REST API (Patroni docs 4.1.5, the `restapi` section):
 
-**What real deployments use:**
-- **Plain VM installs (Patroni docs, tutorials):** HTTP.
-- **Crunchy PGO (Kubernetes operator):** HTTPS, `verify_client: optional`. Works.
-- **Zalando Spilo (Kubernetes):** HTTPS, generating a self-signed certificate if none is given. Works with `patroni_verify=false`.
+| Setting | What it does | Effect on the plugin | Supported? |
+| :--- | :--- | :--- | :--- |
+| `restapi.authentication` (username/password) | Asks for a password, but **only on endpoints that change something** (switchover, restart, reload). Read-only calls such as `GET /cluster` stay open. | None. Our read needs no password. | Not needed |
+| `restapi.certfile` / `keyfile` (TLS) | The API becomes **HTTPS**. | We must call `https://` and verify the certificate. | Yes: `patroni_scheme=https` |
+| Self-signed certificate | HTTPS with a certificate no public authority signed. | Verification fails unless it's switched off or the cluster's own CA is given. | Yes: `patroni_verify=false` |
+| `verify_client: optional` | Asks callers for a client certificate, but only on the changing endpoints. | None. Reads still work. | Works |
+| `verify_client: required` | Demands a client certificate on **every** call, reads included. | Our `GET /cluster` is refused. | **Not yet** |
 
-**Suggest:** what's there now covers all three. Add client-certificate options (`patroni_certfile`, `patroni_keyfile`) only if a customer runs `verify_client: required`. A `patroni_cafile` option (verify against the cluster's own CA instead of switching verification off) is small and worth adding.
+**What happens when Patroni refuses us** (the `required` case, or a wrong scheme or port): the plugin doesn't fail. It falls back to SQL discovery and keeps working. The only thing lost is seeing stopped members. Tested by pointing `https` at an HTTP-only API: it fell back to streaming discovery, and the monitor stayed up.
+
+### What real deployments use
+
+| Deployment | How its REST API is set up | Works with v2? |
+| :--- | :--- | :--- |
+| Plain VM install (Patroni docs, most tutorials) | HTTP, no client certificate | Yes |
+| Crunchy PGO (Kubernetes operator) | HTTPS, `verify_client: optional` | Yes, with `patroni_scheme=https` |
+| Zalando Spilo / Postgres Operator (Kubernetes) | HTTPS, self-signed if no certificate is given | Yes, with `patroni_scheme=https` + `patroni_verify=false` |
+| Hardened setups with `verify_client: required` | HTTPS plus a mandatory client certificate | Falls back to SQL (stopped members not seen) |
+
+### Added "just in case" (built and tested, all optional and off by default)
+- **`patroni_cafile`:** verifies Patroni's certificate against the cluster's own CA. Safer than switching verification off.
+- **`patroni_certfile` / `patroni_keyfile`:** a client certificate, for Patroni with `verify_client: required`. This closes the one unsupported case in the table above.
+- **`patroni_username` / `patroni_password`:** basic auth, for a proxy or ingress in front of the API. The agent encrypts the password.
+- **Tested** against a real local HTTP server: the password header is sent, and a refused or misconfigured call falls back to SQL discovery instead of failing.
+
+*If he asks about Patroni passwords:* Patroni only asks for its password on endpoints that change something, so the plugin's read doesn't need one.
+
+**Ask:** "Every Patroni security setup is now covered (HTTP, HTTPS, own CA, self-signed, client certificates, a proxy with a password). Is there any setup Zoho customers use that isn't on this list?"
 
 ## Still to ask
 
