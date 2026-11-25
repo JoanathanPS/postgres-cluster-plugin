@@ -214,7 +214,11 @@ class RunTests(unittest.TestCase):
     def test_healthy_poll_is_up_and_valid(self):
         out = self.run_with()
         self.assertEqual(out["status"], 1)
-        self.assertEqual(out["Node Role"], "primary")
+        info = out["Cluster_Info"][0]                    # text values live in this table
+        self.assertEqual(info["node_role"], "primary")
+        self.assertTrue(info["cluster_type"])           # the fake server answers every probe
+        for name in pg.CLUSTER_INFO_TEXT:
+            self.assertNotIn(name, out)
         self.assertEqual(out["Failed Queries"], 0)
         self.assertEqual(pg.validate_output(out), [])
 
@@ -302,9 +306,9 @@ class TruthfulZeroTests(unittest.TestCase):
             self.assertNotIn(name, zeros, name)
         primary = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
         zeros = pg.truthful_zeros(primary, {"Subscriptions": 0, "Tables Never Vacuumed": 0})
-        for name in ("Last WAL Message Age", "Last Archive Age",
-                     "Last Subscription Message Age", "Oldest Table Vacuum Age"):
+        for name in ("Last WAL Message Age", "Last Archive Age", "Oldest Table Vacuum Age"):
             self.assertEqual(zeros[name], 0, name)
+        self.assertNotIn("Last Subscription Message Age", zeros)   # no subscription: not applicable
 
     def test_existing_values_are_never_overwritten(self):
         node = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
@@ -585,3 +589,11 @@ class PatroniHttpTests(unittest.TestCase):
                              "patroni_password": '"secret"'})
         self.assertEqual((a["patroni_cafile"], a["patroni_username"], a["patroni_password"]),
                          ("/etc/ca.pem", "mon", "secret"))
+
+
+class StandaloneNotApplicableTests(unittest.TestCase):
+
+    def test_names_are_real_metrics(self):
+        names = {m.name for m in pg.all_metric_defs()}
+        self.assertEqual(pg.STANDALONE_NOT_APPLICABLE - names, set())
+

@@ -152,6 +152,8 @@ The role of each node is read from PostgreSQL. If a cluster manager reports a di
 
 Metrics are grouped by the tab they appear in. "Per Sec" metrics are averaged over the poll interval, and "New" metrics count what happened since the previous poll.
 
+Metrics that do not apply to a server are not sent and show as "No Data". On a standalone server this covers the cluster and standby metrics: Cluster Health, Nodes Up, Health Code, Nodes Total, Nodes Down, Standbys Streaming, Sync Standbys, Last Failover Age, Failovers 24h, WAL Receiver Connected, Replay Lag, Replay Backlog, Last WAL Message Age, Max Standby Replay Lag and Max Standby Backlog.
+
 ### Summary
 
 | **Metric Name** | **Description** |
@@ -171,14 +173,20 @@ Metrics are grouped by the tab they appear in. "Per Sec" metrics are averaged ov
 
 | **Metric Name** | **Description** |
 | :--- | :--- |
-| Cluster Type | Detected cluster type |
-| Health Code, Health Reason | Cluster status and its cause (see Health Codes) |
-| Primary Node | Current primary node |
+| Health Code | Cluster status (see Health Codes) |
 | Nodes Total, Nodes Down | Number of known nodes, and nodes that are down or not streaming |
 | Standbys Streaming, Sync Standbys | Number of standbys streaming from the primary, and synchronous standbys |
 | Timeline | Current timeline, incremented at each promotion |
 | Last Failover Age | Time since the last failover |
 | Failovers 24h | Number of failovers in the last 24 hours |
+
+The Cluster tab also shows three tables:
+
+| **Table** | **Description** |
+| :--- | :--- |
+| Cluster_Info | Cluster type, primary node, health, the role of the monitored server, and nodes up out of total |
+| Nodes | Role, status and replication lag of each cluster node |
+| Events | Recent failovers and node changes |
 
 ### Replication
 
@@ -200,7 +208,6 @@ Metrics are grouped by the tab they appear in. "Per Sec" metrics are averaged ov
 | **Metric Name** | **Description** |
 | :--- | :--- |
 | Server Version | PostgreSQL version |
-| Node Role | Primary or standby |
 | Max Connections | Maximum number of concurrent connections allowed |
 | Active Queries | Number of client sessions running a query |
 | Active Waiting Queries | Number of active queries waiting on an event |
@@ -298,10 +305,8 @@ Metrics are grouped by the tab they appear in. "Per Sec" metrics are averaged ov
 
 | **Table** | **Description** |
 | :--- | :--- |
-| Nodes | Role, status and replication lag of each cluster node |
 | Replication_Links | Replication state and lag of each standby or subscriber |
 | Replication_Slots | Replication slots and the WAL they retain |
-| Events | Recent failovers and node changes |
 | Wait_Events | Active sessions grouped by wait event |
 | Top_Queries | Top 10 queries by total time, when `pg_stat_statements` is installed |
 

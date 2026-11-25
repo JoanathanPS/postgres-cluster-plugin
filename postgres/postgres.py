@@ -158,6 +158,19 @@ TAB_ORDER = [
 ]
 SUMMARY = ""                      # metrics with no tab chart on the built-in Summary tab
 
+# Text values shown in the Cluster_Info table instead of as metrics.
+CLUSTER_INFO_TEXT = {"Node Role", "Cluster Type", "Health Reason", "Primary Node"}
+
+# Values that only exist in a cluster. On a standalone server they are not sent, so
+# the console shows "No Data" (and "-" under Last Polled): not applicable, never a 0
+# that reads as a measurement or trips a threshold.
+STANDALONE_NOT_APPLICABLE = {
+    "Cluster Health", "Nodes Up", "Health Code", "Nodes Total", "Nodes Down",
+    "Standbys Streaming", "Sync Standbys", "Last Failover Age", "Failovers 24h",
+    "WAL Receiver Connected", "Replay Lag", "Replay Backlog", "Last WAL Message Age",
+    "Max Standby Replay Lag", "Max Standby Backlog",
+}
+
 # Counters that only grow since the server started. The plugin reads them to compute
 # the "Per Sec" and "New ..." metrics, but does not send them: a lifetime total is a
 # rising line, and its rate or per-poll change is what people watch and alert on.
@@ -455,18 +468,14 @@ RATES = [
 
 # Metrics computed in derive_metrics() rather than read from a query.
 DERIVED = [
-    M("Node Role", tab="Activity", kind=str),
     M("Connection Utilization", "%", SUMMARY, float),
     M("Buffer Cache Hit Percent", "%", SUMMARY, float),
     M("Collection Time", "ms", SUMMARY),
     M("Failed Queries", "queries", SUMMARY),
     M("Permission Gaps", "queries", SUMMARY),
     # Cluster layer (built in section 6 from the discovered nodes)
-    M("Cluster Type", tab="Cluster", kind=str),
     M("Cluster Health", "status", SUMMARY),
     M("Health Code", "code", "Cluster"),
-    M("Health Reason", tab="Cluster", kind=str),
-    M("Primary Node", tab="Cluster", kind=str),
     M("Nodes Total", "nodes", "Cluster"),
     M("Nodes Up", "nodes", SUMMARY),
     M("Nodes Down", "nodes", "Cluster"),
@@ -481,6 +490,11 @@ DERIVED = [
 # Child tables built by the cluster layer: name -> (tab, column units). The column
 # order here is the order rows are built in; "" marks a string column.
 CLUSTER_TABLES = {
+    # One row summarising the cluster as text, on the Cluster tab. Site24x7 shows text
+    # values only at the foot of Summary, so they are shown in this table instead.
+    "Cluster_Info": ("Cluster", {
+        "cluster_type": "", "primary_node": "", "health": "", "node_role": "",
+        "health_code": "code", "nodes_up": "nodes", "nodes_total": "nodes"}),
     "Nodes": ("Cluster", {
         "role": "", "state": "", "address": "", "status": "flag", "reachable": "flag",
         "replay_lag_s": "s", "backlog_mb": "MB", "timeline": "timeline",
@@ -612,7 +626,7 @@ def all_metric_defs():
         seen.setdefault(r.name, M(r.name, r.unit, r.tab, float))
     for d in DERIVED:
         seen.setdefault(d.name, d)
-    return [m for m in seen.values() if m.name not in HIDDEN_COUNTERS]
+    return [m for m in seen.values() if m.name not in HIDDEN_COUNTERS | CLUSTER_INFO_TEXT]
 
 
 def build_tabs_and_units():
@@ -989,8 +1003,6 @@ def truthful_zeros(node, metrics):
     else:
         # a standby generates no WAL of its own
         zeros.update({"WAL Generated Per Sec": 0.0, "WAL Written": 0.0})
-    if not metrics.get("Subscriptions"):
-        zeros["Last Subscription Message Age"] = 0      # no subscription, nothing to wait for
     if not metrics.get("Tables Never Vacuumed"):
         zeros["Oldest Table Vacuum Age"] = 0            # no table with rows awaits a first vacuum
     zeros["Index Hit Percent"] = 100.0                  # no index reads: no misses, never a fake 0 %
@@ -1795,6 +1807,19 @@ def event_rows(history, now):
     return rows
 
 
+def cluster_info_rows(metrics):
+    """The one-row Cluster_Info table: what the cluster is and how it is, as text."""
+    row = {"name": "cluster",
+           "cluster_type": metrics.get("Cluster Type") or "-",
+           "primary_node": str(metrics.get("Primary Node") or "-")[:MAX_STRING_CHARS],
+           "health": str(metrics.get("Health Reason") or "-")[:MAX_STRING_CHARS],
+           "node_role": metrics.get("Node Role") or "-",
+           "health_code": metrics.get("Health Code"),
+           "nodes_up": metrics.get("Nodes Up"),
+           "nodes_total": metrics.get("Nodes Total")}
+    return [{k: v for k, v in row.items() if v is not None}]
+
+
 def link_rows(links):
     cols = CLUSTER_TABLES["Replication_Links"][1]
     return [{k: v for k, v in l.items() if (k == "name" or k in cols) and v is not None}
@@ -2141,13 +2166,19 @@ def collect(param):
                              "log_file_path": log_path(args)}
 
     metrics.update(cluster_out)
+    if cluster_out:
+        cluster_tables["Cluster_Info"] = cluster_info_rows(metrics)
     metrics["Failed Queries"] = len(node.failures)
     denied = sorted(set(node.denied))
     metrics["Permission Gaps"] = len(denied)
     metrics["Collection Time"] = int((time.time() - t0) * 1000)
-    payload.update({k: v for k, v in metrics.items() if k not in HIDDEN_COUNTERS})
+    payload.update({k: v for k, v in metrics.items()
+                    if k not in HIDDEN_COUNTERS and k not in CLUSTER_INFO_TEXT})
     payload.update(tables)
     payload.update(cluster_tables)
+    if metrics.get("Cluster Type") == "standalone":
+        for name in STANDALONE_NOT_APPLICABLE:
+            payload.pop(name, None)
     if node.failures:
         payload["msg"] = "%d queries failed: %s" % (len(node.failures), node.failures[0])
     else:
