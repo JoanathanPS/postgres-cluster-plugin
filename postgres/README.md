@@ -72,23 +72,18 @@ wget https://raw.githubusercontent.com/site24x7/plugins/master/postgres/installe
 	username="None"
 	password="None"
 	db="postgres"
+	sslmode="None"
+	patroni_port="None"
+	logs_enabled="false"
 	```
 
-	To monitor a cluster, set `host` to any node, a VIP, a DNS name or an HAProxy port. To monitor more than one server from the same agent, add one section per server.
+	- To monitor a cluster, set `host` to any node, a VIP, a DNS name or an HAProxy port.
+	- For a Patroni cluster, set `patroni_port` to the Patroni REST API port, usually `8008`. Other cluster types need no extra settings.
+	- The plugin uses SSL when the server supports it. To refuse unencrypted connections, set `sslmode` to `require`; to also verify the server's certificate, use `verify-full` with `sslrootcert`.
+	- To send cluster events such as failovers to Site24x7 AppLogs, set `logs_enabled` to `true`.
+	- To monitor more than one server from the same agent, add one section per server.
 
-	Optional settings are added to the same section. For example, a Patroni cluster:
-
-	```ini
-	[postgres_cluster]
-	host="10.0.0.10"
-	port="5432"
-	username="site24x7"
-	password="site24x7"
-	db="postgres"
-	patroni_port=8008
-	```
-
-	All optional settings are listed under [Configuration Options](#configuration-options).
+	All other settings are listed under [Configuration Options](#configuration-options).
 
 #### Linux
 
