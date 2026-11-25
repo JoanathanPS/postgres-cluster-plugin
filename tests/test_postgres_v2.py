@@ -17,9 +17,8 @@ import postgres as pg  # noqa: E402
 V1_METRICS = [
     "Table Count", "Active Queries", "Active Waiting Queries", "Transactions Open",
     "Transactions Idle In Transaction", "Active Connections", "Total Commits",
-    "Total Rollbacks", "Checkpoints Timed",
-    "Checkpoint Write Time", "Checkpoint Sync Time", "Buffers Checkpoint", "Buffers Clean",
-    "Maxwritten Clean", "Buffers Alloc", "Locks Count", "Max Connections",
+    "Total Rollbacks",
+    "Checkpoint Write Time", "Checkpoint Sync Time", "Locks Count", "Max Connections",
     "Total Block Hits", "Server Version", "Uptime", "Database Count",
     "Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal",
     "Total Sessions Killed",
@@ -28,7 +27,9 @@ V1_DROPPED = ["Index Rows Read", "Index Rows Fetched", "Heap Blocks Read", "Heap
               "Cache Hit Ratio", "Total Rows Inserted", "Total Rows Updated",
               "Total Rows Deleted", "Total Rows Fetched", "Total Rows Returned",
               "Total Block Reads", "Index Scans", "Total Conflicts", "Checkpoints Req"]
-V1_METRICS_BEFORE_17 = ["Buffers Backend", "Buffers Backend Fsync"]
+V1_METRICS_BEFORE_17 = []
+# v1 names given plain-English names in v2 (README "Metric changes")
+V1_RENAMED = {'Checkpoints Timed': 'Scheduled Checkpoints', 'Buffers Checkpoint': 'Buffers Written by Checkpoints', 'Buffers Clean': 'Buffers Written by BG Writer', 'Maxwritten Clean': 'BG Writer Stops', 'Buffers Alloc': 'Buffers Allocated', 'Buffers Backend': 'Buffers Written by Backends', 'Buffers Backend Fsync': 'Backend Fsyncs'}
 
 
 class CatalogueTests(unittest.TestCase):
@@ -39,6 +40,9 @@ class CatalogueTests(unittest.TestCase):
             self.assertIn(name, names)
         for name in V1_DROPPED:
             self.assertNotIn(name, names)
+        for old, new in V1_RENAMED.items():
+            self.assertNotIn(old, names)
+            self.assertIn(new, names)
 
     def test_table_names(self):
         names = {t.name for t in pg.TABLES}
