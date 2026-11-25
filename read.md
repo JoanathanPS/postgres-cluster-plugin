@@ -25,6 +25,18 @@ The plugin uses an 8-tab layout: Cluster, Replication, Activity, Transactions an
 
 **Fix:** delete the template, delete the plugin's `.state` folder, then re-add the plugin folder. The README tells users this. Fresh installs, upgrades from version 1 and new servers are not affected.
 
+### Possible fixes (to discuss)
+
+| Option | What it fixes | Cost |
+| :--- | :--- | :--- |
+| **Site24x7 keeps every metric it has seen** instead of replacing the template on each registration, or builds the template from `units` | Both cases, completely, with no stand-ins needed | Needs a change on Site24x7's side. Ask the devs, who earlier offered a server-side workaround. |
+| **Send 0 for every metric on every poll** | Both cases, completely | False values forever: Last Failover Age 0 reads as "just failed over", Nodes Up 0 on a standalone server fires alerts. Rejected earlier. |
+| **Treat the first 10 minutes as registration:** send the full set while the state file is younger than 10 minutes | The agent's retry (the case seen in testing) | A second or third stand-in point. A template deletion is not covered. |
+| **Treat an old state file as a first poll:** if the state wasn't updated for, say, 30 minutes, the monitor was stopped or deleted, so send the full set | A template deleted and registered again later | One stand-in point after any long agent outage. A deletion followed by re-registration within minutes is not covered. |
+| **Find and remove the cause of the agent's timeout** (`pgaf_node` hung for 2 minutes on registration) | Fewer retries | Doesn't remove the risk, only makes it rarer. |
+
+The 10-minute and old-state rules together cover almost every case without false values. A full fix needs Site24x7.
+
 ## Reminder: the first chart point can be a stand-in
 
 A chart's first point can be the registration stand-in rather than a measurement. A "below X" threshold on a metric whose stand-in is 0 (Last Failover Age, Last Archive Age, Nodes Up) can fire once, at registration only.
