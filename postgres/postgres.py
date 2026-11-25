@@ -193,7 +193,7 @@ def _activity_sql(clients):
         " count(*) FILTER (WHERE state = 'idle'),"
         " count(*) FILTER (WHERE state LIKE 'idle in transaction%%'),"
         " count(*) FILTER (WHERE xact_start IS NOT NULL),"
-        " coalesce(max(extract(epoch FROM now() - xact_start)), 0)::bigint,"
+        " max(extract(epoch FROM now() - xact_start))::bigint,"
         " count(*) FILTER (WHERE state = 'active' AND now() - query_start > interval '%d seconds'),"
         " count(*) FILTER (WHERE cardinality(pg_blocking_pids(pid)) > 0)"
         " FROM pg_stat_activity WHERE %s" % (LONG_QUERY_S, clients)
@@ -326,8 +326,8 @@ QUERIES = [
         [M("Total Database Size", "MB", "DB and IO stats", float)])]),
 
     Query("checksums", [Variant((12, 0),
-        # failures detected; 0 when none were (or checksums are off and none can be)
-        "SELECT coalesce(sum(checksum_failures), 0) FROM pg_stat_database",
+        # NULL (left out: "No Data") when data checksums are off and failures can't be detected
+        "SELECT sum(checksum_failures) FROM pg_stat_database",
         [M("Checksum Failures", "failures", "DB and IO stats")])]),
 
     Query("wal_position", [
@@ -1615,7 +1615,7 @@ PROBE_SQL = (
     " round(100.0 * (SELECT count(*) FROM pg_stat_activity WHERE datname IS NOT NULL)"
     " / current_setting('max_connections')::int, 2),"
     " floor(extract(epoch FROM now() - pg_postmaster_start_time()))::bigint,"
-    " (SELECT coalesce(floor(max(extract(epoch FROM now() - xact_start))), 0)::bigint"
+    " (SELECT floor(max(extract(epoch FROM now() - xact_start)))::bigint"
     " FROM pg_stat_activity WHERE datname IS NOT NULL AND pid <> pg_backend_pid()),"
     " (SELECT floor(extract(epoch FROM now() - max(last_msg_receipt_time)))::bigint"
     " FROM pg_stat_wal_receiver),"
