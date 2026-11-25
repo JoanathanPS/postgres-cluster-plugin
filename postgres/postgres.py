@@ -410,8 +410,9 @@ QUERIES = [
     Query("slots", [
         Variant((10, 0),
             "SELECT count(*), count(*) FILTER (WHERE NOT active),"
-            " round(coalesce(max(pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery()"
-            " THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, restart_lsn)), 0)"
+            # no slot: NULL, so Max Slot Retained WAL is left out ("No Data"), not 0
+            " round(max(pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery()"
+            " THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, restart_lsn))"
             " / 1048576.0, 2)"
             " FROM pg_replication_slots",
             [M("Replication Slots", "slots", "Replication"),
