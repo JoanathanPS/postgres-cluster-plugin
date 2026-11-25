@@ -4,7 +4,7 @@ The replacement for the official Site24x7 `postgres` plugin. It monitors a Postg
 
 Start here:
 - **Plugin documentation** (install, configuration, metrics, health codes): [`postgres/README.md`](postgres/README.md)
-- **Current state, test kit and open issues:** [`HANDOFF.md`](HANDOFF.md)
+- **What to know (layout, template, trade-off):** [`read.md`](read.md)
 
 ## Layout
 
