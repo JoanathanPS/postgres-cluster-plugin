@@ -15,6 +15,8 @@
 
 **Verified on 2026-11-25:** 56 unit tests (also under Python 3.6); PostgreSQL 9.6, 10, 11, 12, 13, 14, 15, 16, 17, 18 clean (0 failed queries, 0 permission gaps, 0 violations), 9.5 refused; WAL archiving working / failing / recovered; Index Hit, Longest Transaction and checksum metrics proven both as "No Data" and with real values; final install on both agents (Linux 8 monitors, Windows 6), all up with complete templates.
 
+**Note: our Site24x7 account is not a standard one.** The plugin defines 8 tabs (Cluster, Replication, Activity, Transactions and Sessions, DB and IO stats, Vacuum and Wraparound, WAL and Archiving, BG Writer), shown next to Site24x7's own Summary. This is not how a custom plugin normally behaves in Site24x7: the Site24x7 team changed the account we test on so that it does. We don't know exactly what they changed. Everything verified in the console (tabs, layout, "No Data") was verified on this account only; a regular customer account may show the plugin differently until Site24x7 enables the same for it.
+
 **What Site24x7 does (tested, do not re-test):**
 - A plugin's tabs and charts come from the first poll of the first monitor that registers; every monitor of the plugin shares them. Later payloads cannot add, remove, empty or reorder tabs. A different plugin version is rejected ("Version (2) not available").
 - A metric left out of a poll shows "No Data"; there is no per-metric "no data" alert (only the monitor-level "data collection is not happening").
