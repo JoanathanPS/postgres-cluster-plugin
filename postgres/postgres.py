@@ -436,11 +436,21 @@ QUERIES = [
              M("Last Subscription Message Age", "s", "Replication"),
              M("Subscription Apply Errors", "errors", "Replication"),
              M("Subscription Sync Errors", "errors", "Replication")]),
-        Variant((10, 0),
+        Variant((14, 0),
             "SELECT count(*), count(s.pid),"
             " floor(extract(epoch FROM now() - max(s.last_msg_receipt_time)))::bigint"
             " FROM pg_subscription sub LEFT JOIN pg_stat_subscription s"
             " ON s.subid = sub.oid AND s.relid IS NULL",
+            [M("Subscriptions", "subscriptions", "Replication"),
+             M("Active Subscriptions", "subscriptions", "Replication"),
+             M("Last Subscription Message Age", "s", "Replication")]),
+        # Before 14, pg_subscription is readable only by superusers. pg_stat_subscription
+        # is readable by any user and has one row per subscription (relid NULL: the main
+        # worker, with a NULL pid when the worker is not running).
+        Variant((10, 0),
+            "SELECT count(*), count(pid),"
+            " floor(extract(epoch FROM now() - max(last_msg_receipt_time)))::bigint"
+            " FROM pg_stat_subscription WHERE relid IS NULL",
             [M("Subscriptions", "subscriptions", "Replication"),
              M("Active Subscriptions", "subscriptions", "Replication"),
              M("Last Subscription Message Age", "s", "Replication")])]),
@@ -1468,8 +1478,11 @@ class LogicalAdapter(object):
     def detect(self, seed, ctx):
         if seed.is_recovery or seed.version < (10, 0):
             return False
+        # pg_subscription is superuser-only before 14; pg_stat_subscription is readable
+        subscriptions = ("pg_subscription" if seed.version >= (14, 0)
+                         else "pg_stat_subscription WHERE relid IS NULL")
         row = seed.query_one(
-            "SELECT (SELECT count(*) FROM pg_subscription),"
+            "SELECT (SELECT count(*) FROM " + subscriptions + "),"
             " (SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'logical' AND active),"
             " (SELECT string_agg(extname, ',') FROM pg_extension WHERE extname IN ('bdr', 'spock', 'pglogical'))")
         if not row:
