@@ -1,53 +1,31 @@
 # postgres plugin v2: handoff (updated 2026-11-24 evening)
 
-## 0. Read first: current state and what's left
+## 0. Read first: current state (2026-11-25 evening)
 
-**Where the release lives (all pushed):**
-- `JoanathanPS/postgres-cluster-plugin`, branch `main` = branch `postgres-v2-Joanathan`: only the `postgres/` folder, laid out like `site24x7/plugins/postgres`.
-- `JoanathanPS/plugins` (fork of `site24x7/plugins`), branch `postgres-v2-Joanathan`: 2 commits on top of upstream master. The user opens the PR to `site24x7/plugins` master themselves. **Never open, merge or comment on the PR yourself.**
-- Local worktrees: `%TEMP%\pg-v2-joanathan` (release branch of own repo) and `%TEMP%\s247-fork` (fork clone). `v7` is the dev branch with tests and scripts; its latest plugin changes are **uncommitted** in this folder.
-- To ship a change: edit `postgres/` here, run tests, copy `postgres.py`/`README.md`/installer into both worktrees, commit with a plain message, push the fork branch, and push the own-repo branch to both `postgres-v2-Joanathan` and `main`.
+**Code:** `v7` in JoanathanPS/postgres-cluster-plugin is the source of truth (plugin in `postgres/`, tests in `tests/`). Everything is committed and pushed.
+**PR:** site24x7/plugins#467 from the fork `JoanathanPS/plugins`, branch `postgres-v2-Joanathan`. It is **frozen and does not have the 2026-11-25 work**. Update it only when the user says so, with proper PR comments describing the changes. Never commit, push or comment there otherwise.
 
-**Changes since sections 1–9 were written:**
-- `postgres.cfg` is now byte-identical to upstream (only host/port/username/password/db). Every other option has a code default; the README's Configuration Options table lists them. The installer appends `patroni_port` instead of uncommenting it.
-- `"None"` in any cfg value means empty (it's the placeholder).
-- Units are atomic (`rows`, `MB`, …), no `x/s` units; the rate is in the metric name.
-- **Tabs:** Summary + 8, all visible in the console: Cluster, Replication, Activity, Transactions and Sessions, DB and IO stats, Vacuum and Wraparound, WAL and Archiving, BG Writer. The old Plugin tab's 3 metrics (Collection Time, Failed Queries, Permission Gaps) are on Summary.
-- **16 lifetime totals are read but not sent** (`HIDDEN_COUNTERS` in `postgres.py`): Total Rows Inserted/Updated/Deleted/Fetched/Returned, Total Block Reads, Total Temp Data, Sequential Scans, Index Scans, WAL Written, Total Deadlocks, Total Conflicts, Checkpoints Req, Archive Failed Count, Checksum Failures, WAL Buffers Full. Their Per Sec / New versions are sent. The plugin now sends 99 metrics.
-- TL decided: customers upgrade one at a time, so no backend migration and no v1 compatibility constraints. README "Upgrading from Version 1" lists dropped v1 metrics and their nearest (not equivalent) v2 metric.
-- README metric section is grouped by console tab and matches the code exactly (99 names).
+**Behaviour added on 2026-11-25 (all on v7):**
+- **First poll registers everything.** With no `.state` file for the monitor, the payload carries every metric and table (stand-ins: 0, or 100 for hit percentages; placeholder rows for tables), so the Site24x7 template is complete whichever server registers first. Verified with a standalone monitor registering first (template 142, none missing).
+- **Later polls send only real values.** What does not apply is left out and shows "No Data": cluster-only metrics on standalone (`STANDALONE_NOT_APPLICABLE`), replay lag on a primary, ages of events that never happened, maxima over nothing (Max Slot Retained WAL with no slots, Longest Transaction with none open), checksum failures with checksums off. Counts and sums over nothing stay a real 0.
+- **Cluster tab:** cluster graphs first, then the tables Cluster_Info (type, primary, health, role, nodes up/total), Nodes and Events. The 4 text values are no longer top-level metrics.
+- **Renames:** BG Writer metrics have plain names (Scheduled Checkpoints, BG Writer Stops, ...). README "Metric changes" lists them.
+- **PostgreSQL 10–13 subscriptions** are counted from `pg_stat_subscription` (pg_subscription is superuser-only before 14).
+- **README** rewritten: upgrade steps, metric changes table, "No Data" rule, `.state` note. **TRADEOFF.md** holds the two decisions for the TL. **TL_ASK.md**: every question answered.
 
-**Verified after these changes:** pyflakes clean, 50 unit tests pass, 2 live polls on `tb-standalone-pg16` (status 1, 0 schema violations, the 8 tabs in order, no hidden metric sent).
+**Verified on 2026-11-25:** 56 unit tests (also under Python 3.6); PostgreSQL 9.6, 10, 11, 12, 13, 14, 15, 16, 17, 18 clean (0 failed queries, 0 permission gaps, 0 violations), 9.5 refused; WAL archiving working / failing / recovered; Index Hit, Longest Transaction and checksum metrics proven both as "No Data" and with real values; final install on both agents (Linux 8 monitors, Windows 6), all up with complete templates.
 
-**Verified on the real Linux agent (2026-11-25):** fresh registration of `postgres.py-postgres-pg-linux-agent` gave status 1, template = all 94 numeric metrics + 5 text metrics (99), 0 missing, 0 without data, no hidden counter, and the 8 tabs in order. Notes:
-- The API lists template keys without spaces (`TotalCommits`); `api_check.py` compares by the catalogue's own keys.
-- After a container restart the agent does not start by itself: `docker exec pg-linux-agent /etc/init.d/site24x7monagent start`.
-- A monitor deleted in the console is marked `status: 3` in the agent's `conf/pl_id_mapper` and is never re-registered. Stop the agent, remove those entries (backup in `/root/pl_id_mapper.bak`), start it. Only `[postgres]` was registered this time; the full 9-section cfg is restored (backup `/root/postgres.cfg.full`), so the other 7 register the next time their test beds and the agent run.
-- Don't loop `api_check.py`: each run takes a new token and Zoho blocks the refresh token for a while after ~10 in 10 minutes.
+**What Site24x7 does (tested, do not re-test):**
+- A plugin's tabs and charts come from the first poll of the first monitor that registers; every monitor of the plugin shares them. Later payloads cannot add, remove, empty or reorder tabs. A different plugin version is rejected ("Version (2) not available").
+- A metric left out of a poll shows "No Data"; there is no per-metric "no data" alert (only the monitor-level "data collection is not happening").
+- `-1`, `0` and text: `-1`/`0` are plotted as values; text, null and a missing key all show "No Data".
+- Deleted monitors never re-register under the same name. Linux agent: stop it, empty `conf/pl_id_mapper` (back it up), restart (`/etc/init.d/site24x7monagent start`). Windows agent: take the plugin folder out until its log says "LOGGING STOPPED", then put it back. Also delete the plugin's `.state` folder.
 
-**Audit fixes (2026-11-25, on `v7`, not yet copied to the release worktrees):** unknown ages are no longer zero-filled (Last WAL Message Age on a standby with no receiver, Last Archive Age with archiving on, Last Subscription Message Age with subscriptions, Oldest Table Vacuum Age with never-vacuumed tables); Archive Ready Files is its own query so a user without `pg_monitor` keeps the other archive metrics; `run()` itself returns valid output on any unexpected error (the Linux agent calls it directly); Top_Queries failing because `pg_stat_statements` isn't preloaded is no longer a failed query. 54 tests, value check 23/23 on PG16.
+**Still open:** after the PR, test pgpool, Citus and pg_auto_failover through the Windows agent, pg_auto_failover data nodes directly, and Citus workers individually. The Windows template has 134 entries against Linux's 142 (both report nothing missing; difference not explained).
 
-**Original steps for this check (kept for reference):**
-1. Start only what's needed: `docker start tb-standalone-pg16 pg-linux-agent` (all containers were stopped to save the user's PC).
-2. Linux: `docker cp postgres/postgres.py pg-linux-agent:/opt/site24x7/monagent/plugins/postgres/postgres.py`. The agent sees the change but keeps the old template for existing monitors.
-3. Ask the user to delete **one** monitor in the console (e.g. `postgres.py-postgres-pg-linux-agent`); never delete anything yourself. The agent re-registers it within one or two polls (5 min each). If it doesn't, the user removes and re-adds the plugin folder or restarts the plugin agent.
-4. Check with `python scripts/api_check.py --period 0`: the re-registered monitor should be status 1, template 99, 0 missing. Then ask the user to look at the tabs in the console.
-5. Windows is optional: the code path is the same; copy `postgres.py` to `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres\` and check `scripts/agent_payloads.sh 1`.
-6. Stop the containers again when done (`docker stop ...`).
-
-**Rules from the user:**
-- No AI/Claude attribution anywhere: commits, PR text, code, docs.
-- Discuss `main` and README changes with the user before making them.
-- Explain plainly, no jargon; decide small things yourself instead of asking.
-- Console: view only. Never print or commit `.env` secrets or the agent device key.
-- Keep Docker usage minimal; the user's PC lags.
-
-**Open questions for the TL:** `TL_ASK.md` sections A–E (pg_monitor warning, further renames, Primary tab, standalone cluster fields, Patroni coverage).
+**User rules:** no AI attribution anywhere; commit on v7 when asked, never touch the PR unless asked; explain plainly; keep Docker usage minimal; console is view-only for us; never print `.env` secrets or the agent key.
 
 ---
-
-
-Read this instead of the old chat. The v6 handoff, research, docs and console evidence were removed from the working tree on 2026-11-23. They are on GitHub on branch `v6` and in local history.
 
 ## 1. Where things stand
 
