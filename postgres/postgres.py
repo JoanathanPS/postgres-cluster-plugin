@@ -984,29 +984,36 @@ def sampled_rates(node, deadline):
 
 
 def truthful_zeros(node, metrics):
-    """Values that are genuinely 0 for this node rather than unknown, so the metric is
-    sent (and registered in the template) instead of left out.
-
-    A value is filled only where there is nothing to measure. Where something should
-    have been measured and was not (a standby with no WAL receiver, archiving on but
-    nothing archived yet, a disabled subscription, a table never vacuumed), the value
-    is unknown and stays out, so "age above X" alerts are never silenced by a fake 0."""
+    """Counts that are really 0 rather than unknown: with archiving off, nothing has
+    been archived, has failed or is waiting. Anything that does not apply (a replay lag
+    on a primary, an age of something that never happened) is left out instead, so the
+    console shows "No Data" and no threshold fires on a made-up value."""
     zeros = {}
     if node.settings.get("archive_mode", "off") == "off":
-        # nothing is archived, so nothing has been archived, failed or is waiting
         zeros.update({"Archived Count": 0, "Archive Failed Count": 0, "Archiving Failing": 0,
-                      "Archive Ready Files": 0, "New Archive Failures": 0, "Last Archive Age": 0})
-    if not node.is_recovery:
-        # a primary replays nothing and receives WAL from no one
-        zeros.update({"Replay Lag": 0, "Replay Backlog": 0.0, "WAL Receiver Connected": 0,
-                      "Last WAL Message Age": 0})
-    else:
-        # a standby generates no WAL of its own
-        zeros.update({"WAL Generated Per Sec": 0.0, "WAL Written": 0.0})
-    if not metrics.get("Tables Never Vacuumed"):
-        zeros["Oldest Table Vacuum Age"] = 0            # no table with rows awaits a first vacuum
-    zeros["Index Hit Percent"] = 100.0                  # no index reads: no misses, never a fake 0 %
+                      "Archive Ready Files": 0, "New Archive Failures": 0})
     return {k: v for k, v in zeros.items() if k not in metrics}
+
+
+# Stand-in values sent only on a monitor's first poll, for metrics with no real value
+# then. Site24x7 builds a plugin's charts from the first poll of the first monitor
+# that registers and never adds charts later, so the first poll must carry every
+# metric; from the second poll on, a metric with no real value is left out ("No Data").
+REGISTRATION_STANDINS = {"Index Hit Percent": 100.0, "Buffer Cache Hit Percent": 100.0}
+
+
+def registration_payload(payload):
+    """Adds every metric and table missing from a first poll, so the template is
+    complete whichever kind of server registers first."""
+    for m in all_metric_defs():
+        if m.name not in payload and m.kind is not str:
+            payload[m.name] = REGISTRATION_STANDINS.get(m.name, 0)
+    tables = [(t.name, t.units) for t in TABLES if t.name not in CHILD_DISCOVERY]
+    tables += [(name, cols) for name, (_, cols) in CLUSTER_TABLES.items()]
+    for name, cols in tables:
+        if not payload.get(name):
+            payload[name] = [dict({"name": "-"}, **{c: ("-" if u == "" else 0)
+                                                    for c, u in cols.items()})]
 
 
 def derive_metrics(node, metrics):
@@ -1757,7 +1764,7 @@ def evaluate_health(rows, cluster_type, single_writer=True):
     return HEALTH_OK, "%d of %d nodes up" % (len(up), len(rows))
 
 
-def cluster_metrics(view, cluster_type, history, now, single_writer=True, since=None):
+def cluster_metrics(view, cluster_type, history, now, single_writer=True):
     rows = view.nodes
     code, reason = evaluate_health(rows, cluster_type, single_writer)
     standbys = [r for r in rows if r["role"] == ROLE_STANDBY]
@@ -1781,17 +1788,13 @@ def cluster_metrics(view, cluster_type, history, now, single_writer=True, since=
     if not lags and view.links:     # node names didn't match link names: use the links
         lags = [l["replay_lag_s"] for l in view.links if l.get("replay_lag_s") is not None]
         backlogs = [l["replay_lag_mb"] for l in view.links if l.get("replay_lag_mb") is not None]
-    if lags or not standbys:       # no standby means no standby is behind
-        out["Max Standby Replay Lag"] = max(lags) if lags else 0.0
-    if backlogs or not standbys:
-        out["Max Standby Backlog"] = max(backlogs) if backlogs else 0.0
+    if lags:
+        out["Max Standby Replay Lag"] = max(lags)
+    if backlogs:
+        out["Max Standby Backlog"] = max(backlogs)
     promotions = [e["ts"] for e in history if e["event"] == "promoted"]
     if promotions:
         out["Last Failover Age"] = int(now - max(promotions))
-    elif since is not None:
-        # no failover seen since monitoring began: report that time, a true lower bound
-        # ("no failover for at least this long"), never 0, which would read as "just now"
-        out["Last Failover Age"] = int(now - since)
     out["Failovers 24h"] = len([t for t in promotions if now - t <= 86400])
     return out
 
@@ -2063,13 +2066,11 @@ def collect_cluster(seed, metrics, prev, args, deadline, now):
         nodes_state[r["name"]] = {
             "role": r["role"], "status": r["status"], "address": r.get("address", ""),
             "last_seen": now if r["status"] else old.get("last_seen", now)}
-    since = float(prev_cluster.get("since") or now)
-    out = cluster_metrics(view, cluster_type, history, now, adapter.single_writer, since)
+    out = cluster_metrics(view, cluster_type, history, now, adapter.single_writer)
     tables = {"Nodes": public_rows(view.nodes), "Events": event_rows(history, now)}
     if view.links is not None:
         tables["Replication_Links"] = link_rows(view.links)
-    state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history,
-             "since": since}
+    state = {"sysid": sysid, "type": cluster_type, "nodes": nodes_state, "events": history}
     state.update(ctx["state_extra"])
     return out, tables, events, state
 
@@ -2176,7 +2177,9 @@ def collect(param):
                     if k not in HIDDEN_COUNTERS and k not in CLUSTER_INFO_TEXT})
     payload.update(tables)
     payload.update(cluster_tables)
-    if metrics.get("Cluster Type") == "standalone":
+    if not prev:                        # this monitor's first poll: its registration
+        registration_payload(payload)
+    elif metrics.get("Cluster Type") == "standalone":
         for name in STANDALONE_NOT_APPLICABLE:
             payload.pop(name, None)
     if node.failures:

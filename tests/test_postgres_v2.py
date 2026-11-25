@@ -201,13 +201,17 @@ class FakeConn(object):
 
 class RunTests(unittest.TestCase):
 
-    def run_with(self, fail_on=None, error="permission denied for function pg_ls_waldir", prev=None):
+    def run_with(self, fail_on=None, error="permission denied for function pg_ls_waldir", prev=None,
+                 first=False):
+        """prev=None means a later poll of a known monitor; first=True its very first poll."""
+        if prev is None:
+            prev = {} if first else {"denied": []}
         fake = mock.Mock()
         fake.connect.return_value = FakeConn(fail_on, error)
         with mock.patch.object(pg, "psycopg2", fake), \
                 mock.patch.object(pg, "HAVE_PSYCOPG2", True), \
                 mock.patch.object(pg, "save_state", return_value=True), \
-                mock.patch.object(pg, "load_state", return_value=prev or {}), \
+                mock.patch.object(pg, "load_state", return_value=prev), \
                 mock.patch.object(pg, "RATE_SAMPLE_S", 0.6):
             return pg.run({"host": "h", "port": "5432", "username": "u", "password": "p"})
 
@@ -277,52 +281,50 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["Transactions Per Sec"], 0.0)
         self.assertIn("New Deadlocks", out)
 
-    def test_truthful_zeros_are_sent_not_left_out(self):
-        out = self.run_with()          # fake server: primary, archive_mode off
-        for name in ("Archived Count", "Archiving Failing",
-                     "Replay Lag", "Replay Backlog", "WAL Receiver Connected"):
-            self.assertEqual(out[name], 0, name)
-        self.assertEqual(out["Last Archive Age"], 0)     # stand-in until the first archive
+    def test_later_poll_sends_real_counts_and_leaves_out_what_does_not_apply(self):
+        out = self.run_with()          # fake server: primary, archive_mode off, a later poll
+        for name in ("Archived Count", "Archiving Failing", "Archive Ready Files"):
+            self.assertEqual(out[name], 0, name)          # really nothing archived
+        for name in ("Last Archive Age", "Replay Lag", "Replay Backlog", "WAL Receiver Connected",
+                     "Last WAL Message Age", "Max Standby Replay Lag", "Last Failover Age"):
+            self.assertNotIn(name, out)                   # does not apply: "No Data"
         for name in pg.HIDDEN_COUNTERS:
-            self.assertNotIn(name, out)                  # used for rates, not sent
-        self.assertEqual(out["Index Hit Percent"], 1.0)   # fake server: real value, not the stand-in
+            self.assertNotIn(name, out)                   # used for rates, not sent
+        self.assertEqual(out["Index Hit Percent"], 1.0)   # fake server: a real value
 
+    def test_first_poll_registers_every_metric_and_table(self):
+        out = self.run_with(first=True)
+        sent = {k for k in out if k not in pg.RESERVED_KEYS}
+        names = {m.name for m in pg.all_metric_defs() if m.kind is not str}
+        self.assertEqual(names - sent, set())
+        for table in ("Replication_Links", "Events", "Top_Queries", "Cluster_Info", "Nodes"):
+            self.assertTrue(out.get(table), table)
+        self.assertEqual(pg.validate_output(out), [])
+        self.assertEqual(out["Last Failover Age"], 0)      # stand-in, first poll only
 
 class TruthfulZeroTests(unittest.TestCase):
 
-    def test_standby_and_archiving_keep_real_values(self):
+    def test_archiving_on_keeps_real_values(self):
         node = mock.Mock(is_recovery=True, settings={"archive_mode": "on"})
-        zeros = pg.truthful_zeros(node, {})
-        self.assertNotIn("Replay Lag", zeros)            # a standby has a real replay lag
-        self.assertNotIn("Archived Count", zeros)        # archiving on: real counts
-        self.assertEqual((zeros["WAL Generated Per Sec"], zeros["WAL Written"]), (0.0, 0.0))
-
-    def test_unknown_ages_are_left_out_not_zeroed(self):
-        """A 0 age would silence "age above X" alerts exactly when they matter."""
-        standby = mock.Mock(is_recovery=True, settings={"archive_mode": "on"})
-        zeros = pg.truthful_zeros(standby, {"Subscriptions": 2, "Tables Never Vacuumed": 3})
-        for name in ("Last WAL Message Age", "Last Archive Age",
-                     "Last Subscription Message Age", "Oldest Table Vacuum Age"):
-            self.assertNotIn(name, zeros, name)
-        primary = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
-        zeros = pg.truthful_zeros(primary, {"Subscriptions": 0, "Tables Never Vacuumed": 0})
-        for name in ("Last WAL Message Age", "Last Archive Age", "Oldest Table Vacuum Age"):
-            self.assertEqual(zeros[name], 0, name)
-        self.assertNotIn("Last Subscription Message Age", zeros)   # no subscription: not applicable
-
+        self.assertEqual(pg.truthful_zeros(node, {}), {})  # archiving on: only real counts
+    def test_ages_are_never_zero_stand_ins(self):
+        """A 0 age reads as "just happened" and silences "age above X" alerts."""
+        for node in (mock.Mock(is_recovery=True, settings={"archive_mode": "on"}),
+                     mock.Mock(is_recovery=False, settings={"archive_mode": "off"})):
+            zeros = pg.truthful_zeros(node, {"Subscriptions": 0, "Tables Never Vacuumed": 0})
+            for name in ("Last WAL Message Age", "Last Archive Age",
+                         "Last Subscription Message Age", "Oldest Table Vacuum Age"):
+                self.assertNotIn(name, zeros, name)
     def test_existing_values_are_never_overwritten(self):
         node = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
         self.assertNotIn("Archived Count", pg.truthful_zeros(node, {"Archived Count": 7}))
 
-    def test_cluster_without_standbys_reports_zero_lag(self):
+    def test_cluster_without_standbys_leaves_lag_out(self):
         view = pg.ClusterView([pg.node_row("a", "primary", "up", True)], links=None, primary_name="a")
         out = pg.cluster_metrics(view, "standalone", [], 100.0)
-        self.assertEqual((out["Standbys Streaming"], out["Max Standby Replay Lag"], out["Failovers 24h"]),
-                         (0, 0.0, 0))
-        self.assertNotIn("Last Failover Age", out)      # no start time given
-        out = pg.cluster_metrics(view, "standalone", [], 100.0, since=40.0)
-        self.assertEqual(out["Last Failover Age"], 60)   # "none for at least 60 s", never 0
-
+        self.assertEqual((out["Standbys Streaming"], out["Failovers 24h"]), (0, 0))   # real counts
+        for name in ("Max Standby Replay Lag", "Max Standby Backlog", "Last Failover Age"):
+            self.assertNotIn(name, out)                   # nothing to measure
 
 def row(name, role, status=1):
     return pg.node_row(name, role, "up" if status else "down", status)

@@ -152,7 +152,11 @@ The role of each node is read from PostgreSQL. If a cluster manager reports a di
 
 Metrics are grouped by the tab they appear in. "Per Sec" metrics are averaged over the poll interval, and "New" metrics count what happened since the previous poll.
 
-Metrics that do not apply to a server are not sent and show as "No Data". On a standalone server this covers the cluster and standby metrics: Cluster Health, Nodes Up, Health Code, Nodes Total, Nodes Down, Standbys Streaming, Sync Standbys, Last Failover Age, Failovers 24h, WAL Receiver Connected, Replay Lag, Replay Backlog, Last WAL Message Age, Max Standby Replay Lag and Max Standby Backlog.
+Metrics that do not apply to a server are not sent and show as "No Data", so no threshold fires on them. On a standalone server this covers the cluster and standby metrics: Cluster Health, Nodes Up, Health Code, Nodes Total, Nodes Down, Standbys Streaming, Sync Standbys, Last Failover Age, Failovers 24h, WAL Receiver Connected, Replay Lag, Replay Backlog, Last WAL Message Age, Max Standby Replay Lag and Max Standby Backlog. The same applies on any server to ages of events that have not happened yet, such as Last Archive Age before the first archive.
+
+A monitor's first poll sends every metric, using a stand-in value where there is no real one, because Site24x7 creates the charts from the first poll. Later polls send only real values.
+
+> **Note:** If you delete the plugin's template in Site24x7, also delete the `.state` folder inside the plugin folder before the monitors register again, so that their first poll sends every metric.
 
 ### Summary
 
