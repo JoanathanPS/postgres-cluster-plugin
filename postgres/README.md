@@ -273,13 +273,13 @@ The Cluster tab also shows three tables:
 
 | **Metric Name** | **Description** |
 | :--- | :--- |
-| Scheduled Checkpoints | Number of checkpoints started on schedule |
+| Checkpoints Timed | Number of scheduled checkpoints |
 | New Requested Checkpoints | Number of checkpoints requested before their schedule |
 | Checkpoint Write Time, Checkpoint Sync Time | Time spent writing and syncing checkpoint files |
-| Buffers Written by Checkpoints, Buffers Written by BG Writer, Buffers Written by Backends | Buffers written to disk by checkpoints, by the background writer, and directly by client sessions (up to PostgreSQL 16) |
-| Backend Fsyncs | Number of times client sessions had to flush to disk themselves (up to PostgreSQL 16) |
-| Buffers Allocated | Number of buffers allocated |
-| BG Writer Stops | Number of times the background writer paused because it reached its write limit |
+| Buffers Checkpoint, Buffers Clean, Buffers Backend | Buffers written by checkpoints, the background writer and backends |
+| Buffers Backend Fsync | Number of fsync calls made by backends (up to PostgreSQL 16) |
+| Buffers Alloc | Number of buffers allocated |
+| Maxwritten Clean | Number of times the background writer stopped for writing too many buffers |
 
 ## Transactions and Sessions per Database
 
@@ -334,11 +334,6 @@ The Cluster tab also shows three tables:
 | Index Scans | Index Scans Per Sec | Rate per second instead of a running total |
 | Total Conflicts | New Conflicts | Count since the previous poll |
 | Checkpoints Req | New Requested Checkpoints | Count since the previous poll |
-| Checkpoints Timed | Scheduled Checkpoints | Renamed |
-| Buffers Checkpoint, Buffers Clean, Buffers Backend | Buffers Written by Checkpoints, Buffers Written by BG Writer, Buffers Written by Backends | Renamed |
-| Buffers Backend Fsync | Backend Fsyncs | Renamed |
-| Buffers Alloc | Buffers Allocated | Renamed |
-| Maxwritten Clean | BG Writer Stops | Renamed |
 
 Other changes:
 
