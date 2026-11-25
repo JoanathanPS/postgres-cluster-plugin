@@ -1,147 +1,111 @@
-# TL questions: answers and next steps
+# TL questions
 
-## Answered
+## Answered (brief)
 
-1. **Template gaps → TL: "pre-declare them as zero, nothing wrong with that." Done.**
-   - **Why it has to happen at registration:** Site24x7 builds a monitor's chart layout once, when the monitor first registers, and only from metrics that have a value then. A metric that appears later is never added; we tested that.
-   - **What v2 does:** every metric now has a value from the first poll, so every metric gets a chart. The 7 that used to be missing get a safe stand-in until their event happens:
-     - Last Archive Age, Last WAL Message Age, Last Subscription Message Age, Oldest Table Vacuum Age → **0** ("nothing pending"; lower is better, so it never alerts)
-     - Cache Hit Ratio, Index Hit Percent → **100 %** (no reads yet means no misses; a 0 % hit rate would trip every cache alert)
-     - Last Failover Age → **time since monitoring began** ("no failover for at least this long"; 0 would read as "just failed over")
-     - WAL Written on a standby → **0**, kept out of rate maths so a later promotion doesn't show a fake WAL spike
-   - **Where it's documented:** the README has the same table.
+1. **Template gaps → "pre-declare them, nothing wrong with that." Done.** Every metric has a value from the first poll. Until the event happens, the 7 that used to be missing get safe stand-ins (ages → 0, hit ratios → 100 %, Last Failover Age → time since monitoring began).
+2. **Minimums → "whatever works."** PostgreSQL 9.6+ and Python 3.6+.
+3. **Old metric names → "old charts are migrated in the backend, don't carry v1 baggage." Done.** Dropped Cache Hit Ratio, Heap Blocks Read/Hit and Index Rows Read/Fetched, which newer metrics cover. Fixed the `Tranasctions_…` table name. The README's "Upgrading from Version 1" table lists each old name and its replacement (see F for the backend side).
+4. **Default thresholds → "customers set them, a plugin can't." Done.** No thresholds ship with the plugin. The Health Code covers what only the plugin can judge.
+5. **`use_agent_python` → settled by testing.** The Linux agent's own Python already bundles `psycopg2`, so we ship `=1`. The README tells Windows users to set `0`. Worth mentioning: the Linux agent writes cfg passwords in plain text to `logs/details/plugins.txt`.
+6. **Linux agent test → done (2026-11-24).** A real Full-Stack agent, with all 8 cluster types registered and up and complete templates. Found and fixed an installer bug: current agents say "full-stack agent service", which the v1 check didn't recognise.
+7. **v1 migration and tabs → "customers upgrade one at a time when they choose to, so it doesn't matter." Done.** No backend migration is needed. The 16 running totals (Total Rows Inserted, WAL Written, Total Deadlocks…) are no longer sent; their Per Sec or New versions are. The plugin now sends 99 metrics. Tabs are now Summary + 8, all visible: Cluster, Replication, Activity, Transactions and Sessions, DB and IO stats, Vacuum and Wraparound, WAL and Archiving, BG Writer. The Plugin tab's 3 metrics moved to Summary. The README's upgrade table says the replacements are the nearest metrics, not equivalents.
 
-2. **Minimums → TL: "whatever works."** PostgreSQL 9.6+ and Python 3.6+ stay.
-
-3. **Old metric names → TL: old charts are migrated in the backend, so don't carry v1 baggage. Done.**
-   - **Dropped (newer metrics cover them):** Cache Hit Ratio, Heap Blocks Read/Hit, Index Rows Read/Fetched.
-   - **Renamed:** the misspelled table `Tranasctions_and_Session_per_Database` is now `Transactions_and_Sessions_per_Database`.
-   - **For the backend migration:** the README's "Changes from version 1" lists every rename and drop with its replacement.
-
-4. **Default thresholds → TL: "customers do that, a plugin can't."**
-   - **Confirmed by Site24x7's plugin docs:** thresholds are set per monitor in the console ("Threshold and Availability"). A plugin cannot ship threshold profiles.
-   - **Our side:** the README lists recommended thresholds. The Health Code covers what only the plugin can judge: no primary, split brain, node down.
-
-## Patroni REST API (research done)
-
-### What Patroni's REST API is, and why the plugin uses it
-- **What it is:** every Patroni node runs a small web server, port 8008 by default, that answers questions about the cluster. `GET /cluster` returns every member: its name, host, port, role (leader/replica), state (running, streaming, stopped…), timeline and lag.
-- **Why the plugin uses it:** it's the only source that also lists **stopped** members. SQL discovery (`pg_stat_replication`) only sees standbys that are currently connected, so a dead standby simply vanishes from it. Patroni still lists it as "stopped".
-- **When it's used:** only if the customer sets `patroni_port` in the cfg. Without it, the plugin uses SQL discovery, which works for every cluster, Patroni included.
-- **What the plugin does with it:** one read-only `GET /cluster` per poll, with a 3 s timeout. It never calls an endpoint that changes anything (switchover, restart, reinitialize).
-- **Roles still come from PostgreSQL:** Patroni's answer says which nodes exist. Each node's role is then checked with `pg_is_in_recovery()`. If Patroni and PostgreSQL disagree, that's Health Code 4.
-
-### How Patroni can be secured, and what each option means for us
-Patroni has three security settings for its REST API (Patroni docs 4.1.5, the `restapi` section):
-
-| Setting | What it does | Effect on the plugin | Supported? |
-| :--- | :--- | :--- | :--- |
-| `restapi.authentication` (username/password) | Asks for a password, but **only on endpoints that change something** (switchover, restart, reload). Read-only calls such as `GET /cluster` stay open. | None. Our read needs no password. | Not needed |
-| `restapi.certfile` / `keyfile` (TLS) | The API becomes **HTTPS**. | We must call `https://` and verify the certificate. | Yes: `patroni_scheme=https` |
-| Self-signed certificate | HTTPS with a certificate no public authority signed. | Verification fails unless it's switched off or the cluster's own CA is given. | Yes: `patroni_verify=false` |
-| `verify_client: optional` | Asks callers for a client certificate, but only on the changing endpoints. | None. Reads still work. | Works |
-| `verify_client: required` | Demands a client certificate on **every** call, reads included. | Our `GET /cluster` is refused. | **Not yet** |
-
-**What happens when Patroni refuses us** (the `required` case, or a wrong scheme or port): the plugin doesn't fail. It falls back to SQL discovery and keeps working. The only thing lost is seeing stopped members. Tested by pointing `https` at an HTTP-only API: it fell back to streaming discovery, and the monitor stayed up.
-
-### What real deployments use
-
-| Deployment | How its REST API is set up | Works with v2? |
-| :--- | :--- | :--- |
-| Plain VM install (Patroni docs, most tutorials) | HTTP, no client certificate | Yes |
-| Crunchy PGO (Kubernetes operator) | HTTPS, `verify_client: optional` | Yes, with `patroni_scheme=https` |
-| Zalando Spilo / Postgres Operator (Kubernetes) | HTTPS, self-signed if no certificate is given | Yes, with `patroni_scheme=https` + `patroni_verify=false` |
-| Hardened setups with `verify_client: required` | HTTPS plus a mandatory client certificate | Falls back to SQL (stopped members not seen) |
-
-### Added "just in case" (built and tested, all optional and off by default)
-- **`patroni_cafile`:** verifies Patroni's certificate against the cluster's own CA. Safer than switching verification off.
-- **`patroni_certfile` / `patroni_keyfile`:** a client certificate, for Patroni with `verify_client: required`. This closes the one unsupported case in the table above.
-- **`patroni_username` / `patroni_password`:** basic auth, for a proxy or ingress in front of the API. The agent encrypts the password.
-- **Tested** against a real local HTTP server: the password header is sent, and a refused or misconfigured call falls back to SQL discovery instead of failing.
-
-*If he asks about Patroni passwords:* Patroni only asks for its password on endpoints that change something, so the plugin's read doesn't need one.
-
-**Ask:** "Every Patroni security setup is now covered (HTTP, HTTPS, own CA, self-signed, client certificates, a proxy with a password). Is there any setup Zoho customers use that isn't on this list?"
+---
 
 ## Still to ask
 
-5. **Python (`use_agent_python`): answered by testing on a real Linux agent (2026-11-24).**
-   - **Linux (Full-Stack agent 22.3.01):** with `use_agent_python=1`, the agent doesn't start a separate Python. It loads `postgres.py` as a module inside its own process and calls `run(param)`, which is why the plugin keeps v1's `run(param)` entry point.
-     - The agent's own Python (3.11) **already bundles `psycopg2`**, so the customer installs nothing. Verified: 8 monitors, one per cluster type, all up.
-     - The installer now detects the bundled driver and skips installing it.
-   - **Windows agent:** its Python has no `psycopg2`, so `use_agent_python=0` plus the server's own Python (with `psycopg2-binary`) is what works there.
-   - **Decision:** ship `use_agent_python=1` (upstream default, right for Linux). The README tells Windows users to set `0`.
-   - **Worth telling him:** the Linux agent writes each plugin's cfg parameters, including the plain-text password, into `logs/details/plugins.txt` when it loads the plugin. That's the agent's behaviour, not the plugin's, but the agent team may want to know.
+### A. Missing `pg_monitor`: how should the warning work?
 
-6. **Missing permissions (explain to him, then ask once-or-repeat):**
-   - **Who it happens to:**
-     - **Every v1 customer who upgrades.** The old v1 installer told customers to grant `pg_read_all_stats`, not `pg_monitor`. With only that role, PostgreSQL won't let the user read the WAL directory or the archive status folder, so WAL Directory Size, WAL Files and Archive Ready Files can't be collected. Everything else works.
-     - **Security teams that only allow a bare login user.** Some companies won't grant `pg_monitor` at all.
-     - **Managed databases** (Amazon RDS, Azure, Google Cloud SQL), which block some of PostgreSQL's file-reading functions even for admin-like users.
-   - **What v2 does about it:**
-     - The plugin keeps running, and only the blocked metrics are left out.
-     - `msg` says once which metrics are blocked and that granting `pg_monitor` fixes it: on the first poll, when something new gets blocked, and when it's fixed.
-     - The **Permission Gaps** count is sent every poll, so anyone who cares can set a threshold. Nobody gets the same text every 5 minutes.
-     - It isn't counted as a failure. **Failed Queries** stays for real errors such as timeouts.
-   - **The only question:** is "once" right, or should the note repeat now and then, for example daily?
+**Background:**
+- `pg_monitor` is PostgreSQL's read-only monitoring role, added in PostgreSQL 10 ([docs](https://www.postgresql.org/docs/current/predefined-roles.html)). It's `pg_read_all_stats` + `pg_read_all_settings` + `pg_stat_scan_tables`, plus the WAL-directory listing functions.
+- v1 didn't need it. v1 predates PostgreSQL 10 and only read database-wide counters, which any user can read. v2 also reads replication, WAL and other users' sessions.
+- **Who lacks it:**
+  - every v1 upgrade, because the v1 installer granted only `pg_read_all_stats`
+  - companies that allow only a bare login user
+  - managed databases (RDS, Azure, Cloud SQL), which block some file functions
 
-7. **Linux agent test: done (2026-11-24).**
-   - **Setup:** a real Site24x7 Full-Stack Linux agent (Debian 13 container, server `pg-linux-agent`). The plugin was installed with our installer, and one cfg section was added per cluster type: standalone, streaming, Patroni, repmgr, logical, pgpool, Citus and pg_auto_failover.
-   - **Result:** all 8 registered and are up. The four checked first registered the **complete** template (0 metrics missing).
-   - **Installer bug found and fixed:** current agents report "full-stack agent service", which the old check (copied from the v1 installer) didn't recognise. It would have told every customer on a current agent that no agent was installed.
+**What breaks without it:**
+- WAL Directory Size, WAL Files and Archive Ready Files can't be collected.
+- Session metrics (Active Queries, Blocked Sessions, Wait Events, Top Queries) are undercounted.
+- Cluster discovery can be weaker.
 
-8. **Renamed metrics: can Site24x7 carry the old chart history into the new name?**
-   - **What he asked for:** use the new, clean names, but keep the old charts' data, so a renamed metric's chart starts with its history already in it.
-   - **What the plugin can and can't do:**
-     - The plugin only sends "metric name = value, right now". Site24x7 stores history on its side, filed under the metric's **name**.
-     - A new name is a brand-new metric on Site24x7's side, with an empty chart. Nothing the plugin sends can say "this is the old metric, renamed".
-     - Sending both names keeps the old chart alive, but its history stays on the old chart and doesn't move into the new one.
-   - **So history can move only if Site24x7's backend does it** (renaming the metric, or merging the old metric's data into the new one).
-   - **Ask:**
-     - "Can Site24x7 rename a plugin metric, or merge an old metric's history into a new one, when the plugin version goes from 1 to 2?"
-     - "Has it been done for another official plugin?"
-   - **If yes:** rename to the clean names, give them a rename list (old → new), and the history moves on their side.
-   - **If no:** for each metric, choose between keeping the old name (history kept, old name stays) and renaming (clean name, history starts fresh). In the meantime we can send both names for one version, so nobody's alerts break, then drop the old names in v3.
-   - **Renames we'd propose:**
-     - `Tranasctions_and_Session_per_Database` → `Transactions_and_Sessions_per_Database` (misspelled)
-     - `Checkpoints Req` → `Checkpoints Requested`
-     - `Maxwritten Clean` → `Background Writer Stops` (the old name is unclear)
-     - `Cache Hit Ratio` (0–1) → `Table Cache Hit Percent` (0–100 %), so it uses the same % as the other metrics
-     - Names that are already fine (for example "Total Commits") stay unchanged.
+**What v2 does today:**
+- It keeps running, and leaves out only the blocked metrics.
+- `msg` names the blocked metrics and says "grant `pg_monitor`". It appears on the first poll, and again only when the list changes.
+- A **Permission Gaps** count is sent every poll.
+- It's not counted in **Failed Queries**, which stays for real errors such as timeouts.
 
-## pg_monitor: why the plugin asks for it (explain if asked)
+**Why not `status = 0`:**
+- Status 0 means *monitor down*: a down alert, a red monitor, and downtime in the availability report. The database is up and about 95 % of the data is arriving, so it would be a false outage that pages on-call for nothing.
+- A plugin has no "warning" state of its own. Trouble (yellow) only comes from thresholds.
 
-- **What it is:** PostgreSQL's built-in read-only monitoring role, added in PostgreSQL 10. It lets a user read all statistics and internals without any right to change data or settings.
-  - Docs: https://www.postgresql.org/docs/current/predefined-roles.html
-- **What it contains:** `pg_read_all_stats` + `pg_read_all_settings` + `pg_stat_scan_tables`, plus permission to run the file-listing functions (`pg_ls_waldir`, `pg_ls_archive_statusdir`).
-- **What breaks without it:**
+**Options to make it louder:**
+- (a) Repeat the `msg` note every poll instead of once.
+- (b) Recommend a threshold in the README: Permission Gaps ≥ 1 → Trouble.
+- (c) Add Health Code 5, "monitoring incomplete", which counts as Trouble.
 
-  | A normal user can't… | So the plugin… |
-  | :--- | :--- |
-  | see other users' queries, state and wait events in `pg_stat_activity` | undercounts Active Queries, Blocked Sessions, Longest Transaction, Wait Events and Top Queries |
-  | list the WAL directory or the archive status folder | can't collect WAL Directory Size, WAL Files or Archive Ready Files |
-  | read every replication detail (`pg_stat_replication`, `pg_stat_wal_receiver`) | may have weaker cluster discovery (standby addresses and lag can be hidden) |
-  | read settings such as `shared_preload_libraries` | finds it harder to detect repmgr or pg_auto_failover (a weaker fallback is used) |
+**My suggestion:** (a) + (b).
 
-- **Why not superuser:** it can change and delete anything, and no security team should give that to a monitoring tool. `pg_monitor` is the least privilege that still sees everything. Datadog and pganalyze ask for the same role.
-- **Why v1 didn't need it:**
-  - v1 is old: it predates PostgreSQL 10, where `pg_monitor` was introduced.
-  - v1 only read database-wide counters (`pg_stat_database`, `pg_stat_bgwriter`), which any user can read.
-  - It didn't look at the WAL directory, replication or other users' sessions, so a basic role was enough. Its README asked for `pg_read_all_stats`.
-  - v2 reads much more (replication, WAL, sessions, cluster), so it needs the role made for monitoring.
-- **What v2 does if it's missing:** it keeps running, leaves out only the blocked metrics, says so once in `msg`, and sends a "Permission Gaps" count every poll.
+**Ask:** "Once or every poll? And should it raise Trouble, through a recommended threshold or a health code?"
 
-9. **Missing pg_monitor: how loud should the warning be?**
-   - **Why it matters:** without `pg_monitor`, metrics are missing or partial (sessions undercounted, no WAL directory metrics, weaker discovery). Customers should notice.
-   - **Why not make it an error (`status = 0`):**
-     - `status = 0` means **"monitor down"**: the down alert fires, the monitor turns red, and it counts as downtime in availability reports.
-     - But the database is up, and about 95 % of the metrics are arriving. A down alert for a permission setting is a false outage that pages the on-call engineer for nothing.
-     - A down monitor also hides the data it did collect.
-     - A plugin can only send up (1) or down (0). It has no "warning" state of its own. In Site24x7, warnings ("Trouble") come from thresholds on metrics.
-   - **What v2 does today:** the note in `msg` appears once (and whenever the list changes), and the **Permission Gaps** count is sent every poll.
-   - **Options to make it louder, without a false "down":**
-     - **(a) Repeat the note every poll** instead of once. It's always visible and doesn't page anyone.
-     - **(b) Recommend a threshold "Permission Gaps ≥ 1 → Trouble"** in the README. The monitor then shows **Trouble (yellow)**: not down, but needs attention.
-     - **(c) Add a health code**, for example 5 = "monitoring incomplete: grant pg_monitor", shown next to node down and no primary. It's non-critical.
-   - **Suggest:** (a) + (b), and (c) if he wants it on the health summary too. Never `status = 0`.
-   - **Ask:** "Missing pg_monitor: note once, or every poll? Should it raise Trouble through a threshold or a health code?"
+### B. More renames: which ones?
+
+**Background:**
+- You said the backend migrates old charts, so renaming is fine. So far only the misspelled table has been renamed.
+- Chart history is filed under the metric name, so each rename relies on that backend migration.
+
+**Candidates:**
+
+| Current name | Proposed | Why |
+| :--- | :--- | :--- |
+| `Checkpoints Req` | `Checkpoints Requested` | abbreviation |
+| `Maxwritten Clean` | `Background Writer Stops` | internal PostgreSQL column name, meaningless to users |
+| `Buffers Backend Fsync` and similar raw column names | plain-English names | same reason |
+
+**Ask:** "Rename these too, or keep the v1 names apart from the typo?"
+
+### C. v6's Primary tab: bring it back or not?
+
+**Background:**
+- v6 had a **Primary** tab with about 22 metrics: Primary_Up, Connections, Commits/s, WAL rate, Cache Hit, Checkpoints and so on, read from the primary even when the monitor pointed at a standby.
+
+**Why v2 dropped it:**
+- **Duplication.** If the monitor is on the primary, both tabs show the same numbers. It adds about 22 metrics to a roughly 120-metric template.
+- **Load.** Every standby's monitor opened a second full session to the primary every poll, within the agent's 50 s limit.
+- **Stale data.** v6 needed `Primary_Data_Age_s` and `Primary_Data_Stale` because it showed cached numbers when the primary couldn't be reached.
+
+**What replaces it in v2:**
+- **Primary Node** (who the primary is) and **Health Code 2** ("no reachable primary")
+- the **Nodes** table, with connection %, uptime and lag for every node
+- for full primary metrics: point `host` at the VIP or HAProxy write port, which follows failovers, or monitor the primary itself
+
+**Ask:** "Is that enough, or do you want a small Primary tab back (about 5 key metrics: up, connections %, commits/s, WAL rate, longest transaction)?"
+
+### D. Cluster fields on a standalone server
+
+**Background:**
+- Site24x7 makes one template per plugin, so every monitor has the same layout. A metric that's missing when the monitor registers never gets a chart later.
+- So a standalone monitor also shows Cluster Health (0), Cluster Type ("standalone"), Primary Node and a one-row Nodes table.
+
+**Ask:** "Is that fine as it is, with the README explaining it? Or should Cluster Type say something clearer, such as 'standalone (no replication)'?"
+
+### E. Patroni: any setup we don't cover?
+
+**Background:**
+- Patroni's REST API (`GET /cluster`) is the only source that also lists *stopped* members. It's used only if `patroni_port` is set, it's read-only, and it has a 3 s timeout.
+- If a call is refused, the plugin falls back to SQL discovery and stays up.
+
+**Covered and tested:**
+
+| Patroni setup | cfg |
+| :--- | :--- |
+| Plain HTTP (VM installs) | `patroni_port` |
+| HTTPS (Crunchy PGO) | `patroni_scheme=https` |
+| Self-signed (Zalando Spilo) | `patroni_verify=false` |
+| Own CA | `patroni_cafile` |
+| `verify_client: required` | `patroni_certfile` + `patroni_keyfile` |
+| Proxy or ingress with a password | `patroni_username` + `patroni_password` |
+
+`restapi.authentication` doesn't matter here: Patroni only asks for its password on endpoints that change something.
+
+**Ask:** "Does any Zoho customer use a Patroni setup that isn't on this list?"

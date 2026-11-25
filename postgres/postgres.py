@@ -9,12 +9,12 @@ become. A small engine runs the catalogue, so adding a metric is one entry and
 never a new branch of code.
 
 Rules the engine enforces:
-  * A failed or inapplicable query removes its metrics; it never reports 0.
-  * A NULL value removes that metric for this poll.
+  * A failed or inapplicable query removes its metrics instead of reporting 0.
+    The only fixed values are the safe stand-ins in truthful_zeros().
   * `status` is 0 only when the server cannot be monitored at all (driver
     missing, connection or authentication failure, unsupported version).
-  * Rates and deltas need a previous sample of the same server process; until
-    then they are omitted, never shown as 0.
+  * Rates and deltas come from the previous poll of the same server process.
+    On a monitor's first poll they are measured over RATE_SAMPLE_S seconds.
 """
 
 import argparse
@@ -23,7 +23,6 @@ import json
 import math
 import os
 import re
-import sys
 import time
 
 try:
@@ -118,13 +117,14 @@ class Query(object):
 class Table(object):
     """A multi-row query whose rows become a Site24x7 child table."""
 
-    def __init__(self, name, tab, variants, units, role=ANY, when=None):
+    def __init__(self, name, tab, variants, units, role=ANY, when=None, optional=False):
         self.name = name
         self.tab = tab
         self.variants = sorted(variants, key=lambda v: v[0], reverse=True)
         self.units = units        # column -> unit, also fixes column order and types
         self.role = role
         self.when = when
+        self.optional = optional  # True: a failure leaves the table out silently
 
     def pick(self, version):
         for min_ver, sql in self.variants:
@@ -145,18 +145,28 @@ class Rate(object):
         self.scale = scale
 
 
+# Summary plus these 8 tabs all fit on one line of the Site24x7 console.
 TAB_ORDER = [
+    "Cluster",
+    "Replication",
     "Activity",
     "Transactions and Sessions",
     "DB and IO stats",
-    "BG Writer",
     "Vacuum and Wraparound",
     "WAL and Archiving",
-    "Replication",
-    "Cluster",
-    "Plugin",
+    "BG Writer",
 ]
 SUMMARY = ""                      # metrics with no tab chart on the built-in Summary tab
+
+# Counters that only grow since the server started. The plugin reads them to compute
+# the "Per Sec" and "New ..." metrics, but does not send them: a lifetime total is a
+# rising line, and its rate or per-poll change is what people watch and alert on.
+HIDDEN_COUNTERS = {
+    "Total Rows Inserted", "Total Rows Updated", "Total Rows Deleted", "Total Rows Fetched",
+    "Total Rows Returned", "Total Block Reads", "Total Temp Data", "Sequential Scans",
+    "Index Scans", "WAL Written", "Total Deadlocks", "Total Conflicts", "Checkpoints Req",
+    "Archive Failed Count", "Checksum Failures", "WAL Buffers Full",
+}
 
 # pg_stat_activity filter for client sessions, excluding this plugin's own session.
 _CLIENTS_10 = "backend_type = 'client backend' AND pid <> pg_backend_pid()"
@@ -325,29 +335,23 @@ QUERIES = [
         [M("WAL Files", "files", "WAL and Archiving"),
          M("WAL Directory Size", "MB", "WAL and Archiving", float)])]),
 
-    Query("archiver", [
-        Variant((12, 0),
-            "SELECT archived_count, failed_count,"
-            " floor(extract(epoch FROM now() - last_archived_time))::bigint,"
-            " CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL"
-            " OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END,"
-            " (SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready')"
-            " FROM pg_stat_archiver",
-            [M("Archived Count", "files", "WAL and Archiving"),
-             M("Archive Failed Count", "files", "WAL and Archiving"),
-             M("Last Archive Age", "s", "WAL and Archiving"),
-             M("Archiving Failing", "flag", "WAL and Archiving"),
-             M("Archive Ready Files", "files", "WAL and Archiving")]),
-        Variant((9, 6),
-            "SELECT archived_count, failed_count,"
-            " floor(extract(epoch FROM now() - last_archived_time))::bigint,"
-            " CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL"
-            " OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END"
-            " FROM pg_stat_archiver",
-            [M("Archived Count", "files", "WAL and Archiving"),
-             M("Archive Failed Count", "files", "WAL and Archiving"),
-             M("Last Archive Age", "s", "WAL and Archiving"),
-             M("Archiving Failing", "flag", "WAL and Archiving")])],
+    Query("archiver", [Variant((9, 6),
+        "SELECT archived_count, failed_count,"
+        " floor(extract(epoch FROM now() - last_archived_time))::bigint,"
+        " CASE WHEN last_failed_time IS NOT NULL AND (last_archived_time IS NULL"
+        " OR last_failed_time > last_archived_time) THEN 1 ELSE 0 END"
+        " FROM pg_stat_archiver",
+        [M("Archived Count", "files", "WAL and Archiving"),
+         M("Archive Failed Count", "files", "WAL and Archiving"),
+         M("Last Archive Age", "s", "WAL and Archiving"),
+         M("Archiving Failing", "flag", "WAL and Archiving")])],
+        when=lambda node: node.settings.get("archive_mode", "off") != "off"),
+
+    # Its own query: listing the archive status directory needs pg_monitor, and without
+    # that role only this metric should be missing, not every archive metric.
+    Query("archive_ready", [Variant((12, 0),
+        "SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'",
+        [M("Archive Ready Files", "files", "WAL and Archiving")])],
         when=lambda node: node.settings.get("archive_mode", "off") != "off"),
 
     Query("wal_receiver", [
@@ -429,18 +433,18 @@ QUERIES = [
 ]
 
 RATES = [
-    Rate("Transactions Per Sec", "Total Commits", "transactions/s", SUMMARY),
-    Rate("Rollbacks Per Sec", "Total Rollbacks", "transactions/s", "Transactions and Sessions"),
-    Rate("Rows Inserted Per Sec", "Total Rows Inserted", "rows/s", "DB and IO stats"),
-    Rate("Rows Updated Per Sec", "Total Rows Updated", "rows/s", "DB and IO stats"),
-    Rate("Rows Deleted Per Sec", "Total Rows Deleted", "rows/s", "DB and IO stats"),
-    Rate("Rows Fetched Per Sec", "Total Rows Fetched", "rows/s", "DB and IO stats"),
-    Rate("Rows Returned Per Sec", "Total Rows Returned", "rows/s", "DB and IO stats"),
-    Rate("Block Reads Per Sec", "Total Block Reads", "blocks/s", "DB and IO stats"),
-    Rate("Sequential Scans Per Sec", "Sequential Scans", "scans/s", "DB and IO stats"),
-    Rate("Index Scans Per Sec", "Index Scans", "scans/s", "DB and IO stats"),
-    Rate("Temp Data Per Sec", "Total Temp Data", "MB/s", "DB and IO stats"),
-    Rate("WAL Generated Per Sec", "WAL Written", "MB/s", "WAL and Archiving"),
+    Rate("Transactions Per Sec", "Total Commits", "transactions", SUMMARY),
+    Rate("Rollbacks Per Sec", "Total Rollbacks", "transactions", "Transactions and Sessions"),
+    Rate("Rows Inserted Per Sec", "Total Rows Inserted", "rows", "DB and IO stats"),
+    Rate("Rows Updated Per Sec", "Total Rows Updated", "rows", "DB and IO stats"),
+    Rate("Rows Deleted Per Sec", "Total Rows Deleted", "rows", "DB and IO stats"),
+    Rate("Rows Fetched Per Sec", "Total Rows Fetched", "rows", "DB and IO stats"),
+    Rate("Rows Returned Per Sec", "Total Rows Returned", "rows", "DB and IO stats"),
+    Rate("Block Reads Per Sec", "Total Block Reads", "blocks", "DB and IO stats"),
+    Rate("Sequential Scans Per Sec", "Sequential Scans", "scans", "DB and IO stats"),
+    Rate("Index Scans Per Sec", "Index Scans", "scans", "DB and IO stats"),
+    Rate("Temp Data Per Sec", "Total Temp Data", "MB", "DB and IO stats"),
+    Rate("WAL Generated Per Sec", "WAL Written", "MB", "WAL and Archiving"),
     Rate("New Deadlocks", "Total Deadlocks", "deadlocks", "Transactions and Sessions", delta=True),
     Rate("New Conflicts", "Total Conflicts", "conflicts", "Transactions and Sessions", delta=True),
     Rate("New Requested Checkpoints", "Checkpoints Req", "checkpoints", "BG Writer", delta=True),
@@ -454,9 +458,9 @@ DERIVED = [
     M("Node Role", tab="Activity", kind=str),
     M("Connection Utilization", "%", SUMMARY, float),
     M("Buffer Cache Hit Percent", "%", SUMMARY, float),
-    M("Collection Time", "ms", "Plugin"),
-    M("Failed Queries", "queries", "Plugin"),
-    M("Permission Gaps", "queries", "Plugin"),
+    M("Collection Time", "ms", SUMMARY),
+    M("Failed Queries", "queries", SUMMARY),
+    M("Permission Gaps", "queries", SUMMARY),
     # Cluster layer (built in section 6 from the discovered nodes)
     M("Cluster Type", tab="Cluster", kind=str),
     M("Cluster Health", "status", SUMMARY),
@@ -588,7 +592,9 @@ TABLES = [
          " FROM pg_stat_statements WHERE queryid IS NOT NULL"
          " ORDER BY total_time DESC LIMIT 10")],
         {"calls": "calls", "total_time_ms": "ms", "mean_time_ms": "ms", "rows": "rows", "query": ""},
-        when=lambda node: node.settings.get("pg_stat_statements")),
+        # installed but not in shared_preload_libraries, the view raises an error on
+        # every read: that is the extension's setup, not a collection failure
+        when=lambda node: node.settings.get("pg_stat_statements"), optional=True),
 ]
 
 # Per-database tables Site24x7 discovers as child items (as in version 1).
@@ -596,7 +602,7 @@ CHILD_DISCOVERY = ["Transactions_and_Sessions_per_Database", "Stats_per_DB"]
 
 
 def all_metric_defs():
-    """Every metric the catalogue can emit, in a stable order, without duplicates."""
+    """Every metric the plugin sends, in a stable order, without duplicates."""
     seen = {}
     for q in QUERIES:
         for v in q.variants:
@@ -606,7 +612,7 @@ def all_metric_defs():
         seen.setdefault(r.name, M(r.name, r.unit, r.tab, float))
     for d in DERIVED:
         seen.setdefault(d.name, d)
-    return list(seen.values())
+    return [m for m in seen.values() if m.name not in HIDDEN_COUNTERS]
 
 
 def build_tabs_and_units():
@@ -775,14 +781,16 @@ class Node(object):
         else:
             self.failures.append(scrub(text))
 
-    def query_all(self, sql):
+    def query_all(self, sql, with_columns=False):
+        """Rows of `sql` (with column names first if asked), or None if it failed."""
         if self.conn is None:
             return None
         cur = None
         try:
             cur = self.conn.cursor()
             cur.execute("/* site24x7 */ " + sql)
-            return cur.fetchall()
+            rows = cur.fetchall()
+            return ([d[0] for d in cur.description], rows) if with_columns else rows
         except Exception as e:
             self.record_failure(e)
             return None
@@ -884,23 +892,14 @@ def collect_tables(node, deadline):
         if not applies(t, node):
             continue
         sql = t.pick(node.version)
-        if sql is None or node.conn is None:
+        before, denied_before = len(node.failures), len(node.denied)
+        result = node.query_all(sql, with_columns=True) if sql else None
+        if result is None and t.optional:
+            del node.failures[before:]
+            del node.denied[denied_before:]
+        if result is None:
             continue
-        cur = None
-        try:
-            cur = node.conn.cursor()
-            cur.execute("/* site24x7 */ " + sql)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-        except Exception as e:
-            node.record_failure(e)
-            continue
-        finally:
-            if cur is not None:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
+        cols, rows = result
         table_rows = []
         seen = set()
         for r in rows:
@@ -926,7 +925,7 @@ def compute_rates(metrics, prev, now, identity):
     out = {}
     prev_counters = prev.get("counters") or {}
     dt = now - float(prev.get("ts") or 0)
-    if prev.get("identity") != identity or dt <= 0 or not (RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S):
+    if prev.get("identity") != identity or not RATE_MIN_INTERVAL_S <= dt <= RATE_MAX_INTERVAL_S:
         return out
     for r in RATES:
         cur = metrics.get(r.source)
@@ -972,24 +971,29 @@ def sampled_rates(node, deadline):
 
 def truthful_zeros(node, metrics):
     """Values that are genuinely 0 for this node rather than unknown, so the metric is
-    sent (and registered in the template) instead of left out."""
+    sent (and registered in the template) instead of left out.
+
+    A value is filled only where there is nothing to measure. Where something should
+    have been measured and was not (a standby with no WAL receiver, archiving on but
+    nothing archived yet, a disabled subscription, a table never vacuumed), the value
+    is unknown and stays out, so "age above X" alerts are never silenced by a fake 0."""
     zeros = {}
     if node.settings.get("archive_mode", "off") == "off":
         # nothing is archived, so nothing has been archived, failed or is waiting
         zeros.update({"Archived Count": 0, "Archive Failed Count": 0, "Archiving Failing": 0,
-                      "Archive Ready Files": 0, "New Archive Failures": 0})
+                      "Archive Ready Files": 0, "New Archive Failures": 0, "Last Archive Age": 0})
     if not node.is_recovery:
         # a primary replays nothing and receives WAL from no one
-        zeros.update({"Replay Lag": 0, "Replay Backlog": 0.0, "WAL Receiver Connected": 0})
+        zeros.update({"Replay Lag": 0, "Replay Backlog": 0.0, "WAL Receiver Connected": 0,
+                      "Last WAL Message Age": 0})
     else:
         # a standby generates no WAL of its own
         zeros.update({"WAL Generated Per Sec": 0.0, "WAL Written": 0.0})
-    # Pre-declared so every metric registers in the template (TL decision, 2026-11-24).
-    # Each value is safe for alerting: "lower is better" ages are 0 (nothing pending),
-    # and hit ratios with no reads are 100 % (no misses), never a fake 0 % hit rate.
-    zeros.update({"Last Archive Age": 0, "Last Subscription Message Age": 0,
-                  "Last WAL Message Age": 0, "Oldest Table Vacuum Age": 0,
-                  "Index Hit Percent": 100.0})
+    if not metrics.get("Subscriptions"):
+        zeros["Last Subscription Message Age"] = 0      # no subscription, nothing to wait for
+    if not metrics.get("Tables Never Vacuumed"):
+        zeros["Oldest Table Vacuum Age"] = 0            # no table with rows awaits a first vacuum
+    zeros["Index Hit Percent"] = 100.0                  # no index reads: no misses, never a fake 0 %
     return {k: v for k, v in zeros.items() if k not in metrics}
 
 
@@ -1274,11 +1278,7 @@ class PatroniAdapter(object):
                 finally:
                     if lnode is not seed:
                         lnode.close()
-        for r in rows:
-            link = next((l for l in links or [] if l["name"] == r["name"]), None)
-            if link and r["role"] == ROLE_STANDBY:
-                r["replay_lag_s"] = link["replay_lag_s"]
-                r["backlog_mb"] = link["replay_lag_mb"]
+        apply_link_lag(rows, links)
         return ClusterView(nodes=rows, links=links, primary_name=leader)
 
 
@@ -1476,10 +1476,6 @@ class LogicalAdapter(object):
             row["_probe"] = (host, mport)
             rows.append(row)
         return ClusterView(nodes=rows, links=replication_view(seed, logical=True))
-
-    @property
-    def label(self):
-        return self.name
 
 
 class StandaloneAdapter(object):
@@ -1816,7 +1812,9 @@ def public_rows(rows):
 def discover_cluster(seed, ctx):
     """Runs the first adapter that recognises the seed."""
     adapter = next(a for a in ADAPTERS if a.detect(seed, ctx))
-    label = ctx.get("logical_ext") or adapter.name if adapter.name == "logical" else adapter.name
+    label = adapter.name
+    if label == "logical" and ctx.get("logical_ext"):
+        label = ctx["logical_ext"]          # pglogical, spock or bdr
     return adapter, label, adapter.nodes(seed, ctx)
 
 
@@ -1873,7 +1871,7 @@ def finalize(payload):
 
     The repository rules require every `units` key to exist in the data. Declaring
     unsent metrics would not help either: Site24x7 builds the template only from
-    metrics that carry a value (tested 2026-11-23), which is why truthful_zeros() and
+    metrics that carry a value, which is why truthful_zeros() and
     sampled_rates() exist."""
     emitted = {k for k in payload if k not in RESERVED_KEYS}
     for tab in payload.get("tabs", {}).values():
@@ -1933,12 +1931,13 @@ def down(payload, message):
 
 
 # =============================================================================
-# 7. ENTRY POINTS
+# 9. ENTRY POINTS
 # =============================================================================
 
 def resolve_args(param):
     """Normalises cfg/CLI parameters. Unknown keys are ignored."""
     p = {k: clean_quotes(v) for k, v in (param or {}).items()}
+    p = {k: ("" if v == "None" else v) for k, v in p.items()}   # cfg placeholder
     try:
         port = int(p.get("port") or 5432)
     except ValueError:
@@ -1955,12 +1954,11 @@ def resolve_args(param):
         patroni_port = int(p.get("patroni_port") or 0)
     except ValueError:
         patroni_port = 0
-    password = p.get("password") or ""
     return {
         "host": p.get("host") or "localhost",
         "port": port if 0 < port < 65536 else 5432,
         "username": p.get("username") or "postgres",
-        "password": "" if password == "None" else password,
+        "password": p.get("password") or "",
         "db": p.get("db") or "postgres",
         "sslmode": p.get("sslmode") or "",
         "sslrootcert": p.get("sslrootcert") or "",
@@ -1977,7 +1975,7 @@ def resolve_args(param):
         "patroni_certfile": p.get("patroni_certfile") or "",
         "patroni_keyfile": p.get("patroni_keyfile") or "",
         "patroni_username": p.get("patroni_username") or "",
-        "patroni_password": "" if (p.get("patroni_password") or "") == "None" else (p.get("patroni_password") or ""),
+        "patroni_password": p.get("patroni_password") or "",
         "logs_enabled": parse_bool(p.get("logs_enabled"), False),
         "log_type_name": p.get("log_type_name") or "PostgreSQL Cluster Events",
         "log_file_path": p.get("log_file_path") or "",
@@ -2066,8 +2064,24 @@ def permission_note(denied, prev_denied):
     return ""
 
 
+def error_payload(exc):
+    """What the agent receives if the plugin itself fails: always valid output."""
+    return {"plugin_version": PLUGIN_VERSION, "heartbeat_required": HEARTBEAT,
+            "status": 0, "msg": scrub("plugin error: %s" % exc)[:MAX_MSG_CHARS]}
+
+
 def run(param):
-    """Collects one poll. `param` is the cfg section as a dict; returns the payload."""
+    """Collects one poll. `param` is the cfg section as a dict; returns the payload.
+
+    The Linux agent imports this module and calls run() itself, so the guard against
+    an unexpected error lives here and not only in __main__."""
+    try:
+        return collect(param)
+    except Exception as exc:
+        return error_payload(exc)
+
+
+def collect(param):
     t0 = time.time()
     args = resolve_args(param)
     payload = base_payload(args)
@@ -2080,7 +2094,7 @@ def run(param):
     if not node.connect():
         reason = "authentication failed for user %s" % args["username"] if node.auth_failed \
             else "cannot connect to %s:%s (%s)" % (args["host"], args["port"], node.error)
-        if not param.get("host"):
+        if not (param or {}).get("host"):
             reason = "no configuration received from agent; " + reason
         return down(payload, reason)
 
@@ -2131,7 +2145,7 @@ def run(param):
     denied = sorted(set(node.denied))
     metrics["Permission Gaps"] = len(denied)
     metrics["Collection Time"] = int((time.time() - t0) * 1000)
-    payload.update(metrics)
+    payload.update({k: v for k, v in metrics.items() if k not in HIDDEN_COUNTERS})
     payload.update(tables)
     payload.update(cluster_tables)
     if node.failures:
@@ -2178,7 +2192,6 @@ def parse_cli(argv=None):
 if __name__ == "__main__":
     try:
         result = run(parse_cli())
-    except Exception as exc:  # the agent must always receive valid JSON
-        result = {"plugin_version": PLUGIN_VERSION, "heartbeat_required": HEARTBEAT,
-                  "status": 0, "msg": scrub("plugin error: %s" % exc)[:MAX_MSG_CHARS]}
+    except Exception as exc:  # argument parsing: the agent must still receive valid JSON
+        result = error_payload(exc)
     print(json.dumps(result, indent=4, sort_keys=True))

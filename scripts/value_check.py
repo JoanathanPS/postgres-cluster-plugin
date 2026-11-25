@@ -131,8 +131,6 @@ def main():
           "got %s s, expected >= 3 s" % d.get("Longest Transaction"))
     check("Deadlock happened (setup)", "40P01" in errs, "pgcodes %s" % errs)
     check("New Deadlocks", d.get("New Deadlocks") == 1, "got %s, expected 1" % d.get("New Deadlocks"))
-    check("Total Deadlocks", d.get("Total Deadlocks", 0) - base.get("Total Deadlocks", 0) == 1,
-          "delta %s, expected 1" % (d.get("Total Deadlocks", 0) - base.get("Total Deadlocks", 0)))
     rb = d.get("Total Rollbacks", 0) - base.get("Total Rollbacks", 0)
     check("Total Rollbacks", rb >= 5, "delta %s, expected >= 5 (5 rollbacks + deadlock victims)" % rb)
     # PostgreSQL prunes dead rows on the fly (HOT), so compare with its own counter

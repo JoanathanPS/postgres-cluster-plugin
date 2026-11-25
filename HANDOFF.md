@@ -1,4 +1,51 @@
-# postgres plugin v2: handoff (2026-11-23)
+# postgres plugin v2: handoff (updated 2026-11-24 evening)
+
+## 0. Read first: current state and what's left
+
+**Where the release lives (all pushed):**
+- `JoanathanPS/postgres-cluster-plugin`, branch `main` = branch `postgres-v2-Joanathan`: only the `postgres/` folder, laid out like `site24x7/plugins/postgres`.
+- `JoanathanPS/plugins` (fork of `site24x7/plugins`), branch `postgres-v2-Joanathan`: 2 commits on top of upstream master. The user opens the PR to `site24x7/plugins` master themselves. **Never open, merge or comment on the PR yourself.**
+- Local worktrees: `%TEMP%\pg-v2-joanathan` (release branch of own repo) and `%TEMP%\s247-fork` (fork clone). `v7` is the dev branch with tests and scripts; its latest plugin changes are **uncommitted** in this folder.
+- To ship a change: edit `postgres/` here, run tests, copy `postgres.py`/`README.md`/installer into both worktrees, commit with a plain message, push the fork branch, and push the own-repo branch to both `postgres-v2-Joanathan` and `main`.
+
+**Changes since sections 1–9 were written:**
+- `postgres.cfg` is now byte-identical to upstream (only host/port/username/password/db). Every other option has a code default; the README's Configuration Options table lists them. The installer appends `patroni_port` instead of uncommenting it.
+- `"None"` in any cfg value means empty (it's the placeholder).
+- Units are atomic (`rows`, `MB`, …), no `x/s` units; the rate is in the metric name.
+- **Tabs:** Summary + 8, all visible in the console: Cluster, Replication, Activity, Transactions and Sessions, DB and IO stats, Vacuum and Wraparound, WAL and Archiving, BG Writer. The old Plugin tab's 3 metrics (Collection Time, Failed Queries, Permission Gaps) are on Summary.
+- **16 lifetime totals are read but not sent** (`HIDDEN_COUNTERS` in `postgres.py`): Total Rows Inserted/Updated/Deleted/Fetched/Returned, Total Block Reads, Total Temp Data, Sequential Scans, Index Scans, WAL Written, Total Deadlocks, Total Conflicts, Checkpoints Req, Archive Failed Count, Checksum Failures, WAL Buffers Full. Their Per Sec / New versions are sent. The plugin now sends 99 metrics.
+- TL decided: customers upgrade one at a time, so no backend migration and no v1 compatibility constraints. README "Upgrading from Version 1" lists dropped v1 metrics and their nearest (not equivalent) v2 metric.
+- README metric section is grouped by console tab and matches the code exactly (99 names).
+
+**Verified after these changes:** pyflakes clean, 50 unit tests pass, 2 live polls on `tb-standalone-pg16` (status 1, 0 schema violations, the 8 tabs in order, no hidden metric sent).
+
+**Verified on the real Linux agent (2026-11-25):** fresh registration of `postgres.py-postgres-pg-linux-agent` gave status 1, template = all 94 numeric metrics + 5 text metrics (99), 0 missing, 0 without data, no hidden counter, and the 8 tabs in order. Notes:
+- The API lists template keys without spaces (`TotalCommits`); `api_check.py` compares by the catalogue's own keys.
+- After a container restart the agent does not start by itself: `docker exec pg-linux-agent /etc/init.d/site24x7monagent start`.
+- A monitor deleted in the console is marked `status: 3` in the agent's `conf/pl_id_mapper` and is never re-registered. Stop the agent, remove those entries (backup in `/root/pl_id_mapper.bak`), start it. Only `[postgres]` was registered this time; the full 9-section cfg is restored (backup `/root/postgres.cfg.full`), so the other 7 register the next time their test beds and the agent run.
+- Don't loop `api_check.py`: each run takes a new token and Zoho blocks the refresh token for a while after ~10 in 10 minutes.
+
+**Audit fixes (2026-11-25, on `v7`, not yet copied to the release worktrees):** unknown ages are no longer zero-filled (Last WAL Message Age on a standby with no receiver, Last Archive Age with archiving on, Last Subscription Message Age with subscriptions, Oldest Table Vacuum Age with never-vacuumed tables); Archive Ready Files is its own query so a user without `pg_monitor` keeps the other archive metrics; `run()` itself returns valid output on any unexpected error (the Linux agent calls it directly); Top_Queries failing because `pg_stat_statements` isn't preloaded is no longer a failed query. 54 tests, value check 23/23 on PG16.
+
+**Original steps for this check (kept for reference):**
+1. Start only what's needed: `docker start tb-standalone-pg16 pg-linux-agent` (all containers were stopped to save the user's PC).
+2. Linux: `docker cp postgres/postgres.py pg-linux-agent:/opt/site24x7/monagent/plugins/postgres/postgres.py`. The agent sees the change but keeps the old template for existing monitors.
+3. Ask the user to delete **one** monitor in the console (e.g. `postgres.py-postgres-pg-linux-agent`); never delete anything yourself. The agent re-registers it within one or two polls (5 min each). If it doesn't, the user removes and re-adds the plugin folder or restarts the plugin agent.
+4. Check with `python scripts/api_check.py --period 0`: the re-registered monitor should be status 1, template 99, 0 missing. Then ask the user to look at the tabs in the console.
+5. Windows is optional: the code path is the same; copy `postgres.py` to `C:\Program Files (x86)\Site24x7\WinAgent\monitoring\Plugins\postgres\` and check `scripts/agent_payloads.sh 1`.
+6. Stop the containers again when done (`docker stop ...`).
+
+**Rules from the user:**
+- No AI/Claude attribution anywhere: commits, PR text, code, docs.
+- Discuss `main` and README changes with the user before making them.
+- Explain plainly, no jargon; decide small things yourself instead of asking.
+- Console: view only. Never print or commit `.env` secrets or the agent device key.
+- Keep Docker usage minimal; the user's PC lags.
+
+**Open questions for the TL:** `TL_ASK.md` sections A–E (pg_monitor warning, further renames, Primary tab, standalone cluster fields, Patroni coverage).
+
+---
+
 
 Read this instead of the old chat. The v6 handoff, research, docs and console evidence were removed from the working tree on 2026-11-23. They are on GitHub on branch `v6` and in local history.
 

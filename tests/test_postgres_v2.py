@@ -12,22 +12,22 @@ sys.path.insert(0, os.path.join(ROOT, "postgres"))
 import postgres as pg  # noqa: E402
 
 # Version 1 metric names that version 2 still sends (reference/postgres/postgres.py).
-# v1-only metrics already covered by newer ones were dropped on purpose: the backend
-# migrates old charts, so they are not carried (see V1_DROPPED).
+# v1-only metrics covered by newer ones, and running totals replaced by their
+# "Per Sec" / "New ..." versions, are not sent (see V1_DROPPED).
 V1_METRICS = [
     "Table Count", "Active Queries", "Active Waiting Queries", "Transactions Open",
     "Transactions Idle In Transaction", "Active Connections", "Total Commits",
-    "Total Rollbacks", "Total Conflicts", "Checkpoints Timed", "Checkpoints Req",
+    "Total Rollbacks", "Checkpoints Timed",
     "Checkpoint Write Time", "Checkpoint Sync Time", "Buffers Checkpoint", "Buffers Clean",
     "Maxwritten Clean", "Buffers Alloc", "Locks Count", "Max Connections",
-    "Total Rows Inserted", "Total Rows Updated", "Total Rows Deleted", "Total Rows Fetched",
-    "Total Rows Returned", "Total Block Reads", "Total Block Hits", "Index Scans",
-    "Server Version", "Uptime", "Database Count",
+    "Total Block Hits", "Server Version", "Uptime", "Database Count",
     "Total Sessions", "Total Sessions Abandoned", "Total Sessions Fatal",
     "Total Sessions Killed",
 ]
 V1_DROPPED = ["Index Rows Read", "Index Rows Fetched", "Heap Blocks Read", "Heap Blocks Hit",
-              "Cache Hit Ratio"]
+              "Cache Hit Ratio", "Total Rows Inserted", "Total Rows Updated",
+              "Total Rows Deleted", "Total Rows Fetched", "Total Rows Returned",
+              "Total Block Reads", "Index Scans", "Total Conflicts", "Checkpoints Req"]
 V1_METRICS_BEFORE_17 = ["Buffers Backend", "Buffers Backend Fsync"]
 
 
@@ -236,6 +236,31 @@ class RunTests(unittest.TestCase):
         self.assertEqual(later["Permission Gaps"], 1)               # still counted every poll
         self.assertNotIn("msg", later)                               # but no repeated text
 
+    def test_unexpected_error_still_returns_valid_output(self):
+        """The Linux agent calls run() directly, without the __main__ guard."""
+        with mock.patch.object(pg, "collect", side_effect=RuntimeError("boom password=x")):
+            out = pg.run({"host": "h"})
+        self.assertEqual(out["status"], 0)
+        self.assertIn("plugin error: boom", out["msg"])
+        self.assertNotIn("password=x", out["msg"])
+
+    def test_optional_table_failure_is_not_a_failed_query(self):
+        """pg_stat_statements installed but not preloaded errors on every read."""
+        top = next(t for t in pg.TABLES if t.name == "Top_Queries")
+        with mock.patch.object(top, "when", lambda node: True):
+            out = self.run_with(fail_on="pg_stat_statements WHERE",
+                                error="pg_stat_statements must be loaded via shared_preload_libraries")
+        self.assertEqual(out["Failed Queries"], 0)
+        self.assertNotIn("Top_Queries", out)
+        self.assertNotIn("msg", out)
+
+    def test_archive_ready_needs_its_own_permission_only(self):
+        archiver = next(q for q in pg.QUERIES if q.key == "archiver")
+        ready = next(q for q in pg.QUERIES if q.key == "archive_ready")
+        self.assertNotIn("pg_ls_archive_statusdir", archiver.pick((16, 0)).sql)
+        self.assertIn("pg_ls_archive_statusdir", ready.pick((16, 0)).sql)
+        self.assertIsNone(ready.pick((11, 0)))
+
     def test_resolved_permission_gap_is_announced(self):
         out = self.run_with(prev={"denied": ["function pg_ls_waldir"]})
         self.assertEqual(out["Permission Gaps"], 0)
@@ -250,10 +275,12 @@ class RunTests(unittest.TestCase):
 
     def test_truthful_zeros_are_sent_not_left_out(self):
         out = self.run_with()          # fake server: primary, archive_mode off
-        for name in ("Archived Count", "Archive Failed Count", "Archiving Failing",
+        for name in ("Archived Count", "Archiving Failing",
                      "Replay Lag", "Replay Backlog", "WAL Receiver Connected"):
             self.assertEqual(out[name], 0, name)
-        self.assertEqual(out["Last Archive Age"], 0)     # pre-declared (TL decision)
+        self.assertEqual(out["Last Archive Age"], 0)     # stand-in until the first archive
+        for name in pg.HIDDEN_COUNTERS:
+            self.assertNotIn(name, out)                  # used for rates, not sent
         self.assertEqual(out["Index Hit Percent"], 1.0)   # fake server: real value, not the stand-in
 
 
@@ -265,6 +292,19 @@ class TruthfulZeroTests(unittest.TestCase):
         self.assertNotIn("Replay Lag", zeros)            # a standby has a real replay lag
         self.assertNotIn("Archived Count", zeros)        # archiving on: real counts
         self.assertEqual((zeros["WAL Generated Per Sec"], zeros["WAL Written"]), (0.0, 0.0))
+
+    def test_unknown_ages_are_left_out_not_zeroed(self):
+        """A 0 age would silence "age above X" alerts exactly when they matter."""
+        standby = mock.Mock(is_recovery=True, settings={"archive_mode": "on"})
+        zeros = pg.truthful_zeros(standby, {"Subscriptions": 2, "Tables Never Vacuumed": 3})
+        for name in ("Last WAL Message Age", "Last Archive Age",
+                     "Last Subscription Message Age", "Oldest Table Vacuum Age"):
+            self.assertNotIn(name, zeros, name)
+        primary = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
+        zeros = pg.truthful_zeros(primary, {"Subscriptions": 0, "Tables Never Vacuumed": 0})
+        for name in ("Last WAL Message Age", "Last Archive Age",
+                     "Last Subscription Message Age", "Oldest Table Vacuum Age"):
+            self.assertEqual(zeros[name], 0, name)
 
     def test_existing_values_are_never_overwritten(self):
         node = mock.Mock(is_recovery=False, settings={"archive_mode": "off"})
