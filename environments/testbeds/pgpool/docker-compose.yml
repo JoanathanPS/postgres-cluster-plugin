@@ -12,16 +12,20 @@ services:
     <<: *pg
     command: postgres -c wal_level=replica -c max_wal_senders=10 -c max_replication_slots=10 -c hot_standby=on
     volumes: ["./initdb:/docker-entrypoint-initdb.d:ro"]
+    ports: ["127.0.0.1:5471:5432"]
   pgp-pg2:
     <<: *pg
+    ports: ["127.0.0.1:5472:5432"]
     entrypoint: ["/standby.sh"]
     volumes: ["./standby.sh:/standby.sh:ro"]
     depends_on: { pgp-pg1: { condition: service_healthy } }
   pgp-pg3:
     <<: *pg
+    ports: ["127.0.0.1:5473:5432"]
     entrypoint: ["/standby.sh"]
     volumes: ["./standby.sh:/standby.sh:ro"]
     depends_on: { pgp-pg1: { condition: service_healthy } }
   pgpool:
     build: ./pgpool
+    ports: ["127.0.0.1:5470:9999"]
     depends_on: { pgp-pg2: { condition: service_healthy }, pgp-pg3: { condition: service_healthy } }

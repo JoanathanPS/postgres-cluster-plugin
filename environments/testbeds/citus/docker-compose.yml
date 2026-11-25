@@ -4,6 +4,6 @@ x-citus: &citus
   image: citusdata/citus:12.1
   environment: { POSTGRES_PASSWORD: pgpass, POSTGRES_HOST_AUTH_METHOD: trust }
 services:
-  citus-coordinator: { <<: *citus, hostname: citus-coordinator }
-  citus-worker1: { <<: *citus, hostname: citus-worker1 }
-  citus-worker2: { <<: *citus, hostname: citus-worker2 }
+  citus-coordinator: { <<: *citus, hostname: citus-coordinator, ports: ["127.0.0.1:5480:5432"] }
+  citus-worker1: { <<: *citus, hostname: citus-worker1, ports: ["127.0.0.1:5481:5432"] }
+  citus-worker2: { <<: *citus, hostname: citus-worker2, ports: ["127.0.0.1:5482:5432"] }

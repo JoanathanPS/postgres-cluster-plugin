@@ -489,6 +489,20 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("_probe", rows["repmgr-node2"])            # matched as the seed
         self.assertEqual(rows["repmgr-node1"]["_probe"], ("127.0.0.1", 5461))
 
+    def test_citus_worker_finds_itself_by_group_not_address(self):
+        """A worker reached at an address that differs from its pg_dist_node entry is
+        still its own row, not an extra coordinator."""
+        reg = [("citus-coordinator", 5432, 0, "primary", True),
+               ("citus-worker1", 5432, 1, "primary", True),
+               ("citus-worker2", 5432, 2, "primary", True)]
+        seed = SeedStub(host="127.0.0.1", port=5481, answers={
+            "pg_dist_local_group": [(1,)], "pg_dist_node": reg})
+        rows = pg.CitusAdapter().nodes(seed, ctx_for(seed)).nodes
+        self.assertEqual([(r["name"], r["role"]) for r in rows],
+                         [("citus-coordinator", "coordinator"), ("citus-worker1", "worker"),
+                          ("citus-worker2", "worker")])
+        self.assertNotIn("_probe", rows[1])                          # matched as the seed
+
     def test_registry_clusters_get_links_from_the_primary(self):
         """pgpool / pg_auto_failover list nodes but not links: ask the primary."""
         link = ("walreceiver", "10.0.0.2", "streaming", "async", 0, 0, 0, 0.5, None, None, 1.5, "5432")
