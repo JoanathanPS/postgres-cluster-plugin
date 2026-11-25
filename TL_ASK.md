@@ -13,7 +13,7 @@
 8. **Standalone servers and the cluster tabs → keep the tabs, show "not applicable" as No Data.** Site24x7 fixes a plugin's tabs at the first registration, so tabs can't differ per monitor (6 tests, including empty and missing tabs and a second plugin version). Cluster-only metrics are not sent on a standalone server, so they show "No Data" and never trip a threshold. `-1` was rejected: Site24x7 treats it as a real value.
 9. **Missing `pg_monitor` → unchanged.** The monitor message names the unreadable metrics once (and again when the list changes); Permission Gaps carries the count every poll for alerting. It is the user's permission choice, so the monitor stays up.
 10. **Primary tab (v6) → not brought back.** It duplicated metrics and needed a second session to the primary every poll.
-11. **Renames → done.** BG Writer metrics carry plain names (Scheduled Checkpoints, Buffers Written by Checkpoints / BG Writer / Backends, Backend Fsyncs, Buffers Allocated, BG Writer Stops). Listed in the README's "Metric changes" table.
+11. **Renames → only what is wrong.** The BG Writer names match PostgreSQL's own `pg_stat_bgwriter` columns, which DBAs know and can search, so they stay. Only the misspelled v1 table was renamed.
 12. **Patroni setups → no question for the TL.** HTTP, HTTPS, self-signed, own CA, client certificates and an authenticating proxy are all supported and tested.
 
 All questions are answered. Open decisions are in TRADEOFF.md.

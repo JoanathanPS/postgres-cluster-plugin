@@ -9,7 +9,7 @@
 - **First poll registers everything.** With no `.state` file for the monitor, the payload carries every metric and table (stand-ins: 0, or 100 for hit percentages; placeholder rows for tables), so the Site24x7 template is complete whichever server registers first. Verified with a standalone monitor registering first (template 142, none missing).
 - **Later polls send only real values.** What does not apply is left out and shows "No Data": cluster-only metrics on standalone (`STANDALONE_NOT_APPLICABLE`), replay lag on a primary, ages of events that never happened, maxima over nothing (Max Slot Retained WAL with no slots, Longest Transaction with none open), checksum failures with checksums off. Counts and sums over nothing stay a real 0.
 - **Cluster tab:** cluster graphs first, then the tables Cluster_Info (type, primary, health, role, nodes up/total), Nodes and Events. The 4 text values are no longer top-level metrics.
-- **Renames:** BG Writer metrics have plain names (Scheduled Checkpoints, BG Writer Stops, ...). README "Metric changes" lists them.
+- **Names:** metric names follow PostgreSQL's own (e.g. `buffers_backend` → Buffers Backend). Rename only what is wrong.
 - **PostgreSQL 10–13 subscriptions** are counted from `pg_stat_subscription` (pg_subscription is superuser-only before 14).
 - **README** rewritten: upgrade steps, metric changes table, "No Data" rule, `.state` note. **TRADEOFF.md** holds the two decisions for the TL. **TL_ASK.md**: every question answered.
 
