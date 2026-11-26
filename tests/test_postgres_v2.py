@@ -283,9 +283,11 @@ class RunTests(unittest.TestCase):
 
     def test_later_poll_sends_real_counts_and_leaves_out_what_does_not_apply(self):
         out = self.run_with()          # fake server: primary, archive_mode off, a later poll
-        for name in ("Archived Count", "Archiving Failing", "Archive Ready Files"):
+        for name in ("Archived Count", "Archive Ready Files"):
             self.assertEqual(out[name], 0, name)          # really nothing archived
-        for name in ("Last Archive Age", "Replay Lag", "Replay Backlog", "WAL Receiver Connected",
+        self.assertEqual(out["Archiving"], "Off")         # yes/no states are text
+        self.assertEqual(out["WAL Receiver"], "Not a standby")
+        for name in ("Last Archive Age", "Replay Lag", "Replay Backlog",
                      "Last WAL Message Age", "Max Standby Replay Lag", "Last Failover Age"):
             self.assertNotIn(name, out)                   # does not apply: "No Data"
         for name in pg.HIDDEN_COUNTERS:
